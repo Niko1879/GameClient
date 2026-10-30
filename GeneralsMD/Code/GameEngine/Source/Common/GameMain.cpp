@@ -31,6 +31,7 @@
 #include "Common/FramePacer.h"
 #include "Common/GameEngine.h"
 #include "Common/ReplaySimulation.h"
+#include "Common/SelfPlay.h"
 
 
 /**
@@ -44,8 +45,17 @@ Int GameMain()
 	TheFramePacer->enableFramesPerSecondLimit(TRUE);
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
+	if (GetEnvironmentVariableA("GENERALS_AI_USER_DATA", nullptr, 0))
+	{
+		printf("GeneralsAIProfile %s\n", TheGlobalData->getPath_UserData().str());
+		fflush(stdout);
+	}
 
-	if (TheGlobalData->m_exportStats && (!TheGlobalData->m_headless || TheGlobalData->m_simulateReplays.empty()))
+	if (SelfPlayIsEnabled())
+	{
+		exitcode = SelfPlayRun();
+	}
+	else if (TheGlobalData->m_exportStats && (!TheGlobalData->m_headless || TheGlobalData->m_simulateReplays.empty()))
 	{
 		printf("ERROR: -exportStats requires headless replay mode (-headless -replay <file>).\n");
 		fflush(stdout);

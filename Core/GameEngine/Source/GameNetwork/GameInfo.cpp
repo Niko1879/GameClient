@@ -39,6 +39,7 @@
 #include "Common/Xfer.h"
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/GameInfo.h"
+#include "GameNetwork/GameSlotParser.h"
 #include "GameNetwork/GameSpy/ThreadUtils.h"
 #include "GameNetwork/GameSpy/StagingRoomGameInfo.h"
 #include "GameNetwork/LANAPI.h"						// for testing packet size
@@ -1015,7 +1016,7 @@ Bool ParseAsciiStringToGameInfo(GameInfo *game, AsciiString options)
 	// Parse game options
 	char *buf = strdup(options.str());
 	char *bufPtr = buf;
-	char *strPos, *keyValPair;
+	char *keyValPair;
 	GameSlot newSlot[MAX_SLOTS];
 	Bool optionsOk = true;
 	AsciiString mapName;
@@ -1043,9 +1044,14 @@ Bool ParseAsciiStringToGameInfo(GameInfo *game, AsciiString options)
 	DEBUG_LOG(("ParseAsciiStringToGameInfo - parsing [%s]", options.str()));
 
 
-	while ( (keyValPair = strtok_r(bufPtr, ";", &strPos)) != nullptr )
+	while (bufPtr && *bufPtr)
 	{
-		bufPtr = nullptr; // strtok within the same string
+		keyValPair = bufPtr;
+		// S is the final field; semicolons inside player names belong to S.
+		char *fieldEnd = (keyValPair[0] == slotListID && keyValPair[1] == '=')
+			? strrchr(keyValPair, ';') : strchr(keyValPair, ';');
+		bufPtr = fieldEnd ? fieldEnd + 1 : nullptr;
+		if (fieldEnd) *fieldEnd = '\0';
 
 		AsciiString key, val;
 		char *pos = nullptr;
@@ -1151,26 +1157,28 @@ Bool ParseAsciiStringToGameInfo(GameInfo *game, AsciiString options)
 		{
 			sawSlotlist = true;
 			/// @TODO: Need to read in all the slot info... big mess right now.
-			char *rawSlotBuf = strdup(val.str());
-			char *freeMe = nullptr;
+			std::array<GameSlotParser::Slot, MAX_SLOTS> parsedSlots;
+			if (!GameSlotParser::split(std::string(val.str()), parsedSlots))
+			{
+				optionsOk = false;
+				DEBUG_LOG(("ParseAsciiStringToGameInfo - malformed slot list, quitting"));
+				break;
+			}
 			AsciiString rawSlot;
 //			Bool slotsOk = true;	//flag that lets us know whether or not the slot list is good.
 
 //			DEBUG_LOG(("ParseAsciiStringToGameInfo - Parsing slot list"));
 			for (int i=0; i<MAX_SLOTS; ++i)
 				{
-					rawSlot = strtok_r(rawSlotBuf,":",&pos);
-					if( rawSlotBuf )
-						freeMe = rawSlotBuf;
-					rawSlotBuf = nullptr;
+					rawSlot = parsedSlots[i].text.c_str();
 					switch (*rawSlot.str())
 					{
 						case 'H':
 						{
 //							DEBUG_LOG(("ParseAsciiStringToGameInfo - Human player"));
-							char *slotPos = nullptr;
+							char *slotPos = (char *)rawSlot.str() + parsedSlots[i].nameEnd + 1;
 							//Parse out the Name
-							AsciiString slotValue(strtok_r((char *)rawSlot.str(),",",&slotPos));
+							AsciiString slotValue(parsedSlots[i].text.substr(0, parsedSlots[i].nameEnd).c_str());
 							if(slotValue.isEmpty())
 							{
 								optionsOk = false;
@@ -1474,7 +1482,6 @@ Bool ParseAsciiStringToGameInfo(GameInfo *game, AsciiString options)
 					}
 				}
 
-			free(freeMe);
 		}
 		else
 		{

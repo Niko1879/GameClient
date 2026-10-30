@@ -29,6 +29,7 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+#include "Common/ReplayLogic.h"
 
 #include "Common/CRCDebug.h"
 #include "Common/Player.h"
@@ -475,7 +476,8 @@ void ParachuteContain::onRemoving( Object *rider )
 	// before its delayed OCLUpdate runs after landing. Restart an expired lifetime before releasing the object.
 	static NameKeyType key_DeletionUpdate = NAMEKEY( "DeletionUpdate" );
 	DeletionUpdate *dup = (DeletionUpdate*)rider->findUpdateModule( key_DeletionUpdate );
-	if (dup && dup->getDieFrame() <= TheGameLogic->getFrame())
+	// Replays of releases before this fix let the lifetime expire (Common/ReplayLogic.h).
+	if (dup && dup->getDieFrame() <= TheGameLogic->getFrame() && !replayLogicBefore60HzFixes())
 	{
 		dup->restartLifetime();
 	}

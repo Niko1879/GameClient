@@ -113,19 +113,8 @@ TerrainTypeCollection::~TerrainTypeCollection()
 //-------------------------------------------------------------------------------------------------
 TerrainType *TerrainTypeCollection::findTerrain( AsciiString name )
 {
-	TerrainType *terrain;
-
-	for( terrain = m_terrainList; terrain; terrain = terrain->friend_getNext() )
-	{
-
-		if( terrain->getName() == name )
-			return terrain;
-
-	}
-
-	// not found
-	return nullptr;
-
+	const auto found = m_terrainByName.find(name);
+	return found == m_terrainByName.end() ? nullptr : found->second;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -158,6 +147,8 @@ TerrainType *TerrainTypeCollection::newTerrain( AsciiString name )
 	// tie to list
 	terrain->friend_setNext( m_terrainList );
 	m_terrainList = terrain;
+	// Explicit duplicate creation historically made the new head win.
+	m_terrainByName[name] = terrain;
 
 	// return the new terrain
 	return terrain;

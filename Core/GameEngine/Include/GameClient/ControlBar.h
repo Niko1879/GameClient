@@ -883,6 +883,10 @@ public:
 	// get method for list of commandbuttons
 	const CommandButton *getCommandButtons() { return m_commandButtons; }
 
+	// Window-free button state, for training actors that are not the local player.
+	CommandAvailability evaluateCommandAvailability( const CommandButton *command, Object *obj ) const
+	{ return getCommandAvailability( command, obj, nullptr, nullptr, FALSE ); }
+
 protected:
 
 	ICoord2D m_defaultControlBarPosition;				///< Stored the original position of the control bar on the screen

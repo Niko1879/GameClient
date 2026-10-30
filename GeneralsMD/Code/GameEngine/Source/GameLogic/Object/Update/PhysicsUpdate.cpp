@@ -27,6 +27,7 @@
 // Author: Michael S. Booth, November 2001
 
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+#include "Common/ReplayLogic.h"
 
 // please talk to MDC (x36804) before taking this out
 #define NO_DEBUG_CRC
@@ -668,7 +669,8 @@ UpdateSleepTime PhysicsBehavior::update()
 		const Real THRESH = 0.001f;
 #if defined(GENERALS_ONLINE_HIGH_FPS_SERVER)
 		// Info: At 60Hz, motive acceleration can be smaller than THRESH and must accumulate across frames.
-		if (!isMotive())
+		// Replays of releases before this fix clamp unconditionally (Common/ReplayLogic.h).
+		if (!isMotive() || replayLogicBefore60HzFixes())
 		{
 			if (fabsf(m_vel.x) < THRESH) m_vel.x = 0.0f;
 			if (fabsf(m_vel.y) < THRESH) m_vel.y = 0.0f;

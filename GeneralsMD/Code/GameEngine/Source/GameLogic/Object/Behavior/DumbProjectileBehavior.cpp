@@ -27,6 +27,7 @@
 // Desc:
 
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+#include "Common/ReplayLogic.h"
 
 #include "Common/BezierSegment.h"
 #include "Common/GameCommon.h"
@@ -663,13 +664,14 @@ UpdateSleepTime DumbProjectileBehavior::update()
 				prevPos = m_flightPath[0];
 #if defined(GENERALS_ONLINE_HIGH_FPS_SERVER)
 				// Info: Look one legacy frame ahead so launch orientation matches the retail 30Hz path.
+				// Replays of releases before this fix use the next path point (Common/ReplayLogic.h).
 				const Int highFpsPathPointCount = (Int)m_flightPath.size();
 				const Int legacyPathPointCount = (highFpsPathPointCount + GENERALS_ONLINE_HIGH_FPS_FRAME_MULTIPLIER - 1)
 					/ GENERALS_ONLINE_HIGH_FPS_FRAME_MULTIPLIER;
 				const Int legacyPathIntervalCount = max(legacyPathPointCount - 1, 1);
 				const Int orientationStep = (highFpsPathPointCount - 1 + legacyPathIntervalCount / 2)
 					/ legacyPathIntervalCount;
-				curPos = m_flightPath[orientationStep];
+				curPos = m_flightPath[replayLogicBefore60HzFixes() ? 1 : orientationStep];
 #else
 				curPos = m_flightPath[1];
 #endif

@@ -93,5 +93,21 @@ if(RTS_BUILD_GENERALS)
     add_subdirectory(Generals)
 endif()
 
+option(RTS_REPLAY_PROBE_SYMBOLS "Write a linker map for local replay crash diagnosis" OFF)
+if(RTS_REPLAY_PROBE_SYMBOLS AND MSVC AND TARGET z_generals)
+    target_link_options(z_generals PRIVATE /MAP)
+endif()
+
+option(RTS_REPLAY_PROBE_LEGACY_MOVEMENT "Probe pre-August-28 movement; requires replay CRC validation" OFF)
+if(RTS_REPLAY_PROBE_LEGACY_MOVEMENT AND TARGET z_gameengine)
+    set_property(SOURCE "${CMAKE_SOURCE_DIR}/GeneralsMD/Code/GameEngine/Source/GameLogic/Object/Update/PhysicsUpdate.cpp"
+        TARGET_DIRECTORY z_gameengine APPEND PROPERTY COMPILE_DEFINITIONS REPLAY_PROBE_LEGACY_MOVEMENT)
+endif()
+option(RTS_REPLAY_PROBE_LEGACY_PROJECTILES "Probe pre-August-28 projectile orientation; requires replay CRC validation" OFF)
+if(RTS_REPLAY_PROBE_LEGACY_PROJECTILES AND TARGET z_gameengine)
+    set_property(SOURCE "${CMAKE_SOURCE_DIR}/GeneralsMD/Code/GameEngine/Source/GameLogic/Object/Behavior/DumbProjectileBehavior.cpp"
+        TARGET_DIRECTORY z_gameengine APPEND PROPERTY COMPILE_DEFINITIONS REPLAY_PROBE_LEGACY_PROJECTILES)
+endif()
+
 feature_summary(WHAT ENABLED_FEATURES DESCRIPTION "Enabled features:")
 feature_summary(WHAT DISABLED_FEATURES DESCRIPTION "Disabled features:")

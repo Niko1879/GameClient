@@ -117,7 +117,9 @@ public:
 		SHROUD_REVEALED					= 0x00000010,	///< Check to make sure the shroud is revealed
 		NO_ENEMY_OBJECT_OVERLAP	= 0x00000020,	///< Can't overlap enemy objects only.
 		IGNORE_STEALTHED				= 0x00000040, ///< Units that we can't see are legal to "build" on. (when moving mouse around)
-		FAIL_STEALTHED_WITHOUT_FEEDBACK = 0x00000080 ///< USE WITH IGNORE_STEALTHED except it will fail without BIB feedback (when clicking to place).
+		FAIL_STEALTHED_WITHOUT_FEEDBACK = 0x00000080, ///< USE WITH IGNORE_STEALTHED except it will fail without BIB feedback (when clicking to place).
+		OBSERVED_PLACEMENT_PREVIEW = 0x00000100, ///< Player-known obstacles only; never query hidden pathfinding state.
+		NO_PLACEMENT_FEEDBACK = 0x00000200 ///< Read-only query: do not add visual bibs.
 	};
 
 public:

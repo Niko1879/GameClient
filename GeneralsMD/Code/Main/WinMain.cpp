@@ -878,7 +878,21 @@ static CriticalSection critSec1, critSec2, critSec3, critSec4, critSec5;
 //=============================================================================
 static LONG WINAPI UnHandledExceptionFilter(struct _EXCEPTION_POINTERS* e_info)
 {
+	if (TheGlobalData && TheGlobalData->m_headless)
+	{
+		fprintf(stderr, "ReplayFailure unhandled_exception code=%08X address=%p frame=%u image_offset=%08X\n",
+			e_info->ExceptionRecord->ExceptionCode, e_info->ExceptionRecord->ExceptionAddress,
+			TheGameLogic ? TheGameLogic->getFrame() : 0,
+			static_cast<unsigned int>(reinterpret_cast<uintptr_t>(e_info->ExceptionRecord->ExceptionAddress)
+				- reinterpret_cast<uintptr_t>(GetModuleHandle(NULL))));
+		fflush(stderr);
+	}
 	DumpExceptionInfo(e_info->ExceptionRecord->ExceptionCode, e_info);
+	if (TheGlobalData && TheGlobalData->m_headless)
+	{
+		fprintf(stderr, "%s\n", g_LastErrorDump.str());
+		fflush(stderr);
+	}
 #ifdef RTS_ENABLE_CRASHDUMP
 	if (TheMiniDumper && TheMiniDumper->IsInitialized())
 	{
@@ -1064,7 +1078,11 @@ Int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 	}
 	catch (...)
 	{
-
+		if (TheGlobalData && TheGlobalData->m_headless)
+		{
+			fprintf(stderr, "ReplayFailure uncaught_cpp_exception\n");
+			fflush(stderr);
+		}
 	}
 
 #ifdef RTS_ENABLE_CRASHDUMP

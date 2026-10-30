@@ -111,6 +111,9 @@ set(GAMEENGINE_SRC
     Include/Common/StateMachine.h
     Include/Common/StatsCollector.h
     Include/Common/StatsExporter.h
+    Include/Common/TrainingExporter.h
+    Include/Common/TrainingCommands.h
+    Include/Common/SelfPlay.h
     Include/Common/StatsUploader.h
 #    Include/Common/STLTypedefs.h
 #    Include/Common/StreamingArchiveFile.h
@@ -630,6 +633,9 @@ set(GAMEENGINE_SRC
     Source/Common/StateMachine.cpp
     Source/Common/StatsCollector.cpp
     Source/Common/StatsExporter.cpp
+    Source/Common/TrainingExporter.cpp
+    Source/Common/TrainingCommands.cpp
+    Source/Common/SelfPlay.cpp
     Source/Common/StatsUploader.cpp
 #    Source/Common/System/ArchiveFile.cpp
 #    Source/Common/System/ArchiveFileSystem.cpp

@@ -25,9 +25,11 @@
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
 #include "Common/StatsExporter.h"
+#include "Common/TrainingExporter.h"
 #include "Common/WorkerProcess.h"
 #include "GameLogic/GameLogic.h"
 #include "GameClient/GameClient.h"
+#include "GameClient/MapUtil.h"
 
 
 Bool ReplaySimulation::s_isRunning = false;
@@ -83,10 +85,15 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 		printf("Simulating Replay \"%s\"\n", filename.str());
 		fflush(stdout);
 		DWORD startTimeMillis = GetTickCount();
+        if (!TrainingExporterBegin(filename)) { numErrors++; continue; }
 		if (TheGlobalData->m_exportStats)
 			StatsExporterBeginRecording();
 		if (TheRecorder->simulateReplay(filename))
 		{
+			printf("ReplayStage playback_ready ini=%08X map=\"%s\"\n",
+				TheGlobalData->m_iniCRC, TheGlobalData->m_pendingFile.str());
+			fflush(stdout);
+			Bool reportedGameStart = FALSE;
 			UnsignedInt totalTimeSec = TheRecorder->getPlaybackFrameCount() / LOGICFRAMES_PER_SECOND;
 			while (TheRecorder->isPlaybackInProgress())
 			{
@@ -101,6 +108,14 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 					fflush(stdout);
 				}
 				TheGameLogic->UPDATE();
+				if (!reportedGameStart)
+				{
+					const MapMetaData *loadedMap = TheMapCache ? TheMapCache->findMap(TheGlobalData->m_mapName) : NULL;
+					printf("ReplayStage game_started frame=%u map_crc=%08X map=\"%s\"\n",
+						TheGameLogic->getFrame(), loadedMap ? loadedMap->m_CRC : 0, TheGlobalData->m_mapName.str());
+					fflush(stdout);
+					reportedGameStart = TRUE;
+				}
 				if (TheGlobalData->m_exportStats)
 					StatsExporterCollectSnapshot();
 				if (TheRecorder->sawCRCMismatch())
@@ -116,10 +131,27 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 			fflush(stdout);
 			if (TheGlobalData->m_exportStats)
 				ExportGameStatsJSON(TheRecorder->getReplayDir(), filename);
+            const Bool completed = !TheRecorder->isPlaybackInProgress()
+                && TheRecorder->reachedPlaybackEOF()
+                && TheGameLogic->getFrame() >= TheRecorder->getLastPlaybackCommandFrame();
+            const MapMetaData *map = TheMapCache ? TheMapCache->findMap(TheGlobalData->m_mapName) : NULL;
+            // Lightweight compatibility probes need evidence without writing a
+            // full observation trajectory. Preserve normal CRC checking.
+            printf("ReplayValidation {\"completed\":%s,\"crc_mismatch\":%s,"
+                "\"crc_comparisons\":%u,\"final_frame\":%u,\"last_command_frame\":%u,"
+                "\"stream_eof\":%s,\"ticks_per_second\":%d,\"engine_ini_crc\":\"%08X\","
+                "\"loaded_map_crc\":\"%08X\"}\n",
+                completed ? "true" : "false", TheRecorder->sawCRCMismatch() ? "true" : "false",
+                TheRecorder->getRecordedCRCComparisons(), TheGameLogic->getFrame(),
+                TheRecorder->getLastPlaybackCommandFrame(), TheRecorder->reachedPlaybackEOF() ? "true" : "false",
+                static_cast<int>(LOGICFRAMES_PER_SECOND), TheGlobalData->m_iniCRC, map ? map->m_CRC : 0);
+            fflush(stdout);
+            if (!TrainingExporterFinish(completed, TheRecorder->sawCRCMismatch())) numErrors++;
 		}
 		else
 		{
 			printf("Cannot open replay\n");
+            TrainingExporterFinish(FALSE, FALSE);
 			numErrors++;
 		}
 	}
@@ -137,6 +169,10 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 
 int ReplaySimulation::simulateReplaysInWorkerProcesses(const std::vector<AsciiString> &filenames, int maxProcesses)
 {
+    if (TrainingExporterIsEnabled()) {
+        printf("Training export currently requires sequential replay mode (omit -jobs).\n");
+        return 1;
+    }
 	DWORD totalStartTimeMillis = GetTickCount();
 
 	WideChar exePath[1024];

@@ -66,3 +66,35 @@ build.ninja
 ## Python
 __pycache__/
 *.pyc
+
+# Private keys.
+/vast_ai
+
+# Agent working rules and project documentation.
+/AGENTS.md
+/instructions.md
+/.github/copilot-instructions.md
+/ARTIFACTS.md
+/scripts/*.md
+
+# Standalone replay collection tools and their tests.
+/scripts/watch_china_replays.py
+/scripts/replay_collector.ps1
+/scripts/fetch_replay_alternates.py
+/scripts/test_watch_china_replays.py
+/scripts/test_replay_alternates.py
+
+# Prepared corpus, recordings and the replay catalogue; see ARTIFACTS.md.
+/training-data/
+/replays/
+
+# Game assets, profiles and engine builds; the policy contract files are not ignored.
+/replay-runtime/*
+!/replay-runtime/policy.json
+!/replay-runtime/action-catalog.json
+/replay-watch/
+
+# Local build outputs and learner environments.
+/build/
+/.venv-torch/
+/.venv-torch-rocm/

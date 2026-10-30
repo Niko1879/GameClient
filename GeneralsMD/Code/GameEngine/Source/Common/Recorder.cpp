@@ -25,6 +25,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/Recorder.h"
+#include "Common/SelfPlay.h"
 #include "Common/file.h"
 #include "Common/FileSystem.h"
 #include "Common/PlayerList.h"
@@ -382,6 +383,9 @@ void RecorderClass::init() {
 	m_wasDesync = FALSE;
 	m_doingAnalysis = FALSE;
 	m_playbackFrameCount = 0;
+	m_playbackReachedEOF = FALSE;
+	m_lastPlaybackCommandFrame = 0;
+	m_recordedCRCComparisons = 0;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -405,6 +409,8 @@ void RecorderClass::reset() {
  * Do the update for this frame.
  */
 void RecorderClass::update() {
+	// Self-play trajectories use the IPC logger; preserve the user's Last Replay.
+	if (SelfPlayIsEnabled()) return;
 	if (m_mode == RECORDERMODETYPE_RECORD || m_mode == RECORDERMODETYPE_NONE) {
 		updateRecord();
 	}
@@ -1025,7 +1031,9 @@ void RecorderClass::handleCRCMessage(UnsignedInt newCRC, Int playerIndex, Bool f
 		samePlayer = TRUE;
 	if (samePlayer || (localPlayerIndex < 0))
 	{
+		const Bool crcAvailable = m_crcInfo.GetQueueSize() > 0;
 		UnsignedInt playbackCRC = m_crcInfo.readCRC();
+		if (crcAvailable && TheGameLogic->getFrame() > 0) ++m_recordedCRCComparisons;
 		//DEBUG_LOG(("RecorderClass::handleCRCMessage() - Comparing CRCs of InGame:%8.8X Replay:%8.8X Frame:%d from Player %d",
 		//	playbackCRC, newCRC, TheGameLogic->getFrame()-m_crcInfo.GetQueueSize()-1, playerIndex));
 		if (TheGameLogic->getFrame() > 0 && newCRC != playbackCRC && !m_crcInfo.sawCRCMismatch())
@@ -1117,6 +1125,9 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 		}
 	}
 
+	m_playbackReachedEOF = FALSE;
+	m_lastPlaybackCommandFrame = 0;
+	m_recordedCRCComparisons = 0;
 	ReplayHeader header;
 	header.forPlayback = TRUE;
 	header.filename = filename;
@@ -1305,9 +1316,13 @@ AsciiString RecorderClass::readAsciiString() {
 void RecorderClass::readNextFrame() {
 	Int bytesRead = m_file->read(&m_nextFrame, sizeof(m_nextFrame));
 	if (bytesRead != sizeof(m_nextFrame)) {
+		m_playbackReachedEOF = bytesRead == 0;
 		DEBUG_LOG(("RecorderClass::readNextFrame - read failed on frame %d", TheGameLogic->getFrame()));
 		m_nextFrame = -1;
 		stopPlayback();
+	}
+	else {
+		m_lastPlaybackCommandFrame = m_nextFrame;
 	}
 }
 

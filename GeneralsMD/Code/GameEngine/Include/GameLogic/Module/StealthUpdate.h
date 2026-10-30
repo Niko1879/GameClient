@@ -133,6 +133,8 @@ public:
 	Real getFriendlyOpacity() const;
 	UnsignedInt getStealthDelay() const { return getStealthUpdateModuleData()->m_stealthDelay; }
 	UnsignedInt getStealthLevel() const { return getStealthUpdateModuleData()->m_stealthLevel; }
+	// Read-only look for an explicit viewer, independent of local rendering state.
+	StealthLookType getStealthLookForPlayer(const Player *player) { return calcStealthedStatusForPlayer(getObject(), player); }
   EvaMessage getEnemyDetectionEvaEvent() const { return getStealthUpdateModuleData()->m_enemyDetectionEvaEvent; }
   EvaMessage getOwnDetectionEvaEvent() const { return getStealthUpdateModuleData()->m_ownDetectionEvaEvent; }
 	Bool getOrderIdleEnemiesToAttackMeUponReveal() const { return getStealthUpdateModuleData()->m_orderIdleEnemiesToAttackMeUponReveal; }

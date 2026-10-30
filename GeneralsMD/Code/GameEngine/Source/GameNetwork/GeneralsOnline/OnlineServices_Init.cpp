@@ -1075,6 +1075,11 @@ void NGMP_OnlineServicesManager::InitSentry()
 	// This ensures libcurl's internal mutexes are fully initialized before the EAC plugin
 	// attempts to use them, preventing an access violation in mtx_do_lock on null mutex state.
 	curl_global_init(CURL_GLOBAL_DEFAULT);
+	// Local headless simulations report failures to their supervising process.
+	// Crashpad can replace the exception with a generic termination code and
+	// production crash uploads are inappropriate for replay compatibility probes.
+	if (TheGlobalData->m_headless)
+		return;
 
 #if !_DEBUG
 	// game paths are in the process code page, sentry's char* API wants UTF-8, so hand it the wide path

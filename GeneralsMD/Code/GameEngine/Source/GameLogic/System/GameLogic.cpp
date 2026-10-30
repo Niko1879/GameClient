@@ -46,6 +46,9 @@
 #include "Common/OSDisplay.h"
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
+#include "Common/TrainingExporter.h"
+#include "Common/ReplayLogic.h"
+#include "Common/SelfPlay.h"
 #include "Common/PlayerList.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Radar.h"
@@ -1232,6 +1235,13 @@ void GameLogic::setGameMode(GameMode mode)
 	// ------------------------------------------------------------------------------------------------
 void GameLogic::startNewGame(Bool loadingSaveGame)
 {
+	// An earlier release's logic is for recorded playback only (Common/ReplayLogic.h).
+	if (TheReplayLogic != REPLAY_LOGIC_CURRENT && !(TheRecorder && TheRecorder->isPlaybackMode()))
+	{
+		printf("-replayLogic is valid only for replay playback\n");
+		exit(1);
+	}
+
 	try
 	{
 		tryStartNewGame(loadingSaveGame);
@@ -4038,6 +4048,9 @@ void GameLogic::update()
 
 	// process client commands
 	{
+        SelfPlayPreCommands();
+        SelfPlayRecordCommands();
+        TrainingExporterCapturePreCommands();
 		processCommandList(TheCommandList);
 	}
 
@@ -4342,6 +4355,8 @@ void GameLogic::destroyObject(Object* obj)
 	// if already flagged for destruction, ignore
 	if (!obj || obj->isDestroyed())
 		return;
+
+    TrainingObserveObjectRemoval(obj);
 
 	// run the object onDestroy event if provided
 	for (BehaviorModule** m = obj->getBehaviorModules(); *m; ++m)

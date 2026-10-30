@@ -531,6 +531,7 @@ public:
 
 	void setCurrentVictim( const Object *nemesis );			///<  Current victim.
 	Object *getCurrentVictim() const;
+	ObjectID getCurrentVictimID() const { return m_currentVictimID; }
 	virtual void notifyVictimIsDead() { }
 
 	// if we are attacking a position (and NOT an object), return it. otherwise return null.
@@ -656,6 +657,11 @@ public:
 #endif
 
 	Object* getGoalObject() { return getStateMachine()->getGoalObject(); }	///< return the id of the current state of the machine
+	ObjectID getGoalObjectID() const { return getStateMachine()->getGoalObjectID(); }
+	const Coord3D* getGoalPathEnd() const {
+		const Int count = getStateMachine()->getGoalPathSize();
+		return count > 0 ? getStateMachine()->getGoalPathPosition(count-1) : nullptr;
+	}
 	const Coord3D* getGoalPosition() const { return getStateMachine()->getGoalPosition(); }	///< return the id of the current state of the machine
 
 	WhichTurretType friend_getTurretSync() const { return m_turretSyncFlag; }

@@ -298,6 +298,7 @@ public:
 	// common parameters for state machines
 	void setGoalObject( const Object *obj );
 	Object *getGoalObject();
+	ObjectID getGoalObjectID() const { return m_goalObjectID; }
 	const Object *getGoalObject() const;
 	void setGoalPosition( const Coord3D *pos );
 	const Coord3D *getGoalPosition() const { return &m_goalPosition; }

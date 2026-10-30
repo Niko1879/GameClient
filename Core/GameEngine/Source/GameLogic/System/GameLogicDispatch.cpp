@@ -48,6 +48,9 @@
 #include "Common/ThingTemplate.h"
 #include "Common/Upgrade.h"
 #include "Common/StatsCollector.h"
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+#include "Common/TrainingExporter.h"
+#endif
 #include "Common/Radar.h"
 
 #include "GameLogic/AIPathfind.h"
@@ -404,6 +407,14 @@ void GameLogic::logicMessageDispatcher( GameMessage *msg, void *userData )
 			}
 		}
 	}
+
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+#if RETAIL_COMPATIBLE_AIGROUP
+    if (isInGame()) TrainingObserveCommand(msg, currentlySelectedGroup);
+#else
+    if (isInGame()) TrainingObserveCommand(msg, currentlySelectedGroup.Peek());
+#endif
+#endif
 
 #ifdef DEBUG_LOGGING
 	AsciiString commandName;
@@ -1886,13 +1897,20 @@ bool GameLogic::onDozerConstruct(MAYBE_UNUSED GameMessage *msg, AIGroupPtr &curr
 	loc = msg->getArgument( 1 )->location;
 	angle = msg->getArgument( 2 )->real;
 
-	if( place == nullptr || constructorObject == nullptr )
+	if( place == nullptr || constructorObject == nullptr ) {
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+        TrainingExporterBuildResult(msg, nullptr);
+#endif
 		return false;  //These are not crashes, as the object may have died before this message came in
+    }
 
 	if( msg->getType() == GameMessage::MSG_DOZER_CONSTRUCT )
 	{
-		TheBuildAssistant->buildObjectNow( constructorObject, place, &loc, angle,
+        Object *created = TheBuildAssistant->buildObjectNow( constructorObject, place, &loc, angle,
 																				constructorObject->getControllingPlayer() );
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+        TrainingExporterBuildResult(msg, created);
+#endif
 	}
 	else
 	{

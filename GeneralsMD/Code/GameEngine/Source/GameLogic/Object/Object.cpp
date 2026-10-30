@@ -50,6 +50,7 @@
 #include "Common/XferCRC.h"
 #include "Common/PerfTimer.h"
 #include "Common/StatsExporter.h"
+#include "Common/TrainingExporter.h"
 
 #include "GameClient/Anim2D.h"
 #include "GameClient/ControlBar.h"
@@ -2075,6 +2076,7 @@ void Object::healCompletely()
 //-------------------------------------------------------------------------------------------------
 void Object::setEffectivelyDead(Bool dead)
 {
+    if (dead && !isEffectivelyDead()) TrainingObserveObjectRemoval(this);
 	if (dead)
 		BitSet(m_privateStatus, EFFECTIVELY_DEAD);
 	else

@@ -32,6 +32,7 @@
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "Common/GameMemory.h"
 #include "Common/SubsystemInterface.h"
+#include <map>
 
 // FORWARD DECLARATIONS ///////////////////////////////////////////////////////////////////////////
 struct FieldParse;
@@ -231,6 +232,9 @@ public:
 protected:
 
 	TerrainType *m_terrainList;						///< list of available terrain types
+	// Names use the same case-sensitive comparison as the historical list scan.
+	// Keep the list for iteration/default inheritance; indexing is observer-neutral.
+	std::map<AsciiString, TerrainType *> m_terrainByName;
 
 };
 

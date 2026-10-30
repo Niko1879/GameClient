@@ -1,0 +1,8 @@
+# The converter pins and the feature key hash these files byte for byte, so a
+# line-ending conversion on checkout would invalidate prepared training data.
+/scripts/*.py -text
+/replay-runtime/*.json -text
+
+# Upstream tools in the same directory keep the normal line-ending rules.
+/scripts/fix_compile_commands.py text=auto
+/scripts/run-clang-tidy.py text=auto

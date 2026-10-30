@@ -32,6 +32,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/BuildAssistant.h"
+#include "Common/TrainingExporter.h"
 #include "Common/GlobalData.h"
 #include "Common/Player.h"
 #include "Common/ThingTemplate.h"
@@ -45,6 +46,7 @@
 #include "GameClient/InGameUI.h"
 #include "GameClient/TerrainVisual.h"
 #include "GameLogic/AI.h"
+#include "GameLogic/GameLogic.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/AIPathfind.h"
@@ -54,6 +56,24 @@
 #include "GameLogic/Module/CreateModule.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/ParkingPlaceBehavior.h"
+#include <chrono>
+
+namespace {
+class PlacementCheckTimer {
+	TrainingPlacementProfilePart part;
+	bool enabled;
+	std::chrono::steady_clock::time_point started;
+public:
+	PlacementCheckTimer(TrainingPlacementProfilePart value, UnsignedInt options)
+		: part(value), enabled((options & BuildAssistant::OBSERVED_PLACEMENT_PREVIEW) && TrainingExportProfilingEnabled()) {
+		if (enabled) started = std::chrono::steady_clock::now();
+	}
+	~PlacementCheckTimer() {
+		if (enabled) TrainingExportProfilePlacement(part,
+			std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count());
+	}
+};
+}
 
 // PUBLIC DATA ////////////////////////////////////////////////////////////////////////////////////
 BuildAssistant *TheBuildAssistant = nullptr;
@@ -653,6 +673,27 @@ void BuildAssistant::iterateFootprint( const ThingTemplate *build,
   * TheSuperHackers @tweak Stubbjax 05/09/2025 Return LBC_SHROUD for shrouded objects near the
 	* edge of the shroud so that players cannot use this info to determine whether they exist. */
 //-------------------------------------------------------------------------------------------------
+static Bool placementObjectObserved(const Object *object, const Object *builder)
+{
+	if (!builder || !builder->getControllingPlayer()) return FALSE;
+	return TrainingObjectVisibleTo(object, builder->getControllingPlayer()->getPlayerIndex());
+}
+
+class PlacementSupplyFilter : public PartitionFilter
+{
+	const Object *m_builder;
+public:
+	explicit PlacementSupplyFilter(const Object *builder) : m_builder(builder) {}
+	Bool allow(Object *object) override {
+		// Do not assume every neutral supply object was present on the map
+		// initially: newly spawned hidden supplies must not change this mask.
+		return placementObjectObserved(object, m_builder);
+	}
+#if defined(RTS_DEBUG)
+	const char *debugGetName() override { return "PlacementSupplyFilter"; }
+#endif
+};
+
 LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos,
 																											 const ThingTemplate *build,
 																											 Real angle,
@@ -669,6 +710,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 	MemoryPoolObjectHolder hold(iter);
 	for( them = iter->first(); them; them = iter->next() )
 	{
+		if (BitIsSet(options, OBSERVED_PLACEMENT_PREVIEW) && !placementObjectObserved(them, builderObject)) continue;
 		Bool feedbackWithFailure = TRUE;
 		Relationship rel = builderObject ? builderObject->getRelationship( them ) : NEUTRAL;
 
@@ -730,7 +772,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 		{
 			if( feedbackWithFailure )
 			{
-				TheTerrainVisual->addFactionBib( them, TRUE );
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib( them, TRUE );
 				return LBC_OBJECTS_IN_THE_WAY;
 			}
 			return LBC_GENERIC_FAILURE;
@@ -741,7 +783,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 			//Kris: If object is disabled, it can't move out of the way, thus you can't build there.
 			if( feedbackWithFailure )
 			{
-				TheTerrainVisual->addFactionBib( them, TRUE );
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib( them, TRUE );
 				return LBC_OBJECTS_IN_THE_WAY;
 			}
 			return LBC_GENERIC_FAILURE;
@@ -755,7 +797,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 		{
 			if( feedbackWithFailure )
 			{
-				TheTerrainVisual->addFactionBib( them, TRUE );
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib( them, TRUE );
 				return LBC_OBJECTS_IN_THE_WAY;
 			}
 			return LBC_GENERIC_FAILURE;
@@ -816,6 +858,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 
 	for( them = iter2->first(); them; them = iter2->next() )
 	{
+		if (BitIsSet(options, OBSERVED_PLACEMENT_PREVIEW) && !placementObjectObserved(them, builderObject)) continue;
 
 		Relationship rel = builderObject ? builderObject->getRelationship( them ) : NEUTRAL;
 		//Kris: If the building is stealthed and we can't see it, pretend we can build there.
@@ -862,7 +905,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 		}
 		if (ThePartitionManager->geomCollidesWithGeom(them->getPosition(), hisBounds, them->getOrientation(),
 			worldPos, myBounds, angle)) {
-			TheTerrainVisual->addFactionBib(them, true);
+			if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib(them, true);
 			return LBC_OBJECTS_IN_THE_WAY;
 		}
 		if (!checkMyExit && !checkHisExit && !hisExtraWidth && !myExtraWidth)
@@ -879,7 +922,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 				if (shrouded)
 					return LBC_SHROUD;
 				
-				TheTerrainVisual->addFactionBib(them, true);
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib(them, true);
 				return LBC_OBJECTS_IN_THE_WAY;
 			}
 			// Check for overlap of his exit rectangle with my geom info
@@ -888,7 +931,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 				if (shrouded)
 					return LBC_SHROUD;
 				
-				TheTerrainVisual->addFactionBib(them, true);
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib(them, true);
 				return LBC_OBJECTS_IN_THE_WAY;
 			}
 			// Check both exit rectangles together.
@@ -897,7 +940,7 @@ LegalBuildCode BuildAssistant::isLocationClearOfObjects( const Coord3D *worldPos
 				if (shrouded)
 					return LBC_SHROUD;
 				
-				TheTerrainVisual->addFactionBib(them, true);
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib(them, true);
 				return LBC_OBJECTS_IN_THE_WAY;
 			}
 		}
@@ -951,6 +994,7 @@ LegalBuildCode BuildAssistant::isLocationLegalToBuild( const Coord3D *worldPos,
 	//
 	if( BitIsSet( options, NO_OBJECT_OVERLAP ) )
 	{
+		PlacementCheckTimer timer(TP_OVERLAP, options);
 		LegalBuildCode code = isLocationClearOfObjects(worldPos, build, angle, builderObject, options, player);
 		if( code != LBC_OK )
 		{
@@ -975,7 +1019,8 @@ LegalBuildCode BuildAssistant::isLocationLegalToBuild( const Coord3D *worldPos,
 	{
 		// special case for supply centers: can't build too close to supply sources
 		PartitionFilterAcceptByKindOf f1(MAKE_KINDOF_MASK(KINDOF_SUPPLY_SOURCE), KINDOFMASK_NONE);
-		PartitionFilter *filters[] = { &f1, nullptr };
+		PlacementSupplyFilter observed(builderObject);
+		PartitionFilter *filters[] = { &f1, BitIsSet(options, OBSERVED_PLACEMENT_PREVIEW) ? &observed : nullptr, nullptr };
 
 		// see if there are any reasonably close by
 		Real range = build->getTemplateGeometryInfo().getBoundingCircleRadius() + TheGlobalData->m_SupplyBuildBorder*2;
@@ -993,7 +1038,7 @@ LegalBuildCode BuildAssistant::isLocationLegalToBuild( const Coord3D *worldPos,
 						tooCloseGeom,
 						tooClose->getOrientation()))
 			{
-				TheTerrainVisual->addFactionBib(tooClose, true, TheGlobalData->m_SupplyBuildBorder);
+				if (!BitIsSet(options, NO_PLACEMENT_FEEDBACK)) TheTerrainVisual->addFactionBib(tooClose, true, TheGlobalData->m_SupplyBuildBorder);
 				return LBC_TOO_CLOSE_TO_SUPPLIES;
 			}
 		}
@@ -1002,6 +1047,7 @@ LegalBuildCode BuildAssistant::isLocationLegalToBuild( const Coord3D *worldPos,
 	// if clear path is requested check to see if the builder object can get there (unless it's a structure)
 	if( BitIsSet( options, CLEAR_PATH ) && builderObject && !builderObject->isKindOf( KINDOF_IMMOBILE ) )
 	{
+		PlacementCheckTimer timer(TP_PATH, options);
 		const AIUpdateInterface *ai = builderObject->getAIUpdateInterface();
 
 		//
@@ -1014,7 +1060,12 @@ LegalBuildCode BuildAssistant::isLocationLegalToBuild( const Coord3D *worldPos,
 		if( ai == nullptr )
 			return LBC_NO_CLEAR_PATH;
 
-		if( ai->isQuickPathAvailable( worldPos ) == FALSE )
+		// The UI path check explicitly ignores structures when resolving
+		// terrain zones, so a hidden building cannot become a mask input.
+		const Bool pathAvailable = BitIsSet(options, OBSERVED_PLACEMENT_PREVIEW)
+			? TheAI->pathfinder()->clientSafeQuickDoesPathExistForUI(ai->getLocomotorSet(), builderObject->getPosition(), worldPos)
+			: ai->isQuickPathAvailable(worldPos);
+		if( pathAvailable == FALSE )
 				return LBC_NO_CLEAR_PATH;
 
 	}
@@ -1022,6 +1073,7 @@ LegalBuildCode BuildAssistant::isLocationLegalToBuild( const Coord3D *worldPos,
 	// check basic terrain restrctions
 	if( BitIsSet( options, TERRAIN_RESTRICTIONS ) )
 	{
+		PlacementCheckTimer timer(TP_TERRAIN, options);
 
 		//
 		// we will take "samples" at this resolution across the footprint of where we are

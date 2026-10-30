@@ -30,12 +30,17 @@
 #include "Common/CRCDebug.h"
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
+#include "Common/TrainingExporter.h"
+#include "Common/SelfPlay.h"
 #include "Common/version.h"
 #include "GameClient/ClientInstance.h"
 #include "GameClient/TerrainVisual.h" // for TERRAIN_LOD_MIN definition
 #include "GameClient/GameText.h"
 #include "GameNetwork/NetworkDefs.h"
 #include "WWLib/trim.h"
+#include "Common/ReplayLogic.h"
+
+ReplayLogic TheReplayLogic = REPLAY_LOGIC_CURRENT;
 
 
 
@@ -429,6 +434,63 @@ Int parseExportStats(char *args[], int num)
 	return 1;
 }
 
+Int parseExportTraining(char *args[], int num)
+{
+    if (num < 2 || args[1][0] == '-') {
+        printf("-exportTraining requires an output directory\n"); exit(1);
+    }
+    TrainingExporterConfigure(args[1]);
+    return 2;
+}
+
+Int parseTrainingInterval(char *args[], int num)
+{
+    char *end = nullptr;
+    long milliseconds = num > 1 ? strtol(args[1], &end, 10) : 0;
+    if (num < 2 || !end || *end || milliseconds < 1 || milliseconds > 10000) {
+        printf("-trainingInterval requires milliseconds in 1..10000\n"); exit(1);
+    }
+    TrainingExporterSetInterval(static_cast<Int>(milliseconds));
+    return 2;
+}
+
+Int parseTrainingPlacement(char *args[], int num)
+{
+    if (num < 2 || (strcmp(args[1], "fast") && strcmp(args[1], "full_mask"))) {
+        printf("-trainingPlacement requires fast or full_mask\n"); exit(1);
+    }
+    TrainingExporterSetPlacementMode(strcmp(args[1], "full_mask") == 0);
+    return 2;
+}
+
+Int parseTrainingFormat(char *args[], int num)
+{
+    if (num < 2 || (strcmp(args[1], "jsonl") && strcmp(args[1], "binary"))) {
+        printf("-trainingFormat requires jsonl or binary\n"); exit(1);
+    }
+    TrainingExporterSetBinaryFormat(strcmp(args[1], "binary") == 0);
+    return 2;
+}
+
+Int parseTrainingQuietCapture(char *args[], int num)
+{
+    if (num < 2 || (strcmp(args[1], "all") && strcmp(args[1], "scheduled"))) {
+        printf("-trainingQuietCapture requires all or scheduled\n"); exit(1);
+    }
+    TrainingExporterSetScheduledQuietCapture(strcmp(args[1], "scheduled") == 0);
+    return 2;
+}
+
+Int parseSelfPlay(char *args[], int num)
+{
+    SelfPlayConfigure();
+    rts::ClientInstance::setMultiInstance(TRUE);
+    rts::ClientInstance::skipPrimaryInstance();
+    TheWritableGlobalData->m_shellMapOn = FALSE;
+    TheWritableGlobalData->m_playIntro = FALSE;
+    return 1;
+}
+
 Int parseStatsUrl(char *args[], int num)
 {
 	if (num > 1)
@@ -437,6 +499,15 @@ Int parseStatsUrl(char *args[], int num)
 		return 2;
 	}
 	return 1;
+}
+
+Int parseReplayLogic(char *args[], int num)
+{
+	if (num < 2 || (strcmp(args[1], "current") && strcmp(args[1], "081326"))) {
+		printf("-replayLogic requires current or 081326\n"); exit(1);
+	}
+	TheReplayLogic = strcmp(args[1], "081326") == 0 ? REPLAY_LOGIC_081326 : REPLAY_LOGIC_CURRENT;
+	return 2;
 }
 
 Int parseReplay(char *args[], int num)
@@ -1158,6 +1229,7 @@ static CommandLineParam paramsForStartup[] =
 	// You can pass this multiple times to play back multiple replays.
 	// You can also include wildcards. The file must be in the replay folder or in a subfolder.
 	{ "-replay", parseReplay },
+	{ "-replayLogic", parseReplayLogic },
 
 	// TheSuperHackers @feature helmutbuhler 23/05/2025
 	// Simulate each replay in a separate process and use 1..N processes at the same time.
@@ -1167,6 +1239,12 @@ static CommandLineParam paramsForStartup[] =
 
 	// Export game stats as JSON alongside replay file.
 	{ "-exportStats", parseExportStats },
+    { "-exportTraining", parseExportTraining },
+    { "-trainingPlacement", parseTrainingPlacement },
+    { "-trainingFormat", parseTrainingFormat },
+    { "-trainingQuietCapture", parseTrainingQuietCapture },
+    { "-trainingInterval", parseTrainingInterval },
+    { "-selfPlay", parseSelfPlay },
 
 	// URL to POST compressed stats JSON after export.
 	{ "-statsUrl", parseStatsUrl },
