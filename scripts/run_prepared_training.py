@@ -15,7 +15,7 @@ RUN=ROOT/'model-training'
 DATA=ROOT/'training-data'
 CATALOG=ROOT/'replays/catalog/replay-catalog.sqlite3'
 MANIFEST=DATA/'.model-training.json'
-ENGINE=ROOT/'replay-runtime/game/engine-28e202027359781a.exe'
+ENGINE=ROOT/'replay-runtime/game/engine-6ae8ca8cd3cf2cc5.exe'
 STOP=RUN/'stop.json'
 
 for name in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):os.environ[name]='1'

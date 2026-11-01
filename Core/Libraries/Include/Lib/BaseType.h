@@ -32,6 +32,10 @@
 #include "Lib/BaseTypeCore.h"
 #include "Lib/trig.h"
 
+#if defined(_M_IX86_FP) && _M_IX86_FP >= 2
+#include <emmintrin.h>
+#endif
+
 //-----------------------------------------------------------------------------
 typedef wchar_t WideChar;  ///< multi-byte character representations
 
@@ -157,6 +161,20 @@ __forceinline long fast_float2long_round(float f)
 	__asm {
 		fld [f]
 		fistp [i]
+	}
+#elif defined(_M_IX86_FP) && _M_IX86_FP >= 2
+	// Exactly lroundf, inline: identical for all 2^32 floats in every x87 rounding and
+	// precision mode. The subtraction is exact, and so is independent of those modes.
+	const __m128 value = _mm_set_ss(f);
+	i = _mm_cvttss_si32(value);
+	if (i == (-2147483647L - 1L))
+	{
+		i = lroundf(f); // out of range, NaN, or exactly INT_MIN
+	}
+	else
+	{
+		const float fraction = _mm_cvtss_f32(_mm_sub_ss(value, _mm_cvtsi32_ss(_mm_setzero_ps(), i)));
+		i += (fraction >= 0.5f) - (fraction <= -0.5f);
 	}
 #else
 	i = lroundf(f);

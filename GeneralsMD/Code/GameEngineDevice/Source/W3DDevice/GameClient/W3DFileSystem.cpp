@@ -440,7 +440,8 @@ W3DFileSystem::W3DFileSystem()
 	_TheFileFactory = this; // override the w3d file factory.
 
 #if RTS_ZEROHOUR && PRIORITIZE_TEXTURES_BY_SIZE
-	reprioritizeTexturesBySize();
+	if (!TheGlobalData->m_headless)
+		reprioritizeTexturesBySize();
 #endif
 }
 

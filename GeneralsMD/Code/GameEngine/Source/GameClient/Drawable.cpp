@@ -4159,6 +4159,15 @@ void Drawable::reactToTransformChange(const Matrix3D* oldMtx, const Coord3D* old
 }
 
 //-------------------------------------------------------------------------------------------------
+void Drawable::followObjectTransform(const Matrix3D* mx)
+{
+	if (TheGlobalData->m_headless)
+		adoptTransformMatrix(mx);
+	else
+		setTransformMatrix(mx);
+}
+
+//-------------------------------------------------------------------------------------------------
 void Drawable::reactToGeometryChange()
 {
 	for (DrawModule** dm = getDrawModules(); *dm; ++dm)

@@ -139,7 +139,7 @@ private:
 	// this is an absolute frame, not a frame count.
 	// actually, it's not a real frame at all, it has phase info in the lower bits...
 	UnsignedInt m_nextCallFrameAndPhase;
-	Int m_indexInLogic;
+	Int m_sleepySlot;		///< this module's slot in GameLogic's sleepy-update index, or -1 when not in the heap
 
 protected:
 
@@ -205,14 +205,14 @@ public:
 		m_nextCallFrameAndPhase = (frame << 2) | getUpdatePhase();
 	}
 
-	UPDATEMODULE_FRIEND_DECLARATOR Int friend_getIndexInLogic() const
+	UPDATEMODULE_FRIEND_DECLARATOR Int friend_getSleepySlot() const
 	{
-		return m_indexInLogic;
+		return m_sleepySlot;
 	}
 
-	UPDATEMODULE_FRIEND_DECLARATOR void friend_setIndexInLogic(Int i)
+	UPDATEMODULE_FRIEND_DECLARATOR void friend_setSleepySlot(Int i)
 	{
-		m_indexInLogic = i;
+		m_sleepySlot = i;
 	}
 
 	UPDATEMODULE_FRIEND_DECLARATOR const Object* friend_getObject() const
@@ -223,14 +223,14 @@ public:
 };
 inline UpdateModule::UpdateModule( Thing *thing, const ModuleData* moduleData ) :
 	BehaviorModule( thing, moduleData ),
-	m_indexInLogic(-1),
+	m_sleepySlot(-1),
 	m_nextCallFrameAndPhase(0)
 {
 	// nothing
 }
 inline UpdateModule::~UpdateModule()
 {
-	DEBUG_ASSERTCRASH(m_indexInLogic == -1, ("destroying an updatemodule still in the logic list"));
+	DEBUG_ASSERTCRASH(m_sleepySlot == -1, ("destroying an updatemodule still in the logic list"));
 }
 
 //-------------------------------------------------------------------------------------------------

@@ -35,6 +35,8 @@
 #include "Common/GameMemory.h"
 #include "Common/AsciiString.h"
 
+#include <vector>
+
 //-------------------------------------------------------------------------------------------------
 // Note that NameKeyType isn't a "real" enum, but an enum type used to enforce the
 // fact that NameKeys are really magic cookies, and aren't really interchangeable
@@ -97,10 +99,8 @@ public:
 	NameKeyType nameToKey(const char* name);
 	NameKeyType nameToLowercaseKey(const char *name);
 
-	// given a key, return the name. this is almost never needed,
-	// except for a few rare cases like object serialization. also
-	// note that it's not particularly fast; it does a dumb linear
-	// search for the key.
+	// given a key, return the name. keys are unique, so this is a
+	// direct lookup; an unknown key returns the empty string.
 	AsciiString keyToName(NameKeyType key);
 
 	// Get a string out of the INI. Store it into a NameKeyType
@@ -126,6 +126,7 @@ private:
 	void freeSockets();
 
 	Bucket*				m_sockets[SOCKET_COUNT];			///< Catalog of all Buckets already generated
+	std::vector<Bucket*>	m_bucketsByKey;		///< The same Buckets, indexed by key
 	UnsignedInt		m_nextID;											///< Next available ID
 
 };

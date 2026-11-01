@@ -118,7 +118,7 @@ public:
 	void preUpdate();
 
 #if defined(RTS_DEBUG)
-	Int getNumberSleepyUpdates() const { return m_sleepyUpdates.size(); } //For profiling, so not in Release.
+	Int getNumberSleepyUpdates() const { return m_sleepyHeap.size(); } //For profiling, so not in Release.
 #endif
 	void processCommandList(CommandList* list);		///< process the command list
 
@@ -276,6 +276,7 @@ public:
 
 	// this should be called only by UpdateModule, thanks.
 	void friend_awakenUpdateModule(Object* obj, UpdateModulePtr update, UnsignedInt whenToWakeUp);
+	void friend_noteDisabledUntil(UnsignedInt frame) { if (frame < m_nextDisabledExpiry) m_nextDisabledExpiry = frame; }
 
 	Bool isQuitToDesktopRequested() const { return m_quitToDesktopAfterMatch; }
 
@@ -306,6 +307,9 @@ private:
 	Int rebalanceChildSleepyUpdate(Int i);
 	void remakeSleepyUpdate();
 	void validateSleepyUpdate() const;
+	UnsignedInt m_nextDisabledExpiry;	///< no object's timed disable can end before this frame
+	void clearSleepyUpdates();
+	void appendSleepyUpdate(UpdateModulePtr u);
 
 	bool onNewGame(GameMessage *msg);
 	bool onClearGameData(GameMessage *msg, AIGroupPtr &currentlySelectedGroup);
@@ -439,7 +443,17 @@ private:
 	// never modify it directly; please use the proper access methods.
 	// (for an excellent discussion of priority queues, please see:
 	// http://dogma.net/markn/articles/pq_stl/priority.htm)
-	std::vector<UpdateModulePtr> m_sleepyUpdates;
+	// Rebalancing touches only these contiguous tables, never the modules themselves:
+	// each entry's friend_getPriority() and index slot, and each slot's heap index.
+	struct SleepyEntry
+	{
+		UnsignedInt priority;
+		Int slot;
+		UpdateModulePtr module;
+	};
+	std::vector<SleepyEntry> m_sleepyHeap;
+	std::vector<Int> m_sleepyIndexBySlot;
+	std::vector<Int> m_sleepyFreeSlots;
 
 #ifdef ALLOW_NONSLEEPY_UPDATES
 	// this is a plain old list, not a pq.

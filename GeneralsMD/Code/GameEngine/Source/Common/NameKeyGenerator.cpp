@@ -85,6 +85,7 @@ void NameKeyGenerator::freeSockets()
 		}
 		m_sockets[i] = nullptr;
 	}
+	m_bucketsByKey.clear();
 
 }
 
@@ -111,14 +112,10 @@ inline UnsignedInt calcHashForLowercaseString(const char* p)
 //-------------------------------------------------------------------------------------------------
 AsciiString NameKeyGenerator::keyToName(NameKeyType key)
 {
-	for (Int i = 0; i < SOCKET_COUNT; ++i)
-	{
-		for (Bucket *b = m_sockets[i]; b; b = b->m_nextInSocket)
-		{
-			if (key == b->m_key)
-				return b->m_nameString;
-		}
-	}
+	// the unsigned cast also sends negative keys out of range.
+	const UnsignedInt index = (UnsignedInt)key;
+	if (index < m_bucketsByKey.size() && m_bucketsByKey[index])
+		return m_bucketsByKey[index]->m_nameString;
 	return AsciiString::TheEmptyString;
 }
 
@@ -220,6 +217,11 @@ NameKeyType NameKeyGenerator::createNameKey(UnsignedInt hash, const AsciiString&
 	b->m_nameString = name;
 	b->m_nextInSocket = m_sockets[hash];
 	m_sockets[hash] = b;
+
+	const UnsignedInt index = (UnsignedInt)b->m_key;
+	if (index >= m_bucketsByKey.size())
+		m_bucketsByKey.resize(index + 1, nullptr);
+	m_bucketsByKey[index] = b;
 
 	NameKeyType result = b->m_key;
 

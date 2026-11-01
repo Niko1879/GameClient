@@ -180,6 +180,7 @@
             "displayName": "Windows 32bit VCPKG Optimized",
             "cacheVariables": {
                 "RTS_BUILD_OPTION_OPTIMIZED": "ON",
+                "RTS_BUILD_OPTION_CFG": "OFF",
                 "RTS_MEMORYPOOL_DEBUG": "OFF",
                 "RTS_MEMORYPOOL_DEBUG_CUSTOM_NEW": "OFF",
                 "RTS_MEMORYPOOL_DEBUG_BOUNDINGWALL": "OFF"
@@ -190,7 +191,8 @@
             "inherits": "win32-vcpkg-optimized",
             "displayName": "Windows 32bit VCPKG PGO Generate",
             "cacheVariables": {
-                "RTS_BUILD_OPTION_PGO": "GENERATE"
+                "RTS_BUILD_OPTION_PGO": "GENERATE",
+                "RTS_PGO_FILE": "${sourceDir}/.cache/sim-profile/genzh.pgd"
             }
         },
         {
@@ -198,7 +200,8 @@
             "inherits": "win32-vcpkg-optimized",
             "displayName": "Windows 32bit VCPKG PGO Use",
             "cacheVariables": {
-                "RTS_BUILD_OPTION_PGO": "USE"
+                "RTS_BUILD_OPTION_PGO": "USE",
+                "RTS_PGO_FILE": "${sourceDir}/.cache/sim-profile/genzh.pgd"
             }
         },
         {

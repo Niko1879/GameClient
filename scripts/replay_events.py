@@ -156,19 +156,20 @@ def decisions(rows, config, counts, validate=None, observe=None):
 class EventValidator:
     """Encode a selected candidate; reject it if its target is unrepresentable.
 
-    With encode_waits=False (the scheduled-capture controller) a selected wait
-    is accepted without encoding: decisions() requires every wait to be
-    representable, so only command acceptance shapes the schedule.
+    With schedule_only (the scheduled-capture controller) a selected wait is
+    accepted without encoding: decisions() requires every wait to be
+    representable, so only command acceptance shapes the schedule. A command
+    checks only what policy.target() reads, and nothing is kept for encoding.
     """
-    def __init__(self, policy, game, counts, first_observation, *, encode_waits=True):
-        self.policy, self.game, self.counts, self.encode_waits = policy, game, counts, encode_waits
+    def __init__(self, policy, game, counts, first_observation, *, schedule_only=False):
+        self.policy, self.game, self.counts, self.schedule_only = policy, game, counts, schedule_only
         self.home = initial_home(first_observation)
 
     def __call__(self, event):
         source = event['source']
         if 'observation' not in source:
             raise ValueError('Scheduled capture omitted a selected observation')
-        if not self.encode_waits and not event['actions'] and self.home is not None:
+        if self.schedule_only and not event['actions'] and self.home is not None:
             return True
         # Detach selected binary data before encoding/buffering so chunk memory
         # accounting sees ordinary containers and retains no source block.
@@ -176,19 +177,24 @@ class EventValidator:
         observation = materialize(source['observation'])
         if self.home is None:
             self.home = initial_home(observation)
-        if not self.encode_waits and not event['actions']:
+        if self.schedule_only and not event['actions']:
             return True
         game, policy = self.game, self.policy
-        encoded = policy.encoder.encode(observation, game['map'], source['frame'],
-            previous_frame=event['previous_frame'], home_position=self.home,
-            source_ticks_per_second=game['source_ticks_per_second'])
-        encoded['event_rate'] = game['source_ticks_per_second']
+        if self.schedule_only:
+            encoded = policy.encoder.schedule_inputs(observation, game['map'])
+        else:
+            encoded = policy.encoder.encode(observation, game['map'], source['frame'],
+                previous_frame=event['previous_frame'], home_position=self.home,
+                source_ticks_per_second=game['source_ticks_per_second'])
+            encoded['event_rate'] = game['source_ticks_per_second']
         try:
             target = policy.target(encoded, event['actions'])
         except (Unrepresentable, KeyError) as error:
             self.counts['structural_exclusions'] += 1
             self.counts['structural:'+str(error)] += 1
             return False
+        if self.schedule_only:
+            return True
         event['prepared'] = {'encoded': encoded, 'target': target, 'hold_ticks': 0,
                'scope': 'event', 'frame': source['frame'], 'player': game['player'],
                'source_ticks_per_second': game['source_ticks_per_second']}

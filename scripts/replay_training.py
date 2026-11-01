@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+import time
 from collections import Counter
 from replay_storage import open_trajectory, manifest_path
 
@@ -193,14 +194,18 @@ def audit(path, *, level='integrity', command_counter=None, record_consumer=None
         if record_consumer is not None:
             record_consumer(record)
     require(header is not None and terrain is not None and footer is not None, "Incomplete trajectory")
-    require(footer["valid"] and footer["playback_completed"] and not footer["crc_mismatch"],
+    # A trimmed export diverged after this frame and holds nothing later (trim_export).
+    verified_through = footer.get("verified_through_frame")
+    require(footer["valid"] and (footer["playback_completed"] and not footer["crc_mismatch"] if verified_through is None
+                                 else footer["crc_mismatch"] and verified_through == footer["final_frame"]),
             "Playback failed or was not training eligible")
     require(footer["recorded_crc_messages_seen"] > 0, "No recorded CRC coverage")
     if "recorded_crc_messages_compared" in footer:
         require(0 < footer["recorded_crc_messages_compared"] <= footer["recorded_crc_messages_seen"],
                 "No actual recorded CRC comparisons, or invalid comparison count")
-        require(footer.get("replay_stream_eof") is True, "Replay command stream did not reach clean EOF")
-        require(footer["final_frame"] >= footer["last_recorded_command_frame"], "Replay stopped before its last command")
+        if verified_through is None:
+            require(footer.get("replay_stream_eof") is True, "Replay command stream did not reach clean EOF")
+            require(footer["final_frame"] >= footer["last_recorded_command_frame"], "Replay stopped before its last command")
     require(samples > 0 and command_count > 0, "Empty demonstration")
     require((samples, command_count, waits) == (footer["samples"], footer["commands"], footer["wait_samples"]),
             "Footer counts disagree")
@@ -212,6 +217,8 @@ def audit(path, *, level='integrity', command_counter=None, record_consumer=None
     if "recorded_crc_messages_compared" in footer:
         result.update({key: footer[key] for key in ("recorded_crc_messages_compared", "replay_stream_eof",
                                                   "last_recorded_command_frame")})
+    if verified_through is not None:
+        result["verified_through_frame"] = verified_through
     result['observation_policy_version'] = header['observation_policy']['version']
     for field in ('observed_sighting_removals', 'temporary_sightings_forgotten'):
         if field in footer:
@@ -276,12 +283,30 @@ def iter_samples(path):
             yield record
 
 
+# One job hashes each input many times: every check that a file has not changed
+# since an earlier step. Such a check needs only the file's identity. A file changed
+# within the timestamp's granularity of being hashed is not remembered.
+_DIGESTS = {}
+_SETTLED_NANOSECONDS = 2_000_000_000
+
+
 def file_sha256(path):
+    path = Path(path)
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    known = _DIGESTS.get(key)
+    if known is not None:
+        return known
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
-    return digest.hexdigest()
+    result = digest.hexdigest()
+    if time.time_ns()-stat.st_mtime_ns > _SETTLED_NANOSECONDS:
+        if len(_DIGESTS) >= 4096:
+            _DIGESTS.clear()
+        _DIGESTS[key] = result
+    return result
 
 
 def replay_stream_summary(replay):
@@ -294,6 +319,37 @@ def replay_stream_summary(replay):
         previous, count = frame, count + 1
     require(count > 0, "Replay has no complete recorded commands")
     return {"messages": count, "last_command_frame": previous}
+
+
+# Common playback failures replay fully, so a used engine re-checks one in
+# LEAK_CHECK_EVERY in a new process rather than losing reuse's saving to them.
+SAMPLED_LEAK_CHECKS = ('crc_diverged', 'map_mismatch')
+LEAK_CHECK_EVERY = 20
+
+
+# A diverged replay is kept up to its last matching CRC if that covers this much play.
+CRC_PREFIX_MINIMUM_SECONDS = 60
+
+
+def verified_crc_frame(native, header, log_text):
+    """The last frame a recorded CRC confirmed in a diverged playback, or None to reject it.
+
+    The Nth comparison checks the engine's CRC of frame N*interval: its frame-0 CRC is
+    never queued (Recorder.cpp CRCInfo::addCRC). The count includes the failed comparison,
+    so frame (N-1)*interval is the last one confirmed. GameLogic::update computes the CRC
+    and captures that frame's samples with no simulation between them.
+    """
+    interval = int(header.get('crc_interval') or 0)
+    comparisons = native['crc_comparisons']
+    # A CRC cannot be compared before its frame, so this catches a wrong interval.
+    if interval <= 0 or comparisons*interval > native['final_frame'] or 'Training export failed' in log_text:
+        return None
+    frame = (comparisons-1)*interval
+    return frame if frame >= CRC_PREFIX_MINIMUM_SECONDS*native['ticks_per_second'] else None
+
+
+class EngineLeakError(Exception):
+    """An earlier game changed a replay's result in a reused engine process."""
 
 
 class ExportPlaybackError(ValueError):
@@ -335,58 +391,92 @@ def export(args):
     require(not any(path.exists() for path in incomplete),
             'Incomplete export already exists; choose a new output directory')
     replay_arg = os.path.relpath(replay, user_data / "Replays")
-    command = [str(exe), "-headless", "-replay", replay_arg,
-               "-exportTraining", str(destination), "-trainingInterval", str(args.interval_ms)]
-    command.extend(['-trainingPlacement', getattr(args, 'placement_mode', 'fast')])
+    options = ["-trainingInterval", str(args.interval_ms), '-trainingPlacement', getattr(args, 'placement_mode', 'fast')]
     if binary:
-        command.extend(['-trainingFormat', args.storage])
+        options.extend(['-trainingFormat', args.storage])
     # An earlier release's game logic, for replays it recorded (engine Common/ReplayLogic.h).
     logic = getattr(args, 'replay_logic', 'current')
     require(logic in ('current', '081326'), 'Unknown replay logic')
-    if logic != 'current':
-        command.extend(['-replayLogic', logic])
     # scheduled: quiet observations only where the event schedule can use them
     # (scheduled_capture.py); preparation output is unchanged.
     quiet_capture = getattr(args, 'quiet_capture', 'all')
     require(quiet_capture in ('all', 'scheduled'), 'Quiet capture must be all or scheduled')
-    controller = None
     if quiet_capture == 'scheduled':
         require(binary and getattr(args, 'capture_policy', None), 'Scheduled capture needs binary storage and a policy')
-        command.extend(['-trainingQuietCapture', 'scheduled'])
-        from scheduled_capture import CaptureController
-        controller = CaptureController(args.capture_policy, replay, trajectory)
+        options.extend(['-trainingQuietCapture', 'scheduled'])
     if data_pack is not None:
         # Mount one historical override for this process. Do not combine it
         # with the user's current community patch or replace installed data.
-        command.extend(["-disableCommunityDataPatch", "-mod", str(data_pack)])
+        options.extend(["-disableCommunityDataPatch", "-mod", str(data_pack)])
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     log_path = destination / (replay.name + ".engine.log")
-    from scheduled_capture import run_engine
-    try:
-        returncode = run_engine(command, cwd=exe.parent, log_path=log_path, timeout=args.timeout,
-                                creationflags=creationflags, controller=controller)
-    except subprocess.TimeoutExpired as error:
+    session = getattr(args, 'engine_session', None)
+    if session is None:
+        command = [str(exe), "-headless", "-replay", replay_arg, "-exportTraining", str(destination), *options]
+        if logic != 'current':
+            command.extend(['-replayLogic', logic])
+    else:
+        # Everything fixed at engine startup; the rest travels with each job.
+        command = [str(exe), "-headless", "-replayServer", *options]
+    from scheduled_capture import CaptureController, run_engine
+    from replay_revision_survey import classify
+
+    def play():
+        """One native run of this replay: (status, validation, exit code, earlier games in its process)."""
+        controller = (CaptureController(args.capture_policy, replay, trajectory)
+                      if quiet_capture == 'scheduled' else None)
+        earlier = 0
+        try:
+            if session is None:
+                returncode = run_engine(command, cwd=exe.parent, log_path=log_path, timeout=args.timeout,
+                                        creationflags=creationflags, controller=controller)
+            else:
+                returncode, earlier = session.run(command, dict(replay=replay_arg, output=str(destination), logic=logic),
+                                                  cwd=exe.parent, log_path=log_path, timeout=args.timeout,
+                                                  creationflags=creationflags, controller=controller)
+        except subprocess.TimeoutExpired as error:
+            for path in [trajectory, *incomplete]:
+                path.unlink(missing_ok=True)
+            raise ExportPlaybackError('timeout', None, None, log_path) from error
+        # This is the compatibility playback too. Reject before hashing/auditing a
+        # failed trajectory, and let routing continue using this run's evidence.
+        native_text = log_path.read_text(encoding='utf-8', errors='replace')
+        native_rows = [json.loads(line[len('ReplayValidation '):])
+                       for line in native_text.splitlines()
+                       if line.startswith('ReplayValidation ')]
+        native = native_rows[-1] if native_rows else None
+        status = classify(native, replay_header, stream_summary, returncode, native_text)
+        if status in ('passed', 'crc_diverged') and getattr(args, 'ticks_per_second', None) is not None:
+            if native['ticks_per_second'] != args.ticks_per_second:
+                status = 'rate_mismatch'
+        return status, native, returncode, earlier
+
+    status, native, returncode, earlier = play()
+    if status != 'passed' and earlier and (status not in SAMPLED_LEAK_CHECKS
+                                           or int(replay_digest[:8], 16) % LEAK_CHECK_EVERY == 0):
+        # A failure in a used engine might be state left by an earlier game, and a
+        # failed replay is not exported again. Replay it in a new process to find out.
+        session.close()
         for path in [trajectory, *incomplete]:
             path.unlink(missing_ok=True)
-        raise ExportPlaybackError('timeout', None, None, log_path) from error
-    # This is the compatibility playback too. Reject before hashing/auditing a
-    # failed trajectory, and let routing continue using this run's evidence.
-    native_text = log_path.read_text(encoding='utf-8', errors='replace')
-    native_rows = [json.loads(line[len('ReplayValidation '):])
-                   for line in native_text.splitlines()
-                   if line.startswith('ReplayValidation ')]
-    from replay_revision_survey import classify
-    native = native_rows[-1] if native_rows else None
-    status = classify(native, replay_header, stream_summary, returncode, native_text)
-    if status == 'passed' and getattr(args, 'ticks_per_second', None) is not None:
-        if native['ticks_per_second'] != args.ticks_per_second:
-            status = 'rate_mismatch'
-    if status != 'passed':
+        warm, warm_native = status, native
+        status, native, returncode, earlier = play()
+        moved = status == warm == 'crc_diverged' and native['crc_comparisons'] != warm_native['crc_comparisons']
+        if warm in SAMPLED_LEAK_CHECKS and (status != warm or moved):
+            # Such a leak could also have altered exports that passed: stop the service.
+            raise EngineLeakError(f'{replay.name} {warm} in a used engine but {status} in a new one')
+    verified_through = None
+    if status == 'crc_diverged' and binary and incomplete[1].is_file():
+        verified_through = verified_crc_frame(native, replay_header, log_path.read_text(encoding='utf-8', errors='replace'))
+    if status != 'passed' and verified_through is None:
         # These paths did not exist before this invocation. Keep native logs
         # and structured evidence, rather than potentially huge rejected rows.
         for path in [trajectory, *incomplete]:
             path.unlink(missing_ok=True)
         raise ExportPlaybackError(status, native, returncode, log_path)
+    if verified_through is not None:
+        from binary_replay import trim_export
+        trim_export(incomplete[1], trajectory, verified_through, native['crc_comparisons']-1)
     trajectory_digest = file_sha256(trajectory)
     captured_commands = Counter()
     from replay_metadata import AuditedReplayMetadata, RECEIPT_FIELD, implementation_identity, make_receipt
@@ -397,8 +487,9 @@ def export(args):
     require(file_sha256(replay) == replay_digest, "Replay changed during export")
     if data_pack is not None:
         require(file_sha256(data_pack) == data_pack_digest, "Historical data package changed during export")
-    require(summary["final_frame"] >= stream_summary["last_command_frame"], "Export missed the end of the recorded stream")
-    if "last_recorded_command_frame" in summary:
+    require(verified_through is not None or summary["final_frame"] >= stream_summary["last_command_frame"],
+            "Export missed the end of the recorded stream")
+    if verified_through is None and "last_recorded_command_frame" in summary:
         require(summary["last_recorded_command_frame"] == stream_summary["last_command_frame"],
                 "Engine and independent parser disagree about the final recorded command")
     from audit_replay_commands import reconcile
@@ -407,7 +498,9 @@ def export(args):
     manifest = {"schema_version": 1, "replay": str(replay), "replay_sha256": replay_digest,
                 "replay_stream": stream_summary,
                 "replay_header": replay_header, "engine": str(exe), "engine_sha256": file_sha256(exe),
-                "engine_command": command, "compatibility_evidence": "completed engine recorded CRC checks",
+                "engine_command": command, "engine_earlier_games": earlier,
+                "compatibility_evidence": ("completed engine recorded CRC checks" if verified_through is None
+                                           else f"engine recorded CRC checks through frame {verified_through}"),
                 "trajectory": str(trajectory), "trajectory_sha256": trajectory_digest, "audit": summary,
                 "native_validation": native, "command_reconciliation": reconciliation}
     if binary:

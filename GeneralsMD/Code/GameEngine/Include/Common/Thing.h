@@ -117,7 +117,15 @@ public:
 	void setOrientation( Real angle );
 
 	const Coord3D *getPosition() const { return &m_cachedPos; }
-	Real getOrientation() const { return m_cachedAngle; }
+	Real getOrientation() const
+	{
+		if (m_cacheFlags & STALE_ANGLE)
+		{
+			m_cachedAngle = m_transform.Get_Z_Rotation();
+			m_cacheFlags &= ~STALE_ANGLE;
+		}
+		return m_cachedAngle;
+	}
 
 	Bool isPositioned() const;
 
@@ -155,6 +163,9 @@ protected:
 
 	virtual void reactToTransformChange(const Matrix3D* oldMtx, const Coord3D* oldPos, Real oldAngle) = 0;
 
+	/// Adopt a transform with no reaction, and the costly angle computed only if it is read.
+	void adoptTransformMatrix(const Matrix3D *mx);
+
 private:
 
 	// note that it is declared 'const' -- the assumption being that
@@ -178,7 +189,8 @@ private:
 	{
 		VALID_DIRVECTOR = 0x01,
 		VALID_ALTITUDE_TERRAIN = 0x02,
-		VALID_ALTITUDE_SEALEVEL = 0x04
+		VALID_ALTITUDE_SEALEVEL = 0x04,
+		STALE_ANGLE = 0x08
 	};
 
 	mutable Coord3D		m_cachedPos;												///< position of thing

@@ -17,6 +17,11 @@ Bool TrainingExporterIsEnabled();
 Bool TrainingExporterBegin(const AsciiString &replay);
 void TrainingExporterCapturePreCommands();
 Bool TrainingExporterFinish(Bool playbackSucceeded, Bool crcMismatch);
+// -replayServer: export one replay per stdin line in this process, keeping the
+// loaded game data. Each process serves one INI package (-mod is fixed at startup).
+void TrainingExporterServerConfigure();
+Bool TrainingExporterServerEnabled();
+Int TrainingExporterServe();
 // Optional performance counters, outside exported observations and game state.
 enum TrainingPlacementProfilePart { TP_OVERLAP, TP_PATH, TP_TERRAIN };
 Bool TrainingExportProfilingEnabled();

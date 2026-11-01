@@ -40,10 +40,16 @@ MODEL_ONLY = {'hidden', 'entity_hidden', 'embedding', 'attention_heads', 'map_hi
               'variant_l2', 'argument_loss_weights', 'delay_loss_weight'}
 
 
+_FEATURE_CODE = []
+
+
 def feature_identity(policy):
+    # Code is hashed as loaded; source_guard stops the service if its files change.
+    if not _FEATURE_CODE:
+        _FEATURE_CODE.extend(inspect.getsource(obj) for obj in FEATURE_CODE)
     identity = {'schema': SCHEMA,
                 'config': {k: v for k, v in policy.config.items() if k not in MODEL_ONLY},
-                'feature_code': [inspect.getsource(obj) for obj in FEATURE_CODE],
+                'feature_code': _FEATURE_CODE,
                 'constants': {name: getattr(generals_policy, name) for name in FEATURE_CONSTANTS},
                 'dependencies': {name: _digest(Path(__file__).with_name(name)) for name in FEATURE_SOURCES}}
     return hashlib.sha256(_json_bytes(identity)).hexdigest()
@@ -142,6 +148,12 @@ class _PreparationDecoder:
             _preparation_guard(self.output, self.minimum_ram, self.stopped)
         self.count += 1
         return self.decoder.decode(*args, **kwargs)
+
+    def raw_decode(self, *args, **kwargs):
+        if self.count % 128 == 0:
+            _preparation_guard(self.output, self.minimum_ram, self.stopped)
+        self.count += 1
+        return self.decoder.raw_decode(*args, **kwargs)
 
 
 def _initialize_preparation(config, output, minimum_ram, stopped):

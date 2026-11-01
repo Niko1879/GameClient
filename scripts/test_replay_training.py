@@ -7,7 +7,7 @@ import unittest
 from collections import Counter
 from unittest.mock import patch
 
-from replay_training import audit, iter_samples, replay_stream_summary
+from replay_training import audit, iter_samples, replay_stream_summary, verified_crc_frame
 from audit_replay_commands import reconcile
 
 
@@ -31,6 +31,35 @@ def fixture():
               "samples": 2, "commands": 1, "wait_samples": 1, "final_frame": 12,
               "recorded_crc_messages_seen": 1}
     return [header, terrain, sample, wait, footer]
+
+
+class FileDigestTests(unittest.TestCase):
+    def test_a_settled_file_is_hashed_once_and_any_change_is_seen(self):
+        import hashlib
+        import os
+        from unittest import mock
+        import replay_training
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'file.bin'
+            path.write_bytes(b'first')
+            old = os.stat(path).st_mtime-60
+            os.utime(path, (old, old))
+            digest = replay_training.file_sha256(path)
+            self.assertEqual(digest, hashlib.sha256(b'first').hexdigest())
+            with mock.patch.object(Path, 'open', side_effect=AssertionError('hashed again')):
+                self.assertEqual(replay_training.file_sha256(path), digest)
+            # Same size, later time: a rewrite.
+            path.write_bytes(b'other')
+            os.utime(path, (old+5, old+5))
+            self.assertEqual(replay_training.file_sha256(path), hashlib.sha256(b'other').hexdigest())
+            # Same size within the timestamp's granularity is not trusted while recent.
+            fresh = Path(directory)/'fresh.bin'
+            fresh.write_bytes(b'aaaaa')
+            first = replay_training.file_sha256(fresh)
+            stat = os.stat(fresh)
+            fresh.write_bytes(b'bbbbb')
+            os.utime(fresh, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            self.assertNotEqual(replay_training.file_sha256(fresh), first)
 
 
 class TrainingAuditTests(unittest.TestCase):
@@ -230,6 +259,48 @@ class TrainingAuditTests(unittest.TestCase):
             self.write(rows)
             with self.assertRaises(ValueError):
                 audit(self.path)
+
+    def test_verified_frame_is_the_crc_before_the_failed_comparison(self):
+        native = dict(crc_comparisons=73, final_frame=7310, ticks_per_second=60)
+        header = dict(crc_interval='100')
+        self.assertEqual(verified_crc_frame(native, header, ''), 7200)
+        # Exactly the minimum is kept; a comparison earlier is pointless.
+        self.assertEqual(verified_crc_frame(dict(native, crc_comparisons=37), header, ''), 3600)
+        self.assertIsNone(verified_crc_frame(dict(native, crc_comparisons=36), header, ''))
+        # A comparison later than its playback, no interval or a broken capture proves nothing.
+        self.assertIsNone(verified_crc_frame(dict(native, crc_comparisons=74), header, ''))
+        self.assertIsNone(verified_crc_frame(native, dict(crc_interval=None), ''))
+        self.assertIsNone(verified_crc_frame(native, header, 'Training export failed: x\n'))
+
+    def test_trimmed_footer_needs_divergence_and_its_verified_frame(self):
+        rows = fixture()
+        rows[-1].update(playback_completed=False, crc_mismatch=True, verified_through_frame=12,
+                        recorded_crc_messages_compared=1, replay_stream_eof=False, last_recorded_command_frame=99)
+        self.write(rows)
+        self.assertEqual(audit(self.path)['verified_through_frame'], 12)
+        for key, value in (('crc_mismatch', False), ('valid', False), ('verified_through_frame', 6),
+                           ('recorded_crc_messages_compared', 0)):
+            with self.subTest(field=key):
+                changed = copy.deepcopy(rows)
+                changed[-1][key] = value
+                self.write(changed)
+                with self.assertRaises(ValueError):
+                    audit(self.path)
+
+    def test_reconciliation_of_a_trimmed_export_stops_at_its_verified_frame(self):
+        rows = fixture()
+        rows[2]['actions'][0]['type_id'] = 1001
+        rows[-1].update(playback_completed=False, crc_mismatch=True, verified_through_frame=12)
+        self.write(rows)
+        summary = audit(self.path)
+        with patch('audit_replay_commands.message_names', return_value={1001: 'MSG_DO_MOVETO'}):
+            with patch('audit_replay_commands.binary_commands', return_value=iter([(6, 1001, 3), (13, 1001, 3)])):
+                proof = reconcile('unused.rep', self.path, audit_summary=summary, captured_commands=Counter({(6, 1001, 3): 1}))
+            self.assertTrue(proof['all_controlled_commands_captured'])
+            # A command inside the verified range must still be there.
+            with patch('audit_replay_commands.binary_commands', return_value=iter([(6, 1001, 3), (12, 1001, 3)])):
+                with self.assertRaises(ValueError):
+                    reconcile('unused.rep', self.path, audit_summary=summary, captured_commands=Counter({(6, 1001, 3): 1}))
 
     def test_explicit_crc_and_stream_completion_evidence(self):
         rows = fixture()

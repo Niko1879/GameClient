@@ -432,7 +432,7 @@ AudioHandle AudioManager::addAudioEvent(const AudioEventRTS *eventToAdd)
 #else
 	const Bool logicalAudio = FALSE;
 #endif
-	const Bool notForLocal = !eventToAdd->getUninterruptible() && !shouldPlayLocally(eventToAdd);
+	const Bool notForLocal = TheGlobalData->m_headless || (!eventToAdd->getUninterruptible() && !shouldPlayLocally(eventToAdd));
 
 	if (!logicalAudio && notForLocal)
 	{

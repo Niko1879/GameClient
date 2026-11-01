@@ -123,17 +123,27 @@ def prepare_batch(dataset, output, config_path, *, action_catalog, minimum_ram=1
     return destination
 
 
+_VERIFIED = set()
+
+
 def verify_prepared(dataset):
     data = EventDataset(dataset)
     expected = feature_identity(NeuralPolicy(data.config, parameters=False))
     if data.key != expected:
         raise ValueError('Prepared feature implementation changed')
     for entry in data.entries:
-        _check_preparation(data.shard_path(entry), entry, data.key,
-            entry['match_key'], entry['index']['source']['sha256'])
-        with zipfile.ZipFile(data.shard_path(entry)) as archive:
-            if archive.testzip() is not None:
-                raise ValueError('Prepared shard CRC failed')
+        path = data.shard_path(entry)
+        _check_preparation(path, entry, data.key, entry['match_key'], entry['index']['source']['sha256'])
+        # A job verifies the same shard at each step: read its members once.
+        stat = path.stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns, entry['archive_sha256'])
+        if key not in _VERIFIED:
+            with zipfile.ZipFile(path) as archive:
+                if archive.testzip() is not None:
+                    raise ValueError('Prepared shard CRC failed')
+            if len(_VERIFIED) >= 4096:
+                _VERIFIED.clear()
+            _VERIFIED.add(key)
     return data
 
 

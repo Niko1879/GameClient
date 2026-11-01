@@ -19,7 +19,7 @@ import uuid
 for variable in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):
     os.environ[variable]='1'
 
-from replay_conversion import (ROOT,WORK,CATALOG,DATA,connect,contract,inventory,recover,
+from replay_conversion import (ROOT,WORK,CATALOG,DATA,ENGINE_HAS_REPLAY_SERVER,connect,contract,inventory,recover,
     claim,update,counts,due,source_guard,worker_main,save,ACTIVE,remove_owned,refresh_collection)
 from replay_catalog import record_failure,resolve_failures
 from replay_training import AUDIT_LEVELS
@@ -27,8 +27,15 @@ from replay_training import AUDIT_LEVELS
 CONTROL=ROOT/'replay-runtime/converter.json'
 STATUS=WORK/'status.json'
 DEFAULTS=dict(workers=8,paused=False,stop=False,stop_now=False,interrupt_excess=False,startup_ram_mib=2304,
-    reserve_ram_mib=1024,max_private_mib=8192,reserve_disk_gib=80,timeout_seconds=2400,scan_seconds=300,
-    audit_level='integrity')
+    warm_ram_mib=1536,reserve_ram_mib=1024,max_private_mib=8192,reserve_disk_gib=80,timeout_seconds=2400,scan_seconds=300,
+    audit_level='integrity',reuse_engine=False,engine_games=100)
+# Measured on 22-minute games, 31 October 2026. A job on a worker with a live engine
+# adds ~100 MiB, ~300 at worst; an idle engine holds about this much.
+JOB_RAM_MIB=256
+ENGINE_RAM_MIB=150
+# A big game leaves 120-150 MiB of empty pools in arenas that one live pool each keeps
+# allocated. Only ending the process returns them, and a new worker boots in seconds.
+WORKER_RECYCLE_MIB=200
 
 
 def settings(path=None):
@@ -38,15 +45,18 @@ def settings(path=None):
 
 def validate_settings(value):
     if set(value)!=set(DEFAULTS):raise ValueError('Converter settings have missing or unknown fields')
-    for name in ('paused','stop','stop_now','interrupt_excess'):
+    for name in ('paused','stop','stop_now','interrupt_excess','reuse_engine'):
         if type(value[name]) is not bool:raise ValueError(name+' must be true/false')
-    ranges=dict(workers=(0,64),startup_ram_mib=(128,1048576),reserve_ram_mib=(128,1048576),
-        max_private_mib=(256,1048576),reserve_disk_gib=(80,1048576),timeout_seconds=(1,86400),scan_seconds=(10,86400))
+    ranges=dict(workers=(0,64),startup_ram_mib=(128,1048576),warm_ram_mib=(128,1048576),reserve_ram_mib=(128,1048576),
+        max_private_mib=(256,1048576),reserve_disk_gib=(80,1048576),timeout_seconds=(1,86400),scan_seconds=(10,86400),engine_games=(1,100000))
     for name,(low,high) in ranges.items():
         if type(value[name]) is not int or not low<=value[name]<=high:
             raise ValueError(f'{name} must be an integer in [{low}, {high}]')
-    if value['startup_ram_mib']<value['reserve_ram_mib']:
-        raise ValueError('Startup RAM must include the RAM reserve')
+    if not value['reserve_ram_mib']<=value['warm_ram_mib']<=value['startup_ram_mib']:
+        raise ValueError('RAM limits must satisfy reserve <= warm <= startup')
+    # An engine without it ignores the flag and idles until every job times out.
+    if value['reuse_engine'] and not ENGINE_HAS_REPLAY_SERVER:
+        raise ValueError('reuse_engine needs a pinned engine with -replayServer')
     if value['audit_level'] not in AUDIT_LEVELS:
         raise ValueError('audit_level must be one of '+', '.join(AUDIT_LEVELS))
     return value
@@ -119,11 +129,36 @@ class ProcessFamily:
         if self.handle:self.kernel.CloseHandle(self.handle);self.handle=None
 
 
-def admission(resource,control):
-    if resource.get('available_ram_bytes',0)<control['startup_ram_mib']*1024**2:return 'waiting_for_ram'
+def admission(resource,control,warm=False,admitted=0):
+    """Why a job cannot start now, or None. A worker already holding an engine (`warm`)
+    has paid for it, so it may work down to a lower floor. `admitted` counts jobs started
+    since `resource` was read, which that reading cannot show yet."""
+    floor=control['warm_ram_mib'] if warm else control['startup_ram_mib']
+    if resource.get('available_ram_bytes',0)-admitted*JOB_RAM_MIB*1024**2<floor*1024**2:return 'waiting_for_ram'
     if resource['free_disk_bytes']<control['reserve_disk_gib']*1024**3:return 'waiting_for_disk'
     if resource.get('aggregate_private_bytes',0)>=control['max_private_mib']*1024**2:return 'waiting_for_memory_budget'
     return None
+
+
+def engines_to_release(children,resource,control):
+    """Idle engines to close when even a worker with an engine cannot take a job:
+    nothing may sit holding memory that the jobs are waiting for."""
+    if admission(resource,control,warm=True) not in ('waiting_for_ram','waiting_for_memory_budget'):return []
+    mib=1024**2
+    shortfall=max(control['warm_ram_mib']*mib-resource.get('available_ram_bytes',0),
+                  resource.get('aggregate_private_bytes',0)-control['max_private_mib']*mib,mib)
+    idle=[slot for slot,child in sorted(children.items(),reverse=True)
+          if child['engine'] and child['job'] is None and not child['stopping']]
+    return idle[:-(-shortfall//(ENGINE_RAM_MIB*mib))]
+
+
+def worker_to_recycle(children,resource,control):
+    """The most bloated idle worker to restart while memory keeps new engines from
+    starting, or None. With memory to spare, restarting would only cost time."""
+    if admission(resource,control) not in ('waiting_for_ram','waiting_for_memory_budget'):return None
+    bloated=[slot for slot,child in children.items() if child['private']>=WORKER_RECYCLE_MIB*1024**2
+             and child['ready'] and child['job'] is None and not child['stopping']]
+    return max(bloated,key=lambda slot:children[slot]['private'],default=None)
 
 
 def resize_plan(children,target):
@@ -178,8 +213,9 @@ def run(args):
         if not args.match_key:refresh_collection(db)
         inventory(db,identity)
         from pipeline_resources import tree
-        now=time.monotonic();next_scan=now+control['scan_seconds'];next_guard=now
+        now=time.monotonic();next_scan=now+control['scan_seconds'];next_guard=now;next_tick=now
         completed=0;fatal=None;reason='running';last_control=control
+        woken=None;stages={};resource=None;total={};admitted=0;released=0;recycled=0;waited=0.0;waited_since=time.monotonic()
 
         def retire(slot,kill=False,cancel_reason=None):
             child=children[slot]
@@ -190,26 +226,33 @@ def run(args):
 
         try:
             while True:
-                settings_error=None
-                try:control=settings();last_control=control
-                except (OSError,ValueError) as error:control=last_control;settings_error=str(error)
+                # Dispatch runs whenever a worker finishes; resources, controls, the queue
+                # summary and queued stage changes are refreshed on the tick.
+                tick=time.monotonic()>=next_tick
+                if tick:
+                    next_tick=time.monotonic()+2
+                    settings_error=None
+                    try:control=settings();last_control=control
+                    except (OSError,ValueError) as error:control=last_control;settings_error=str(error)
                 if time.monotonic()>=next_guard:
                     try:source_guard(identity)
                     except (OSError,ValueError) as error:fatal=str(error)
                     next_guard=time.monotonic()+30
                 while True:
-                    try:event=outbox.get_nowait()
-                    except queue.Empty:break
+                    if woken is not None:event,woken=woken,None
+                    else:
+                        try:event=outbox.get_nowait()
+                        except queue.Empty:break
                     child=children.get(event['slot'])
                     if child is None or event.get('pid')!=child['process'].pid:continue
                     if event['event']=='ready':child['ready']=True
                     elif event['event']=='stage':
                         if child['job'] and event['sha']==child['job']['replay_sha256']:
-                            stage=event['stage'];update(db,pipeline,event['sha'],stage=stage,
-                                status=stage if stage in ACTIVE else 'running')
+                            stages[event['sha']]=event['stage']
                     elif event['event']=='result':
                         result=event['result'];job=child['job']
                         if job is None or event['sha']!=job['replay_sha256']:raise RuntimeError('Worker result does not own its queue job')
+                        stages.pop(event['sha'],None)
                         fields={key:result[key] for key in ('status','stage','message') if key in result}
                         fields.update(owner=None,retry_after=time.time()+30 if result['status']=='pending' else 0)
                         if result['status']=='pending':fields['attempts']=job['attempts']
@@ -217,7 +260,7 @@ def run(args):
                         elif result['status']=='done':resolve_failures(db,job['replay_sha256'])
                         update(db,pipeline,event['sha'],**fields)
                         log.info('%s %s %s',job['match_key'],result['status'],result.get('message',''))
-                        completed+=1;child['job']=None
+                        completed+=1;child['job']=None;child['engine']=event['engine'];child['private']=event['private']
                     elif event['event']=='fatal':
                         fatal='Worker initialization/execution failed: '+event['message'];log.error(fatal)
                 # A dead worker never permanently owns a queue item.
@@ -237,35 +280,52 @@ def run(args):
                             record_job_failure(db,identity,job,fields['message'],stage='conversion',reason='worker_exited',
                                 evidence=dict(exitcode=child['process'].exitcode,attempts=row[0]))
                         update(db,pipeline,job['replay_sha256'],**fields)
+                    stages.pop(child['job']['replay_sha256'] if child['job'] else None,None)
                     child['family'].close();child['inbox'].close();child['process'].close();del children[slot]
                     remove_owned(WORK/'workers'/str(slot))
                 stopping=control['stop'] or control['stop_now'] or fatal is not None or (args.limit and completed>=args.limit)
-                resource=tree()
+                if tick or resource is None:
+                    resource=tree();admitted=0
+                    for sha,stage in stages.items():
+                        db.execute("UPDATE conversion_job SET stage=?,status=?,updated=? WHERE pipeline=? AND replay_sha256=?",
+                            (stage,stage if stage in ACTIVE else 'running',time.time(),pipeline,sha))
+                    if stages:db.commit();stages.clear()
                 emergency=(resource.get('available_ram_bytes',0)<control['reserve_ram_mib']*1024**2
                     or resource.get('aggregate_private_bytes',0)>control['max_private_mib']*1024**2)
-                if control['stop_now'] or emergency:
-                    # Cancel one owned process family at a time under pressure.
-                    victims=sorted(children,reverse=True) if control['stop_now'] else sorted(children,reverse=True)[:1]
-                    for slot in victims:retire(slot,kill=True,cancel_reason='Requested immediate stop' if control['stop_now'] else 'RAM reserve reached')
+                # Idle engines go first. Only a fresh reading can show whether that was enough.
+                releasing=engines_to_release(children,resource,control) if tick and not stopping else []
+                for slot in releasing:
+                    children[slot]['inbox'].put('release');children[slot]['engine']=False;released+=1
+                bloated=worker_to_recycle(children,resource,control) if tick and not stopping else None
+                if bloated is not None:
+                    retire(bloated);children[bloated]['engine']=False;recycled+=1
+                if control['stop_now']:
+                    for slot in sorted(children,reverse=True):retire(slot,kill=True,cancel_reason='Requested immediate stop')
+                elif emergency and tick and not releasing and children:
+                    # Cancel one owned process family at a time under pressure, sparing running jobs if possible.
+                    retire(min(children,key=lambda s:(children[s]['job'] is not None,-s)),kill=True,cancel_reason='RAM reserve reached')
                 target=0 if stopping or control['paused'] or settings_error else control['workers']
                 if args.match_key:target=min(target,1)
                 keep,retiring=resize_plan(children,target)
                 for slot in retiring:retire(slot)
                 for slot in interrupt_slots(children,keep,control['interrupt_excess']):
                     retire(slot,kill=True,cancel_reason='Requested immediate worker reduction')
-                reason='stopping' if stopping else 'paused' if control['paused'] or control['workers']==0 else admission(resource,control) or 'running'
+                reason='stopping' if stopping else 'paused' if control['paused'] or control['workers']==0 else admission(resource,control,warm=any(c['engine'] for c in children.values())) or 'running'
                 if settings_error:reason='invalid_settings'
                 if fatal:reason='stopping_after_error'
-                if not stopping and not emergency and not settings_error and target>0 and not admission(resource,control):
-                    for slot in sorted(keep):
+                if not stopping and not emergency and not settings_error and target>0:
+                    # Workers with an engine first: their jobs cost the least memory.
+                    for slot in sorted(keep,key=lambda s:(not children[s]['engine'],s)):
                         child=children[slot]
-                        if child['ready'] and child['job'] is None and not child['stopping']:
-                            job=claim(db,pipeline,session+':'+str(slot),args.match_key)
+                        if child['ready'] and child['job'] is None and not child['stopping'] and not admission(resource,control,child['engine'],admitted):
+                            job=claim(db,pipeline,session+':'+str(slot),args.match_key,
+                                child.get('release') if control['reuse_engine'] else None)
                             if job:
-                                child['job']=job;child['inbox'].put((job,control.copy()))
-                    ready_pending=due(db,pipeline,args.match_key)
+                                child['job']=job;child['release']=Path(job['source_path']).parent.name;admitted+=1
+                                child['inbox'].put((job,control.copy()))
                     active=sum(not c['stopping'] for c in children.values())
-                    if ready_pending and active<target:
+                    if active<target and not admission(resource,control,admitted=admitted) and due(db,pipeline,args.match_key):
+                        admitted+=1
                         slot=next(i for i in range(64) if i not in children)
                         inbox=context.Queue(maxsize=2)
                         process=context.Process(target=worker_main,args=(slot,inbox,outbox,identity),name='replay-converter-'+str(slot))
@@ -273,24 +333,40 @@ def run(args):
                         try:family=ProcessFamily(process.pid)
                         except BaseException:
                             process.terminate();process.join();raise
-                        children[slot]=dict(process=process,family=family,inbox=inbox,ready=False,stopping=False,job=None)
+                        children[slot]=dict(process=process,family=family,inbox=inbox,ready=False,stopping=False,job=None,engine=False,private=0)
                         inbox.put('boot')
-                total=counts(db,pipeline,args.match_key)
-                if not total.get('pending',0) and not any(total.get(k,0) for k in ACTIVE) and not stopping:
+                if tick:total=counts(db,pipeline,args.match_key)
+                if tick and not total.get('pending',0) and not any(total.get(k,0) for k in ACTIVE) and not stopping:
                     reason='caught_up'
                     for slot,c in children.items():
                         if c['ready'] and c['job'] is None:retire(slot)
                     if args.limit or args.match_key:stopping=True
-                save(STATUS,dict(status=reason,pid=os.getpid(),session=session,pipeline=pipeline,feature_key=identity['feature_key'],
-                    requested_workers=control['workers'],live_workers=len(children),busy_workers=sum(c['job'] is not None for c in children.values()),
-                    counts=total,resources=resource,settings_error=settings_error,error=fatal,updated=time.time(),
-                    workers=[dict(slot=s,pid=c['process'].pid,retiring=s not in keep or c['stopping'],
-                        match_key=c['job']['match_key'] if c['job'] else None) for s,c in children.items()]))
+                if tick:
+                    now=time.monotonic()
+                    if reason.startswith('waiting_for'):waited+=now-waited_since
+                    waited_since=now
+                    save(STATUS,dict(status=reason,pid=os.getpid(),session=session,pipeline=pipeline,feature_key=identity['feature_key'],
+                        requested_workers=control['workers'],live_workers=len(children),busy_workers=sum(c['job'] is not None for c in children.values()),
+                        live_engines=sum(c['engine'] for c in children.values()),released_engines=released,recycled_workers=recycled,admission_wait_seconds=round(waited),
+                        counts=total,resources=resource,settings_error=settings_error,error=fatal,updated=time.time(),
+                        workers=[dict(slot=s,pid=c['process'].pid,retiring=s not in keep or c['stopping'],
+                            match_key=c['job']['match_key'] if c['job'] else None) for s,c in children.items()]))
                 if stopping and not children:break
                 if not stopping and time.monotonic()>=next_scan:
                     if not args.match_key:refresh_collection(db)
                     inventory(db,identity);next_scan=time.monotonic()+control['scan_seconds']
-                time.sleep(2)
+                # A finished worker should not idle until the next tick: wake for its
+                # result. Stage changes only queue up for the tick's single commit.
+                while woken is None:
+                    remaining=next_tick-time.monotonic()
+                    if remaining<=0:break
+                    try:event=outbox.get(timeout=remaining)
+                    except queue.Empty:break
+                    child=children.get(event['slot'])
+                    if event['event']=='stage' and child is not None and event.get('pid')==child['process'].pid:
+                        if child['job'] and event['sha']==child['job']['replay_sha256']:
+                            stages[event['sha']]=event['stage']
+                    else:woken=event
         except KeyboardInterrupt:
             fatal='Foreground converter interrupted; unfinished jobs remain resumable'
         finally:
@@ -298,6 +374,7 @@ def run(args):
             for child in children.values():
                 child['process'].join(timeout=30);child['inbox'].close()
             recover(db,pipeline)
+            log.info('Ending session %s; released %d idle engines; recycled %d workers; %d s waiting for resources',session,released,recycled,waited)
             save(STATUS,dict(status='failed' if fatal else 'stopped',pid=os.getpid(),pipeline=pipeline,
                 counts=counts(db,pipeline,args.match_key),error=fatal,updated=time.time(),live_workers=0,busy_workers=0))
             db.close();outbox.close();outbox.cancel_join_thread()

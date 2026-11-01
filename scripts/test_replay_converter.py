@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 import replay_conversion as core
 import replay_converter as service
+from replay_training import EngineLeakError
+from scheduled_capture import EngineSession
 
 
 def family_child(inbox,outbox):
@@ -125,6 +127,15 @@ class QueueTests(unittest.TestCase):
             self.assertIsNotNone(core.claim(self.db,'p','one'))
             self.assertIsNone(core.claim(other,'p','two'))
         finally:other.close()
+
+    def test_claim_prefers_the_workers_release_without_skipping_priority(self):
+        self.raw('pgo:100','a'*64,'B9DB8815/match_100.rep');self.raw('pgo:101','b'*64,'3DF43954/match_101.rep')
+        self.raw('pgo:102','c'*64,'3DF43954/match_102.rep');self.inventory()
+        self.db.execute("UPDATE conversion_job SET priority=2");self.db.commit()
+        self.assertEqual(core.claim(self.db,'p','one',None,'3DF43954')['match_key'],'pgo:101')
+        self.assertEqual(core.claim(self.db,'p','one',None,'B9DB8815')['match_key'],'pgo:100')
+        # Nothing left on the preferred release: any other work is still claimed.
+        self.assertEqual(core.claim(self.db,'p','one',None,'B9DB8815')['match_key'],'pgo:102')
 
     def test_duplicate_raw_bytes_and_test_alias_are_not_trainable(self):
         self.raw('pgo:100','a'*64);self.raw('pgo:101','a'*64)
@@ -238,11 +249,139 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'audit_level'):
             service.validate_settings(dict(service.DEFAULTS,audit_level='none'))
 
+    def test_engine_reuse_defaults_off_and_is_validated(self):
+        self.assertIs(service.DEFAULTS['reuse_engine'],False)
+        with self.assertRaisesRegex(ValueError,'reuse_engine'):
+            service.validate_settings(dict(service.DEFAULTS,reuse_engine=1))
+        with self.assertRaisesRegex(ValueError,'engine_games'):
+            service.validate_settings(dict(service.DEFAULTS,engine_games=0))
+        with patch.object(service,'ENGINE_HAS_REPLAY_SERVER',False):
+            with self.assertRaisesRegex(ValueError,'-replayServer'):
+                service.validate_settings(dict(service.DEFAULTS,reuse_engine=True))
+        with patch.object(service,'ENGINE_HAS_REPLAY_SERVER',True):
+            self.assertTrue(service.validate_settings(dict(service.DEFAULTS,reuse_engine=True))['reuse_engine'])
+
     def test_resource_admission_is_separate_from_desired_worker_count(self):
         resource=dict(available_ram_bytes=3*1024**3,free_disk_bytes=100*1024**3,aggregate_private_bytes=0)
         self.assertIsNone(service.admission(resource,service.DEFAULTS))
         resource['available_ram_bytes']=1024**3
         self.assertEqual(service.admission(resource,service.DEFAULTS),'waiting_for_ram')
+
+    def test_a_worker_with_an_engine_works_below_the_startup_gate(self):
+        mib=1024**2
+        resource=dict(available_ram_bytes=2000*mib,free_disk_bytes=100*1024**3,aggregate_private_bytes=0)
+        self.assertEqual(service.admission(resource,service.DEFAULTS),'waiting_for_ram')
+        self.assertIsNone(service.admission(resource,service.DEFAULTS,warm=True))
+        resource['available_ram_bytes']=1400*mib
+        self.assertEqual(service.admission(resource,service.DEFAULTS,warm=True),'waiting_for_ram')
+
+    def test_jobs_started_since_the_last_reading_count_against_the_gate(self):
+        mib=1024**2
+        resource=dict(available_ram_bytes=2000*mib,free_disk_bytes=100*1024**3,aggregate_private_bytes=0)
+        self.assertIsNone(service.admission(resource,service.DEFAULTS,True,1))
+        self.assertEqual(service.admission(resource,service.DEFAULTS,True,2),'waiting_for_ram')
+
+    def test_disk_and_budget_limits_also_stop_warm_workers(self):
+        resource=dict(available_ram_bytes=3*1024**3,free_disk_bytes=1024**3,aggregate_private_bytes=0)
+        self.assertEqual(service.admission(resource,service.DEFAULTS,warm=True),'waiting_for_disk')
+        resource.update(free_disk_bytes=100*1024**3,aggregate_private_bytes=9*1024**3)
+        self.assertEqual(service.admission(resource,service.DEFAULTS,warm=True),'waiting_for_memory_budget')
+
+    def test_idle_engines_are_released_only_when_they_cannot_take_a_job(self):
+        mib=1024**2
+        def worker(engine=True,job=None,stopping=False):return dict(engine=engine,job=job,stopping=stopping)
+        workers={0:worker(),1:worker(job={'id':1}),2:worker(engine=False),3:worker(),4:worker(),5:worker(stopping=True)}
+        resource=dict(available_ram_bytes=2000*mib,free_disk_bytes=100*1024**3,aggregate_private_bytes=0)
+        self.assertEqual(service.engines_to_release(workers,resource,service.DEFAULTS),[])
+        resource['available_ram_bytes']=1500*mib
+        self.assertEqual(service.engines_to_release(workers,resource,service.DEFAULTS),[4])
+        resource['available_ram_bytes']=1300*mib
+        self.assertEqual(service.engines_to_release(workers,resource,service.DEFAULTS),[4,3])
+        resource['available_ram_bytes']=500*mib
+        self.assertEqual(service.engines_to_release(workers,resource,service.DEFAULTS),[4,3,0])
+        resource.update(available_ram_bytes=3000*mib,aggregate_private_bytes=8192*mib)
+        self.assertEqual(service.engines_to_release(workers,resource,service.DEFAULTS),[4])
+        resource.update(aggregate_private_bytes=0,free_disk_bytes=1024**3)
+        self.assertEqual(service.engines_to_release(workers,resource,service.DEFAULTS),[],'closing engines frees no disk')
+
+    def test_bloated_idle_workers_restart_only_when_memory_is_short(self):
+        mib=1024**2
+        def worker(private,job=None,ready=True,stopping=False):return dict(private=private*mib,job=job,ready=ready,stopping=stopping)
+        workers={0:worker(150),1:worker(260),2:worker(300),3:worker(900,job={'id':3}),4:worker(800,ready=False),5:worker(700,stopping=True)}
+        resource=dict(available_ram_bytes=3000*mib,free_disk_bytes=100*1024**3,aggregate_private_bytes=0)
+        self.assertIsNone(service.worker_to_recycle(workers,resource,service.DEFAULTS),'memory to spare')
+        resource['available_ram_bytes']=2000*mib
+        self.assertEqual(service.worker_to_recycle(workers,resource,service.DEFAULTS),2)
+        resource.update(available_ram_bytes=3000*mib,aggregate_private_bytes=8192*mib)
+        self.assertEqual(service.worker_to_recycle(workers,resource,service.DEFAULTS),2)
+        resource.update(aggregate_private_bytes=0,free_disk_bytes=1024**3)
+        self.assertIsNone(service.worker_to_recycle(workers,resource,service.DEFAULTS),'restarting frees no disk')
+        resource.update(available_ram_bytes=2000*mib,free_disk_bytes=100*1024**3)
+        self.assertIsNone(service.worker_to_recycle({0:worker(150)},resource,service.DEFAULTS),'not bloated')
+
+    def test_ram_limits_must_be_ordered(self):
+        with self.assertRaisesRegex(ValueError,'reserve <= warm <= startup'):
+            service.validate_settings(dict(service.DEFAULTS,warm_ram_mib=512))
+        with self.assertRaisesRegex(ValueError,'reserve <= warm <= startup'):
+            service.validate_settings(dict(service.DEFAULTS,warm_ram_mib=4096))
+
+
+# Stands in for -replayServer: one line per job, with the engine's done message.
+FAKE_ENGINE = """
+import json, os, sys, time
+for line in sys.stdin:
+    job = json.loads(line)
+    print('job', job['replay'], 'pid', os.getpid(), flush=True)
+    if job['replay'] == 'crash': os._exit(7)
+    if job['replay'] == 'hang': time.sleep(60)
+    print('GAIX ' + json.dumps({'event': 'replay_done', 'exit_code': 3 if job['replay'] == 'bad' else 0}), flush=True)
+"""
+
+
+class EngineSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
+        self.script=self.root/'engine.py';self.script.write_text(FAKE_ENGINE)
+        self.command=[sys.executable,'-B',str(self.script)]
+        self.session=EngineSession(max_games=3)
+        self.addCleanup(self.temp.cleanup);self.addCleanup(self.session.close)
+
+    def run_job(self,replay,command=None,timeout=60):
+        log=self.root/'job.log'
+        result=self.session.run(command or self.command,dict(replay=replay),cwd=self.root,log_path=log,
+            timeout=timeout,creationflags=subprocess.CREATE_NO_WINDOW)
+        return (*result,log.read_text())
+
+    def pid(self,text):return text.split()[-1]
+
+    def test_jobs_share_a_process_and_report_their_own_log_and_exit_code(self):
+        first=self.run_job('a');second=self.run_job('bad')
+        self.assertEqual(first[:2],(0,0));self.assertEqual(second[:2],(3,1))
+        self.assertIn('job a',first[2]);self.assertNotIn('job a',second[2])
+        self.assertEqual(self.pid(first[2]),self.pid(second[2]))
+
+    def test_a_new_command_or_the_game_limit_starts_a_new_process(self):
+        first=self.run_job('a')
+        changed=self.run_job('b',self.command+['--other-pack'])
+        self.assertEqual(changed[1],0);self.assertNotEqual(self.pid(first[2]),self.pid(changed[2]))
+        self.run_job('c',self.command+['--other-pack']);self.run_job('d',self.command+['--other-pack'])
+        limited=self.run_job('e',self.command+['--other-pack'])
+        self.assertEqual(limited[1],0);self.assertNotEqual(self.pid(changed[2]),self.pid(limited[2]))
+
+    def test_a_crash_fails_only_that_job(self):
+        self.run_job('a')
+        code,earlier,_=self.run_job('crash')
+        self.assertEqual((code,earlier),(7,1));self.assertIsNone(self.session.process)
+        self.assertEqual(self.run_job('next')[:2],(0,0))
+
+    def test_timeout_kills_the_engine_and_the_next_job_recovers(self):
+        with self.assertRaises(subprocess.TimeoutExpired):self.run_job('hang',timeout=1)
+        self.assertIsNone(self.session.process)
+        self.assertEqual(self.run_job('next')[:2],(0,0))
+
+    def test_a_leak_stops_the_service_instead_of_failing_one_job(self):
+        # worker_main records OSError/ValueError/RuntimeError against the replay.
+        self.assertFalse(issubclass(EngineLeakError,(OSError,ValueError,RuntimeError)))
 
 
 class CollectionTests(unittest.TestCase):

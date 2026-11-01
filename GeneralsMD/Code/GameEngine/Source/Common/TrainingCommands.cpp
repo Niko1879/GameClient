@@ -573,9 +573,13 @@ void playerCommands(Player *player, PlayerCommands &result)
     build();
     result.sciences.clear(); result.purchasableSciences.clear(); result.upgrades.clear();
     static std::vector<std::string> names;
-    if (names.empty()) for (const AsciiString &name : TheScienceStore->friend_getScienceNames()) names.push_back(name.str());
-    for (const std::string &name : names)
-        if (player->hasScience(TheScienceStore->getScienceFromInternalName(name.c_str()))) result.sciences.push_back(name.c_str());
+    static std::vector<ScienceType> sciences;
+    if (names.empty()) for (const AsciiString &name : TheScienceStore->friend_getScienceNames()) {
+        names.push_back(name.str());
+        sciences.push_back(TheScienceStore->getScienceFromInternalName(name));
+    }
+    for (size_t i = 0; i < names.size(); ++i)
+        if (player->hasScience(sciences[i])) result.sciences.push_back(names[i].c_str());
     const PlayerTemplate *faction = player->getPlayerTemplate();
     if (faction) for (const AsciiString &set : {faction->getPurchaseScienceCommandSetRank1(), faction->getPurchaseScienceCommandSetRank3(),
                                                  faction->getPurchaseScienceCommandSetRank8()})

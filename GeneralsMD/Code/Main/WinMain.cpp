@@ -929,11 +929,19 @@ Int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 		// default in a DevStudio project
 		//
 
-		TheAsciiStringCriticalSection = &critSec1;
-		TheUnicodeStringCriticalSection = &critSec2;
-		TheDmaCriticalSection = &critSec3;
-		TheMemoryPoolCriticalSection = &critSec4;
-		TheDebugLogCriticalSection = &critSec5;
+		// A headless simulation allocates and copies strings on one thread only.
+		// TheGlobalData does not exist yet, so match the flag as CommandLine.cpp will.
+		Bool headless = FALSE;
+		for (Int arg = 1; arg < __argc; ++arg)
+			headless = headless || stricmp(__argv[arg], "-headless") == 0;
+		if (!headless)
+		{
+			TheAsciiStringCriticalSection = &critSec1;
+			TheUnicodeStringCriticalSection = &critSec2;
+			TheDmaCriticalSection = &critSec3;
+			TheMemoryPoolCriticalSection = &critSec4;
+			TheDebugLogCriticalSection = &critSec5;
+		}
 
 		// initialize the memory manager early
 		initMemoryManager();

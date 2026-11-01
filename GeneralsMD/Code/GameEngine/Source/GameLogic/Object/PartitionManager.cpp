@@ -1466,6 +1466,7 @@ void PartitionCell::friend_addToCellList(CellAndObjectIntersection *coi)
 	{
 		coi->friend_addToCellList(&m_firstCoiInCell);
 		++m_coiCount;
+		ThePartitionManager->friend_setCellOccupied(m_cellX, m_cellY, true);
 	}
 }
 
@@ -1476,6 +1477,7 @@ void PartitionCell::friend_removeFromCellList(CellAndObjectIntersection *coi)
 	{
 		coi->friend_removeFromCellList(&m_firstCoiInCell);
 		--m_coiCount;
+		ThePartitionManager->friend_setCellOccupied(m_cellX, m_cellY, m_coiCount > 0);
 	}
 }
 
@@ -2681,6 +2683,7 @@ void PartitionManager::init()
 		m_cellCountY = REAL_TO_INT_CEIL(m_worldExtents.height() * m_cellSizeInv);
 		m_totalCellCount = m_cellCountX * m_cellCountY;
 		m_cells = MSGNEW("PartitionManager_Cells") PartitionCell[m_totalCellCount];
+		m_cellOccupied.assign(m_totalCellCount, 0);
 		for (Int x = 0; x < m_cellCountX; x++)
 		{
 			for (Int y = 0; y < m_cellCountY; y++)
@@ -2769,6 +2772,7 @@ void PartitionManager::shutdown()
 
 	delete [] m_cells;
 	m_cells = nullptr;
+	m_cellOccupied.clear();
 
 	m_cellSize = m_cellSizeInv = 0.0f;
 	m_cellCountX = 0;
@@ -3365,9 +3369,13 @@ Object *PartitionManager::getClosestObjects(
 			continue;
     for (OffsetVec::const_iterator it = offsets.begin(); it != offsets.end(); ++it)
 		{
-			PartitionCell* thisCell = getCellAt(cellCenterX + it->x, cellCenterY + it->y);
-			if (thisCell == nullptr)
+			const Int thisCellX = cellCenterX + it->x, thisCellY = cellCenterY + it->y;
+			if (thisCellX < 0 || thisCellY < 0 || thisCellX >= m_cellCountX || thisCellY >= m_cellCountY)
 				continue;
+			const Int thisCellIndex = thisCellY * m_cellCountX + thisCellX;
+			if (!m_cellOccupied[thisCellIndex])
+				continue;
+			PartitionCell* thisCell = &m_cells[thisCellIndex];
 
 			for (CellAndObjectIntersection *thisCoi = thisCell->getFirstCoiInCell(); thisCoi; thisCoi = thisCoi->getNextCoi())
 			{

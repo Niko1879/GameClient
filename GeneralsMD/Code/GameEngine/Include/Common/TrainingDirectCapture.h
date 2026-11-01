@@ -145,6 +145,7 @@ struct DirectScratch {
     std::vector<const ProductionEntry *> production;
     std::vector<const ThingTemplate *> buildable, trainable;
     std::vector<const char *> contextFields;
+    std::vector<std::pair<int, int>> gridCells;
 } directScratch;
 
 void refreshDirectSighting(DirectSighting &result, Object *object, unsigned frame)
@@ -191,7 +192,7 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
         "commands", "command_cooldowns", "command_targets", "enter_targets", "container_id", "occupants", "capacity",
         "upgrades", "can_guard", "repair_targets", "repair_depots", hasProducer ? "producer_id" : "builder_id", "builder_id"};
     const size_t count = 33+hasProducer+hasBuilder;
-    auto fields = out.writer.object(out.buffer, parent.next(), names, count);
+    auto fields = out.writer.literalObject(out.buffer, parent.next(), names, count);
     out.put(fields, static_cast<unsigned>(object->getID())); out.put(fields, object->getTemplate()->getName().str());
     out.put(fields, owner ? static_cast<int>(owner->getPlayerIndex()) : -1);
     out.point(fields, object->getPosition());
@@ -237,7 +238,7 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
         const bool unit = p->getProductionType() == PRODUCTION_UNIT && p->getProductionObject();
         const bool upgrade = p->getProductionType() == PRODUCTION_UPGRADE && p->getProductionUpgrade();
         const char *keys[] = {"production_id", "kind", "progress", "remaining_quantity", unit ? "unit_type" : "upgrade", "upgrade"};
-        auto entry = out.writer.object(out.buffer, entries.next(), keys, 4+unit+upgrade);
+        auto entry = out.writer.literalObject(out.buffer, entries.next(), keys, 4+unit+upgrade);
         out.put(entry, static_cast<unsigned>(p->getProductionID())); out.put(entry, static_cast<int>(p->getProductionType()));
         out.put(entry, p->getPercentComplete()); out.put(entry, p->getProductionQuantityRemaining());
         if (unit) out.put(entry, p->getProductionObject()->getName().str());
@@ -363,7 +364,7 @@ void directObservation(Player *player, unsigned frame, const Json &actions, Dire
     out.writer.begin(buffer);
     const char *names[] = {"player", "own_entities", "known_nonowned_entities", "visibility_grid",
         "observation_policy_version", "last_submission", "last_validation", "build_placements"};
-    auto root = out.writer.object(buffer, 0, names, fullPlacementMask ? 8 : 7);
+    auto root = out.writer.literalObject(buffer, 0, names, fullPlacementMask ? 8 : 7);
     const int index = static_cast<int>(player->getPlayerIndex());
     auto state = out.object(root, {"index", "faction", "cash", "power_production", "power_consumption", "radar", "rank",
                                    "skill_points", "science_points", "dead", "sciences", "purchasable_sciences", "upgrades"});
@@ -386,9 +387,7 @@ void directObservation(Player *player, unsigned frame, const Json &actions, Dire
         for (Object *target = TheGameLogic->getFirstObject(); target; target = target->getNextObject()) {
             if (!retainedEntity(target)) continue;
             if (!target->isEffectivelyDead() && !target->isDestroyed() && target->getControllingPlayer() == player) ++owned;
-            bool dock = false;
-            for (BehaviorModule **module = target->getBehaviorModules(); *module; ++module)
-                if ((*module)->getDockUpdateInterface()) { dock = true; break; }
+            const bool dock = hasDockInterface(target);
             // TrainingCanDock also requires a live, owned or visible target.
             const bool seen = !target->isEffectivelyDead()
                 && (target->getControllingPlayer() == player || TrainingObjectVisibleTo(target, index));
@@ -403,11 +402,17 @@ void directObservation(Player *player, unsigned frame, const Json &actions, Dire
     auto known = out.array(root, memory.size());
     for (const auto &item : memory) writeDirectSighting(out, known, item);
     auto visibility = out.array(root, gridSize*gridSize);
-    const Region3D region = extent();
-    for (int y = 0; y < gridSize; ++y) for (int x = 0; x < gridSize; ++x) {
-        const Coord3D p = gridPoint(region, x, y);
-        out.put(visibility, static_cast<int>(ThePartitionManager->getShroudStatusForPlayer(index, &p)));
+    auto &cells = directScratch.gridCells;
+    if (cells.empty()) { // the map does not change during a game
+        const Region3D region = extent();
+        cells.resize(gridSize*gridSize);
+        for (int y = 0; y < gridSize; ++y) for (int x = 0; x < gridSize; ++x) {
+            const Coord3D p = gridPoint(region, x, y);
+            ThePartitionManager->worldToCell(p.x, p.y, &cells[y*gridSize+x].first, &cells[y*gridSize+x].second);
+        }
     }
+    for (const auto &cell : cells)
+        out.put(visibility, static_cast<int>(ThePartitionManager->getShroudStatusForPlayer(index, cell.first, cell.second)));
     out.put(root, 7);
     directContext(out, root, submissions, player, frame);
     directContext(out, root, validations, player, frame);

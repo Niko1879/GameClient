@@ -882,6 +882,7 @@ ControlBar::ControlBar()
 	Int i;
 	m_commandButtons = nullptr;
 	m_commandSets = nullptr;
+	m_commandSetsByNameStale = TRUE;
 	m_controlBarSchemeManager = nullptr;
 	m_isObserverCommandBar = FALSE;
 	m_observerLookAtPlayer = nullptr;
@@ -1015,6 +1016,7 @@ ControlBar::~ControlBar()
 
 	// destroy all the command set definitions
 	CommandSet *set;
+	m_commandSetsByNameStale = TRUE;
 	while( m_commandSets )
 	{
 		set = m_commandSets->friend_getNext();
@@ -1352,6 +1354,7 @@ void ControlBar::reset()
 
 	// Remove any overridden sets.
 	CommandSet *set, *nextSet;
+	m_commandSetsByNameStale = TRUE;
 	set = m_commandSets;
 	while (set) {
 		Bool possibleAdjustment = FALSE;
@@ -2052,13 +2055,17 @@ CommandButton *ControlBar::newCommandButtonOverride( CommandButton *buttonToOver
 //-------------------------------------------------------------------------------------------------
 CommandSet* ControlBar::findNonConstCommandSet( const AsciiString& name )
 {
-	CommandSet* set;
+	// Every production check and command query searches here, among hundreds of sets.
+	if( m_commandSetsByNameStale )
+	{
+		m_commandSetsByName.clear();
+		for( CommandSet* set = m_commandSets; set != nullptr; set = set->friend_getNext() )
+			m_commandSetsByName.emplace( set->getName().str(), set ); // the first of a name wins, as a list search would
+		m_commandSetsByNameStale = FALSE;
+	}
 
-	for( set = m_commandSets; set != nullptr; set = set->friend_getNext() )
-		if( set->getName() == name )
-			return const_cast<CommandSet*>((const CommandSet *) set);
-
-	return nullptr;  // set not found
+	const auto found = m_commandSetsByName.find( name.str() );
+	return found == m_commandSetsByName.end() ? nullptr : found->second;
 
 }
 //-------------------------------------------------------------------------------------------------
@@ -2094,6 +2101,8 @@ CommandSet *ControlBar::newCommandSet( const AsciiString& name )
 	CommandSet* set = newInstance(CommandSet)(name);
 	// add it to the list.
 	set->friend_addToList(&m_commandSets);
+	if( !m_commandSetsByNameStale )
+		m_commandSetsByName[ name.str() ] = set; // the list head: a list search would find this one first
 	// return the newly created set
 	return set;
 

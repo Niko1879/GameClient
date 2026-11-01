@@ -1248,6 +1248,7 @@ private:
 	Int							m_cellCountY;			///< number of cells, y
 	Int							m_totalCellCount;	///< x * y
 	PartitionCell*	m_cells;					///< array of cells
+	std::vector<UnsignedByte> m_cellOccupied;	///< whether each cell has objects: scans need not read the large cell
 	PartitionData*	m_dirtyModules;
 	Bool						m_updatedSinceLastReset;	///< Used to force a return of OBJECTSHROUD_INVALID before update has been called.
 
@@ -1342,6 +1343,7 @@ public:
 	Int getCellCountY() { DEBUG_ASSERTCRASH(m_cellCountY != 0, ("partition not inited")); return m_cellCountY; }
 
 	/// return the PartitionCell located at cell coordinates (x,y).
+	void friend_setCellOccupied(Int x, Int y, Bool occupied) { m_cellOccupied[y * m_cellCountX + x] = occupied ? 1 : 0; }
 	PartitionCell *getCellAt(Int x, Int y);
 	const PartitionCell *getCellAt(Int x, Int y) const;
 

@@ -64,7 +64,9 @@ def reconcile(replay, export, *, audit_summary=None, captured_commands=None):
         captured.update(captured_commands)
     if sum(captured.values()) != audit_summary['commands']:
         raise ValueError('Audited command count does not match reconciliation input')
-    original = list(binary_commands(replay))
+    # A trimmed export accounts for the replay's commands up to its verified frame.
+    through = audit_summary.get('verified_through_frame')
+    original = [row for row in binary_commands(replay) if through is None or row[0] <= through]
     ignored = {'MSG_BEGIN_NETWORK_MESSAGES', 'MSG_LOGIC_CRC', 'MSG_SET_REPLAY_CAMERA'}
     expected = Counter((f, k, p) for f, k, p in original
                        if p in players and k in names and names[k] not in ignored)

@@ -589,6 +589,7 @@ public:
 
 	DisabledMaskType getDisabledFlags() const { return m_disabledMask; }
 	Bool isDisabled() const { return m_disabledMask.any(); }
+	UnsignedInt getNextDisabledExpiry() const;	///< the earliest frame a current disable ends
 	Bool clearDisabled( DisabledType type );
 
 	void setDisabled( DisabledType type );

@@ -19,8 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT/'.cache/replay-converter'
 CATALOG = ROOT/'replays/catalog/replay-catalog.sqlite3'
 POLICY = ROOT/'replay-runtime/policy.json'
-ENGINE = ROOT/'replay-runtime/game/engine-28e202027359781a.exe'
-ENGINE_SHA = '28e202027359781a764642d9f0190214b0386a7759a7b112855c0a439c73059c'
+ENGINE = ROOT/'replay-runtime/game/engine-6ae8ca8cd3cf2cc5.exe'
+ENGINE_SHA = '6ae8ca8cd3cf2cc53df06de69840bd1f216fd3e4fcc9cdb79ed69cd93282b3c2'
+ENGINE_HAS_REPLAY_SERVER = True
 DATA = ROOT/'training-data'
 RAW = ROOT/'replays/vanilla-china'
 RULES = ROOT/'replay-runtime/revision-data'
@@ -67,6 +68,8 @@ def connect(path=CATALOG):
             PRIMARY KEY(pipeline,replay_sha256));
         CREATE INDEX IF NOT EXISTS conversion_pending
             ON conversion_job(pipeline,status,priority,retry_after);
+        CREATE INDEX IF NOT EXISTS conversion_claim
+            ON conversion_job(pipeline,status,(CASE WHEN stage!='queued' THEN 0 ELSE 1 END),priority);
     ''')
     return db
 
@@ -263,14 +266,23 @@ def inventory(db,identity,reserve=None):
     db.commit();return dict(added=added,reopened=reopened)
 
 
-def claim(db,pipeline,owner,match_keys=None):
+def claim(db,pipeline,owner,match_keys=None,prefer_release=None):
     db.execute('BEGIN IMMEDIATE')
     try:
         sql="SELECT * FROM conversion_job WHERE pipeline=? AND status='pending' AND retry_after<=?"
         params=[pipeline,time.time()]
         if match_keys:
             sql+=' AND match_key IN ('+','.join('?' for _ in match_keys)+')';params+=match_keys
-        row=db.execute(sql+" ORDER BY CASE WHEN stage!='queued' THEN 0 ELSE 1 END,priority,rowid LIMIT 1",params).fetchone()
+        # conversion_claim serves this order without sorting the whole queue, which
+        # would hold the write lock for ~140 ms per claim on a 60,000-job queue.
+        order=" ORDER BY CASE WHEN stage!='queued' THEN 0 ELSE 1 END,priority,rowid LIMIT 1"
+        row=db.execute(sql+order,params).fetchone()
+        # A reused engine serves one INI package: stay on its release while it has work,
+        # among the jobs of the first resumption state and priority.
+        if row and prefer_release:
+            same=db.execute(sql+" AND CASE WHEN stage!='queued' THEN 0 ELSE 1 END=? AND priority=? AND instr(source_path,?)>0"+order,
+                [*params,0 if row['stage']!='queued' else 1,row['priority'],os.sep+prefer_release+os.sep]).fetchone()
+            row=same or row
         if row:
             db.execute("UPDATE conversion_job SET status='running',owner=?,attempts=attempts+1,updated=? WHERE pipeline=? AND replay_sha256=?",(owner,time.time(),pipeline,row['replay_sha256']))
         db.commit()
@@ -352,7 +364,7 @@ def log_tail(path,lines=60):
     except OSError:return None
 
 
-def convert(job,identity,settings,runtime,profile,catalog,progress):
+def convert(job,identity,settings,runtime,profile,catalog,progress,session=None):
     from harvest_china_replays import parse_replay
     from replay_training import export,file_sha256,ExportPlaybackError
     from replay_bootstrap import data_pack,verify_entry,KIND
@@ -397,7 +409,8 @@ def convert(job,identity,settings,runtime,profile,catalog,progress):
                 proof=export(SimpleNamespace(exe=runtime/ENGINE.name,replay=source,output=owned/'export',
                     user_data=profile,data_pack=pack,interval_ms=100,timeout=settings['timeout_seconds'],
                     ticks_per_second=60,storage='binary',placement_mode='fast',audit_level=settings['audit_level'],
-                    quiet_capture='scheduled',capture_policy=POLICY,replay_logic=replay_logic(header['exe_crc'])))
+                    quiet_capture='scheduled',capture_policy=POLICY,replay_logic=replay_logic(header['exe_crc']),
+                    engine_session=session))
             except ExportPlaybackError as error:
                 # The job directory (and its engine log) is deleted below; keep the log tail.
                 evidence=dict(error.evidence,log_tail=log_tail(error.evidence['log']))
@@ -440,9 +453,13 @@ def worker_main(slot,inbox,outbox,identity):
     if inbox.get()!='boot':return
     def emit(**event):outbox.put(dict(slot=slot,pid=os.getpid(),**event))
     for name in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):os.environ[name]='1'
+    import gc
     from engine_runtime import clone_file,disable_power_throttling,isolation_profile,preflight
+    from event_resources import snapshot
     from replay_training import file_sha256
+    from scheduled_capture import EngineSession
     disable_power_throttling()
+    session=EngineSession()
     directory=WORK/'workers'/str(slot);directory.mkdir(parents=True,exist_ok=True)
     runtime,profile=directory/'runtime',directory/'profile'
     try:
@@ -463,11 +480,16 @@ def worker_main(slot,inbox,outbox,identity):
         while True:
             request=inbox.get()
             if request is None:break
+            if request=='release':
+                session.close();continue
             job,settings=request
+            session.max_games=settings['engine_games']
+            if not settings['reuse_engine']:session.close()
             def progress(stage):emit(event='stage',sha=job['replay_sha256'],stage=stage)
             with (directory/'worker.log').open('w',encoding='utf-8') as log,redirect_stdout(log):
                 try:
-                    result=convert(job,identity,settings,runtime,profile,catalog,progress)
+                    result=convert(job,identity,settings,runtime,profile,catalog,progress,
+                        session if settings['reuse_engine'] else None)
                 except (OSError,ValueError,RuntimeError) as error:
                     text=str(error)
                     resource=any(s in text.lower() for s in ('ram/disk','resource boundary','resource reserve','insufficient memory','not enough memory'))
@@ -480,7 +502,10 @@ def worker_main(slot,inbox,outbox,identity):
                         # original recording and failure remain in the catalogue.
                         remove_owned(job_directory(job,identity))
                         (DATA/('.conversion-'+job['replay_sha256']+'.json')).unlink(missing_ok=True)
-            emit(event='result',sha=job['replay_sha256'],result=result)
+            # A finished job leaves reference cycles worth up to ~80 MiB; collecting takes ~10 ms.
+            gc.collect()
+            emit(event='result',sha=job['replay_sha256'],result=result,engine=session.live(),private=snapshot(directory).get('private_bytes',0))
     except BaseException as error:
         emit(event='fatal',message=repr(error))
         raise
+    finally:session.close()

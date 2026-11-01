@@ -8,6 +8,7 @@ option(RTS_BUILD_OPTION_PROFILE_TRACY "Build code with Tracy profiling enabled."
 option(RTS_BUILD_OPTION_DEBUG "Build code with the \"Debug\" configuration." OFF)
 option(RTS_BUILD_OPTION_ASAN "Build code with Address Sanitizer." OFF)
 option(RTS_BUILD_OPTION_OPTIMIZED "Enable aggressive MSVC Release optimizations." OFF)
+option(RTS_BUILD_OPTION_CFG "Build with Control Flow Guard." ON)
 set(RTS_BUILD_OPTION_PGO "OFF" CACHE STRING "MSVC profile-guided optimization mode.")
 set_property(CACHE RTS_BUILD_OPTION_PGO PROPERTY STRINGS OFF GENERATE USE)
 set(RTS_PGO_FILE "${CMAKE_BINARY_DIR}/genzh.pgd" CACHE FILEPATH "MSVC PGO database path.")
@@ -28,6 +29,7 @@ add_feature_info(DebugBuild RTS_BUILD_OPTION_DEBUG "Building as a \"Debug\" buil
 add_feature_info(AddressSanitizer RTS_BUILD_OPTION_ASAN "Building with address sanitizer")
 add_feature_info(OptimizedBuild RTS_BUILD_OPTION_OPTIMIZED "Aggressive Release optimization")
 add_feature_info(PGO RTS_BUILD_OPTION_PGO "Profile-guided optimization mode")
+add_feature_info(ControlFlowGuard RTS_BUILD_OPTION_CFG "Build with Control Flow Guard")
 
 if(MSVC AND RTS_BUILD_OPTION_OPTIMIZED AND NOT IS_VS6_BUILD)
     target_compile_options(core_config INTERFACE
@@ -38,6 +40,7 @@ if(MSVC AND RTS_BUILD_OPTION_OPTIMIZED AND NOT IS_VS6_BUILD)
         $<$<CONFIG:Release>:/Gy>
         $<$<CONFIG:Release>:/Gw>
         $<$<CONFIG:Release>:/GL>
+        $<$<CONFIG:Release>:/GS->
         $<$<CONFIG:Release>:/arch:SSE2>
     )
     target_link_options(core_config INTERFACE
@@ -47,7 +50,7 @@ if(MSVC AND RTS_BUILD_OPTION_OPTIMIZED AND NOT IS_VS6_BUILD)
     )
 endif()
 
-if(MSVC AND NOT IS_VS6_BUILD)
+if(MSVC AND NOT IS_VS6_BUILD AND RTS_BUILD_OPTION_CFG)
     target_compile_options(core_config INTERFACE
         $<$<CONFIG:Release>:/guard:cf>
     )

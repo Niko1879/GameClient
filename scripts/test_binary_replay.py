@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from binary_replay import BLOCK, MAGIC, Frame, ObjectView, DeferredObservation, load_block, materialize, records
+from binary_replay import BLOCK, MAGIC, Frame, ObjectView, DeferredObservation, load_block, materialize, records, trim_export
 from replay_training import audit
 from test_replay_training import fixture
 
@@ -185,6 +185,85 @@ class BinaryReplayTests(unittest.TestCase):
         self.path.write_bytes(raw)
         with self.assertRaises(ValueError):
             list(records(self.path))
+
+    def test_building_a_frame_equals_decoding_each_node(self):
+        rows = fixture()
+        rows[2]['observation']['extra'] = dict(none=None, yes=True, no=False, signed=-(1 << 63), unsigned=(1 << 64)-1,
+            negative_zero=-0.0, precise=1.2345678901234567, text='café', empty_list=[], empty_dict={},
+            long=list(range(40)), floats=[.5]*40, mixed=[1, 2.5, None, dict(value='repeat', inner=[[], [True]])])
+        write_fixture(self.path, rows)
+        view = list(records(self.path, lazy=True))[2]['observation']
+        frame = view.frame
+
+        def same(left, right):
+            self.assertIs(type(left), type(right))
+            if isinstance(left, dict):
+                self.assertEqual(list(left), list(right))
+                for key in left:
+                    same(left[key], right[key])
+            elif isinstance(left, list):
+                self.assertEqual(len(left), len(right))
+                for a, b in zip(left, right):
+                    same(a, b)
+            elif isinstance(left, float):
+                self.assertEqual(struct.pack('<d', left), struct.pack('<d', right))
+            else:
+                self.assertEqual(left, right)
+        built = frame.build()
+        for node in range(len(frame.tags)):
+            same(built[node], frame.value(node))
+        same(materialize(view), rows[2]['observation'])
+
+    def test_trusted_blocks_skip_checks_only_after_an_audit_could_read_them(self):
+        rows = fixture()
+        write_fixture(self.path, rows)
+        self.assertEqual([r.get('observation') and materialize(r['observation']) for r in records(self.path, lazy=True, validated=True)],
+                         [r.get('observation') for r in rows])
+        # A corrupted block fails every reader that may be first to see it.
+        data = bytearray(self.path.read_bytes())
+        data[-1] ^= 0xff
+        self.path.write_bytes(data)
+        with self.assertRaises(ValueError):
+            list(records(self.path, lazy=True))
+
+    def diverged(self):
+        rows = fixture()
+        late = copy.deepcopy(rows[2])
+        late.update(frame=18, delta_ticks=6, time_seconds=0.3)
+        rows.insert(4, late)
+        rows[-1].update(valid=False, playback_completed=False, crc_mismatch=True, final_frame=19,
+                        samples=3, commands=2, recorded_crc_messages_seen=2,
+                        recorded_crc_messages_compared=2, replay_stream_eof=False,
+                        last_recorded_command_frame=18, observed_sighting_removals=[9])
+        failed = self.path.with_name(self.path.name+'.failed')
+        write_fixture(failed, rows)
+        with self.assertRaisesRegex(ValueError, 'not training eligible'):
+            audit(failed.rename(failed.with_suffix('.bin')))
+        failed.with_suffix('.bin').rename(failed)
+        return rows, failed
+
+    def test_trimming_a_diverged_export_keeps_the_verified_rows_and_passes_audit(self):
+        rows, failed = self.diverged()
+        kept = [r for r in rows if r['record'] != 'sample' or r['frame'] <= 12]
+        trim_export(failed, self.path, 12, 1)
+        self.assertFalse(failed.exists())
+        summary = audit(self.path)
+        self.assertEqual((summary['samples'], summary['commands'], summary['wait_samples']), (2, 1, 1))
+        self.assertEqual((summary['final_frame'], summary['verified_through_frame']), (12, 12))
+        self.assertEqual(summary['recorded_crc_messages_compared'], 1)
+        self.assertNotIn('observed_sighting_removals', summary)
+        back = list(records(self.path))
+        self.assertEqual([r.get('frame') for r in back[:-1]], [r.get('frame') for r in kept[:-1]])
+        self.assertEqual(back[2]['observation'], kept[2]['observation'])
+        self.assertTrue(back[-1]['crc_mismatch'])
+
+    def test_trimming_keeps_rows_on_the_verified_frame_and_refuses_clean_exports(self):
+        _, failed = self.diverged()
+        trim_export(failed, self.path, 18, 1)
+        self.assertEqual(audit(self.path)['samples'], 3)
+        write_fixture(failed, fixture())
+        with self.assertRaisesRegex(ValueError, 'Only a CRC-diverged'):
+            trim_export(failed, self.path, 6, 1)
 
     def test_malformed_typed_ranges_and_unknown_tags_are_rejected(self):
         for tags, values in (([8],[1 << 32]), ([8,7],[1, (1 << 32)|1]), ([8,9],[1,0])):

@@ -535,6 +535,17 @@ Int parseReplay(char *args[], int num)
 	return 1;
 }
 
+Int parseReplayServer(char *args[], int num)
+{
+	TrainingExporterServerConfigure();
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 1;
+}
+
 Int parseJobs(char *args[], int num)
 {
 	if (num > 1)
@@ -1230,6 +1241,7 @@ static CommandLineParam paramsForStartup[] =
 	// You can also include wildcards. The file must be in the replay folder or in a subfolder.
 	{ "-replay", parseReplay },
 	{ "-replayLogic", parseReplayLogic },
+	{ "-replayServer", parseReplayServer },
 
 	// TheSuperHackers @feature helmutbuhler 23/05/2025
 	// Simulate each replay in a separate process and use 1..N processes at the same time.

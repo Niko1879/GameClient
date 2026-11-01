@@ -41,7 +41,9 @@ class EventTests(unittest.TestCase):
         for obj in event_store.FEATURE_CODE:
             def edited(item, obj=obj):
                 return getsource(item)+('\n# A subsequent edit.\n' if item is obj else '')
-            with self.subTest(code=obj.__qualname__), patch('event_store.inspect.getsource', side_effect=edited):
+            # A process reads the feature code once; each new process sees an edit.
+            with self.subTest(code=obj.__qualname__), patch('event_store.inspect.getsource', side_effect=edited), \
+                    patch('event_store._FEATURE_CODE', []):
                 self.assertNotEqual(feature_identity(self.policy), original)
 
     def test_ui_bookkeeping_does_not_censor_delay_or_reset_history(self):

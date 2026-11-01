@@ -7,6 +7,7 @@
 #define Byte TrainingBinaryZlibByte
 #include <zlib.h>
 #undef Byte
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -55,6 +56,13 @@ template<class Json> class Writer {
     std::unordered_map<uint64_t, std::vector<uint32_t>> layouts;
     std::vector<std::vector<uint32_t>> schemas;
     std::vector<uint32_t> keys;
+    // Direct capture names its fields with string literals, whose addresses are
+    // stable: one hash of the addresses finds a layout that was seen before.
+    struct LiteralLayout {
+        std::vector<const char *> fields;
+        uint32_t layout = 0;
+    };
+    std::vector<LiteralLayout> literalLayouts = std::vector<LiteralLayout>(1024);
     std::vector<uint8_t> raw, compressed;
     Buffer scratch;
     Json newStrings, newSchemas;
@@ -128,8 +136,25 @@ public:
         buffer.tags[node] = 8; buffer.values[node] = (static_cast<uint64_t>(layout)<<32)|first;
         return {first, first+static_cast<uint32_t>(count)};
     }
+    // `fields` must be string literals (their addresses identify their text).
+    Cursor literalObject(Buffer &buffer, uint32_t node, const char *const *fields, size_t count) {
+        size_t hash = count;
+        for (size_t i = 0; i < count; ++i) hash = (hash*31) ^ (reinterpret_cast<size_t>(fields[i]) >> 2);
+        LiteralLayout &known = literalLayouts[(hash ^ (hash >> 10)) & 1023];
+        uint32_t layout = known.layout;
+        if (known.fields.size() != count || !std::equal(fields, fields+count, known.fields.begin())) {
+            keys.clear();
+            for (size_t i = 0; i < count; ++i) keys.push_back(intern(fields[i]));
+            layout = finishSchema();
+            known.fields.assign(fields, fields+count);
+            known.layout = layout;
+        }
+        const auto first = buffer.reserve(count);
+        buffer.tags[node] = 8; buffer.values[node] = (static_cast<uint64_t>(layout)<<32)|first;
+        return {first, first+static_cast<uint32_t>(count)};
+    }
     Cursor object(Buffer &buffer, uint32_t node, std::initializer_list<const char *> fields) {
-        return object(buffer, node, fields.begin(), fields.size());
+        return literalObject(buffer, node, fields.begin(), fields.size());
     }
     Cursor array(Buffer &buffer, uint32_t node, size_t count) {
         const auto first = buffer.reserve(count);
@@ -160,19 +185,28 @@ public:
     void copyJson(Buffer &buffer, uint32_t node, const Json &value) { encode(buffer, value, node); }
 
     void write(const Json &record, const Buffer *prepared = nullptr) {
-        Json envelope = Json::object(), metadata = Json::object();
         scratch.clear(); raw.clear();
-        for (auto it = record.begin(); it != record.end(); ++it)
-            if (it.key() != "observation") metadata[it.key()] = it.value();
-        if (!prepared && record.contains("observation")) {
+        const bool observed = record.contains("observation");
+        if (!prepared && observed) {
             scratch.reserve(1);
             encode(scratch, record.at("observation"), 0);
         }
         const Buffer &buffer = prepared ? *prepared : scratch;
-        envelope["record"] = std::move(metadata);
-        envelope["strings"] = std::move(newStrings);
-        envelope["schemas"] = std::move(newSchemas);
-        const auto text = envelope.dump(-1, ' ', false, Json::error_handler_t::replace);
+        // {"record":...,"strings":[...],"schemas":[...]}, usually with empty lists.
+        std::string text = "{\"record\":";
+        if (observed) {
+            Json metadata = Json::object();
+            for (auto it = record.begin(); it != record.end(); ++it)
+                if (it.key() != "observation") metadata[it.key()] = it.value();
+            text += metadata.dump(-1, ' ', false, Json::error_handler_t::replace);
+        } else text += record.dump(-1, ' ', false, Json::error_handler_t::replace);
+        text += ",\"strings\":";
+        if (newStrings.empty()) text += "[]";
+        else text += newStrings.dump(-1, ' ', false, Json::error_handler_t::replace);
+        text += ",\"schemas\":";
+        if (newSchemas.empty()) text += "[]";
+        else text += newSchemas.dump(-1, ' ', false, Json::error_handler_t::replace);
+        text += '}';
         if (text.size() > 16*1024*1024) throw std::runtime_error("Binary metadata exceeds block budget");
         raw.resize(buffer.tags.size()*9);
         if (!buffer.tags.empty()) {

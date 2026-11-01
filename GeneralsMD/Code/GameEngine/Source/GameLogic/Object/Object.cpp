@@ -1867,7 +1867,7 @@ void Object::reactToTransformChange(const Matrix3D* oldMtx, const Coord3D* oldPo
 	}
 	if (m_drawable)
 	{
-  	m_drawable->setTransformMatrix( this->getTransformMatrix() );
+		m_drawable->followObjectTransform( this->getTransformMatrix() );
 	}
 
 	Bool posDiff = isPosDifferent(oldPos, getPosition());
@@ -2210,6 +2210,7 @@ void Object::setDisabledUntil( DisabledType type, UnsignedInt frame )
 
 		m_disabledTillFrame[ type ] = frame;
 		m_disabledMask.set( type, frame > TheGameLogic->getFrame() );
+		TheGameLogic->friend_noteDisabledUntil( frame );
 
 		if( m_drawable )
 		{
@@ -2424,6 +2425,18 @@ Bool Object::clearDisabled( DisabledType type )
 
 //-------------------------------------------------------------------------------------------------
 //Checks any timers and clears disabled statii that have expired.
+//-------------------------------------------------------------------------------------------------
+UnsignedInt Object::getNextDisabledExpiry() const
+{
+	UnsignedInt earliest = 0xffffffff;
+	for( int i = 0; i < DISABLED_COUNT; i++ )
+	{
+		if( isDisabledByType( (DisabledType)i ) && m_disabledTillFrame[ i ] < earliest )
+			earliest = m_disabledTillFrame[ i ];
+	}
+	return earliest;
+}
+
 //-------------------------------------------------------------------------------------------------
 void Object::checkDisabledStatus()
 {

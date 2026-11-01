@@ -35,6 +35,8 @@
 #include "GameLogic/Module/SpawnBehavior.h"
 #include "GameLogic/Module/LifetimeUpdate.h"
 #include "GameNetwork/GeneralsOnline/json.hpp"
+#include "Common/ReplaySimulation.h"
+#include "GameClient/MapUtil.h"
 #include "Common/TrainingBinary.h"
 #include "gitinfo.h"
 #include <filesystem>
@@ -100,9 +102,11 @@ bool active = false, failed = false, mapWritten = false;
 // keep their metadata and sighting-memory updates but omit the observation.
 // Command rows and each player's first row always carry an observation.
 bool scheduledQuietCapture = false;
+bool replayServer = false;
 struct QuietDirective {
-    bool current = false;            // invalidated by every row written with an observation
+    bool current = false;            // until a command row, or the last of `frames` has passed
     std::vector<unsigned> frames;    // quiet frames, from the sync frame on, that need one
+    unsigned earliest = 0;           // no later schedule state can select a quiet frame before this
 };
 std::array<QuietDirective, MAX_PLAYER_COUNT> quietDirectives;
 bool fullPlacementMask = false;
@@ -384,9 +388,18 @@ void write(const Json &record, const training_binary::Buffer *prepared = nullptr
 
 void flushSamples()
 {
+    bool observedRow = false;
     for (size_t i = 0; i < pendingCount; ++i) {
         const auto player = pendingPlayers[i];
         write(pendingSamples[player], binaryFormat ? &pendingDirectBuffers[player] : nullptr);
+        observedRow = observedRow || !pendingSamples[player].contains("light");
+    }
+    // Let the capture controller validate observed rows while the game runs on,
+    // instead of only once the engine stops to ask it for a directive.
+    if (scheduledQuietCapture && observedRow) {
+        output.flush();
+        if (!output) throw std::runtime_error("Cannot flush training export for the capture controller");
+        std::cout << "GAIX {\"event\":\"rows\"}" << std::endl;
     }
     // Retain one record per player: command-only samples must not swap viewers
     // through the same scratch tree between regular cadence boundaries.
@@ -395,13 +408,19 @@ void flushSamples()
     pendingResolvedCommands.clear();
 }
 
-// Ask the controller which quiet frames need an observation, once per row that
-// carried one: the event schedule changes only on such rows. Every earlier row
-// of this player is already written (flushSamples runs first each tick).
+// Ask the controller which quiet frames need an observation only when the answer
+// can matter. A directive stays valid until a command row or its last frame has
+// passed: quiet rows it named cannot change it. Commands only move the schedule
+// later, so nothing before the first frame of the latest answer can be selected.
+// Every earlier row of this player is already written (flushSamples runs first
+// each tick).
 bool quietObservationWanted(int player, unsigned frame)
 {
     QuietDirective &directive = quietDirectives[player];
+    if (directive.current && !directive.frames.empty() && frame > directive.frames.back())
+        directive.current = false;
     if (!directive.current) {
+        if (frame < directive.earliest) return false;
         output.flush();
         if (!output) throw std::runtime_error("Cannot flush training export for the capture controller");
         std::cout << "GAIX " << Json({{"event", "capture"}, {"player", player}, {"frame", frame}}).dump() << std::endl;
@@ -416,6 +435,8 @@ bool quietObservationWanted(int player, unsigned frame)
             if (wanted < frame) throw std::runtime_error("Capture directive names a past frame");
             directive.frames.push_back(wanted);
         }
+        // No frames: the episode is finished, so no quiet row can be selected again.
+        directive.earliest = directive.frames.empty() ? std::numeric_limits<unsigned>::max() : directive.frames.front();
         directive.current = true;
     }
     return std::find(directive.frames.begin(), directive.frames.end(), frame) != directive.frames.end();
@@ -478,12 +499,38 @@ bool retainedNeutralTemplate(const ThingTemplate *t)
     return false;
 }
 
+// Templates are static during a game, and each sample scans every object at least twice.
+struct RetainedTemplate { const ThingTemplate *type = nullptr; bool entity = false, neutral = false; int dock = -1; };
+std::vector<RetainedTemplate> retainedTemplates = std::vector<RetainedTemplate>(4096);
+
 bool retainedEntity(const Object *o)
 {
     // Ownership is observable; playable sides keep every retained template.
     const Player *owner = o->getControllingPlayer();
-    return retainedEntityTemplate(o->getTemplate())
-        && ((owner && owner->isPlayableSide()) || retainedNeutralTemplate(o->getTemplate()));
+    const ThingTemplate *type = o->getTemplate();
+    RetainedTemplate &known = retainedTemplates[(reinterpret_cast<size_t>(type) >> 4) & 4095];
+    if (known.type != type) {
+        known.type = type;
+        known.entity = retainedEntityTemplate(type);
+        known.neutral = known.entity && retainedNeutralTemplate(type);
+        known.dock = -1;
+    }
+    return known.entity && ((owner && owner->isPlayableSide()) || known.neutral);
+}
+
+// An object's modules come from its template, so one object answers for all.
+bool hasDockInterface(Object *o)
+{
+    const ThingTemplate *type = o->getTemplate();
+    RetainedTemplate &known = retainedTemplates[(reinterpret_cast<size_t>(type) >> 4) & 4095];
+    if (known.type != type || known.dock < 0) {
+        bool dock = false;
+        for (BehaviorModule **module = o->getBehaviorModules(); *module; ++module)
+            if ((*module)->getDockUpdateInterface()) { dock = true; break; }
+        if (known.type != type) return dock;
+        known.dock = dock;
+    }
+    return known.dock != 0;
 }
 
 bool persistentSightingTemplate(const ThingTemplate *t)
@@ -1042,6 +1089,8 @@ void TrainingObservationReset()
     submissions.fill(Json()); validations.fill(Json());
     liveObservations.fill(Json());
     observationLookups.commandSets.clear(); observationLookups.docks.clear();
+    std::fill(retainedTemplates.begin(), retainedTemplates.end(), RetainedTemplate{});
+    directScratch.gridCells.clear();
 }
 
 void TrainingObserveObjectRemoval(const Object *object)
@@ -1318,6 +1367,31 @@ void TrainingExporterBuildResult(const GameMessage *message, const Object *build
     }
 }
 Bool TrainingExporterIsEnabled() { return !outputDirectory.empty(); }
+void TrainingExporterServerConfigure() { replayServer = true; }
+Bool TrainingExporterServerEnabled() { return replayServer; }
+
+Int TrainingExporterServe()
+{
+    if (!TheGlobalData->m_headless) {
+        printf("-replayServer requires -headless.\n");
+        return 1;
+    }
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        // A job is {"replay", "output", "logic"}; a malformed one is a controller bug.
+        const Json job = Json::parse(line);
+        outputDirectory = job.at("output").get<std::string>();
+        TheReplayLogic = job.at("logic").get<std::string>() == "081326" ? REPLAY_LOGIC_081326 : REPLAY_LOGIC_CURRENT;
+        // The controller adds a replay's map to the private profile just before its job.
+        TheMapCache->updateCache();
+        const std::vector<AsciiString> replays(1, AsciiString(job.at("replay").get<std::string>().c_str()));
+        const Int exitCode = ReplaySimulation::simulateReplays(replays, SIMULATE_REPLAYS_SEQUENTIAL);
+        // Release the finished game now: the controller prepares this export while we idle.
+        if (TheGameLogic->isInGame()) TheGameLogic->clearGameData();
+        std::cout << "GAIX " << Json({{"event", "replay_done"}, {"exit_code", exitCode}}).dump() << std::endl;
+    }
+    return 0;
+}
 
 Bool TrainingExporterBegin(const AsciiString &replay)
 {
@@ -1410,10 +1484,9 @@ void TrainingExporterCapturePreCommands()
             const unsigned actionCount = static_cast<unsigned>(actions.size());
             const bool observed = !scheduledQuietCapture || !waiting || !lastSample[i].has_value()
                 || quietObservationWanted(i, frame);
-            if (observed) {
-                sample.erase("light");
-                quietDirectives[i].current = false;
-            } else sample["light"] = true;
+            if (!waiting) quietDirectives[i].current = false;
+            if (observed) sample.erase("light");
+            else sample["light"] = true;
             setString(sample["decision"], waiting ? "wait" : "commands");
             if (actions.is_null()) actions = Json::array();
             sample["actions"] = std::move(actions);

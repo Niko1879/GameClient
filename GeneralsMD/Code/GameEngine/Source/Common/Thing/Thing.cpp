@@ -141,7 +141,7 @@ void Thing::setPositionZ( Real z )
 	//USE_PERF_TIMER(ThingMatrixStuff)
 	if( !m_template->isKindOf( KINDOF_STICK_TO_TERRAIN_SLOPE) )
 	{
-		Real oldAngle = m_cachedAngle;
+		Real oldAngle = getOrientation();
 		Coord3D oldPos = m_cachedPos;
 		Matrix3D oldMtx = m_transform;
 
@@ -177,7 +177,7 @@ void Thing::setPosition( const Coord3D *pos )
 	//USE_PERF_TIMER(ThingMatrixStuff)
 	if( !m_template->isKindOf( KINDOF_STICK_TO_TERRAIN_SLOPE) )
 	{
-		Real oldAngle = m_cachedAngle;
+		Real oldAngle = getOrientation();
 		Coord3D oldPos = m_cachedPos;
 		Matrix3D oldMtx = m_transform;
 
@@ -210,7 +210,7 @@ void Thing::setOrientation( Real angle )
 	// or aligned with the terrain if we have the magic flag set.
 	// don't want this? call setTransformMatrix instead.
 
-	Real oldAngle = m_cachedAngle;
+	Real oldAngle = getOrientation();
 	Coord3D oldPos = m_cachedPos;
 	Matrix3D oldMtx = m_transform;
 
@@ -244,7 +244,7 @@ void Thing::setOrientation( Real angle )
 	//DEBUG_ASSERTCRASH(-PI <= angle && angle <= PI, ("Please pass only normalized (-PI..PI) angles to setOrientation (%f).", angle));
 	m_cachedAngle = normalizeAngle(angle);
 	m_cachedPos = pos;
-	m_cacheFlags &= ~VALID_DIRVECTOR;	// but don't clear the altitude flags.
+	m_cacheFlags &= ~(VALID_DIRVECTOR | STALE_ANGLE);	// but don't clear the altitude flags.
 
 	reactToTransformChange(&oldMtx, &oldPos, oldAngle);
 	DEBUG_ASSERTCRASH(!(_isnan(getPosition()->x) || _isnan(getPosition()->y) || _isnan(getPosition()->z)), ("Drawable/Object position NAN! '%s'", m_template->getName().str() ));
@@ -256,7 +256,7 @@ void Thing::setOrientation( Real angle )
 void Thing::setTransformMatrix( const Matrix3D *mx )
 {
 	//USE_PERF_TIMER(ThingMatrixStuff)
-	Real oldAngle = m_cachedAngle;
+	Real oldAngle = getOrientation();
 	Coord3D oldPos = m_cachedPos;
 	Matrix3D oldMtx = m_transform;
 
@@ -269,6 +269,16 @@ void Thing::setTransformMatrix( const Matrix3D *mx )
 
 	reactToTransformChange(&oldMtx, &oldPos, oldAngle);
 	DEBUG_ASSERTCRASH(!(_isnan(getPosition()->x) || _isnan(getPosition()->y) || _isnan(getPosition()->z)), ("Drawable/Object position NAN! '%s'", m_template->getName().str() ));
+}
+
+//=============================================================================
+void Thing::adoptTransformMatrix( const Matrix3D *mx )
+{
+	m_transform = *mx;
+	m_cachedPos.x = m_transform.Get_X_Translation();
+	m_cachedPos.y = m_transform.Get_Y_Translation();
+	m_cachedPos.z = m_transform.Get_Z_Translation();
+	m_cacheFlags = STALE_ANGLE;
 }
 
 //-------------------------------------------------------------------------------------------------

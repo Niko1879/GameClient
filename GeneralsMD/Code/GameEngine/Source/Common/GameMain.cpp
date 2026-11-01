@@ -32,6 +32,7 @@
 #include "Common/GameEngine.h"
 #include "Common/ReplaySimulation.h"
 #include "Common/SelfPlay.h"
+#include "Common/TrainingExporter.h"
 
 
 /**
@@ -54,6 +55,10 @@ Int GameMain()
 	if (SelfPlayIsEnabled())
 	{
 		exitcode = SelfPlayRun();
+	}
+	else if (TrainingExporterServerEnabled())
+	{
+		exitcode = TrainingExporterServe();
 	}
 	else if (TheGlobalData->m_exportStats && (!TheGlobalData->m_headless || TheGlobalData->m_simulateReplays.empty()))
 	{

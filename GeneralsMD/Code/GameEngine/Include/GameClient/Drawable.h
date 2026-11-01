@@ -410,6 +410,8 @@ public:
 	void setInstanceScale(Real value) { m_instanceScale = value;}	///< set scale that will be applied to instance matrix before rendering.
 
 	const Matrix3D *getTransformMatrix() const;	///< return the world transform
+	/// Follow this drawable's object after it moved (nothing renders a headless game).
+	void followObjectTransform(const Matrix3D *mx);
 
 	void draw();													///< render the drawable to the given view
 	void updateDrawable();														///< update the drawable

@@ -172,10 +172,10 @@ void UpdateModule::xfer( Xfer *xfer )
 	}
 #endif
 
-	// m_indexInLogic is not saved -- it's restored in gamelogic::postprocess.
+	// m_sleepySlot is not saved -- it's restored in gamelogic::postprocess.
 	if( xfer->getXferMode() == XFER_LOAD )
 	{
-		m_indexInLogic = -1;
+		m_sleepySlot = -1;
 	}
 
 }

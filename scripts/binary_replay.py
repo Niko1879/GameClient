@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from functools import partial
 import json
 import math
+import os
 from pathlib import Path
 import struct
 import sys
@@ -26,7 +27,7 @@ def materialize(value):
     if isinstance(value, DeferredObservation):
         return materialize(value.loaded())
     if isinstance(value, ObjectView):
-        return {key: materialize(value[key]) for key in value}
+        return value.frame.build()[value.node]
     if isinstance(value, EntityList):
         return value.plain()
     return value
@@ -56,11 +57,11 @@ class DeferredObservation(Mapping):
 
 
 class ObjectView(Mapping):
-    __slots__ = ('frame', 'start', 'fields', 'cache', 'observation')
+    __slots__ = ('frame', 'node', 'start', 'fields', 'cache', 'observation')
 
     def __init__(self, frame, node, *, observation=False):
         bits = frame.values[node]
-        self.frame, self.start = frame, bits & 0xffffffff
+        self.frame, self.node, self.start = frame, node, bits & 0xffffffff
         self.fields = frame.schemas[bits >> 32]
         self.cache, self.observation = {}, observation
 
@@ -184,7 +185,8 @@ class Layouts(list):
 
 
 class Frame:
-    def __init__(self, raw, count, strings, schemas, *, check_finite=False):
+    def __init__(self, raw, count, strings, schemas, *, check_finite=False, trusted=False):
+        """`trusted` skips the structural checks for a block the audit checks or has checked."""
         self.raw, self.strings, self.schemas = raw, strings, schemas
         data = memoryview(raw)
         self.tags = data[:count]
@@ -194,6 +196,8 @@ class Frame:
         tags = np.frombuffer(self.tags, np.uint8)
         values = np.frombuffer(data[count:], '<u8')
         self.tag_array, self.value_array = tags, values
+        if trusted:
+            return
         if not count or np.any(tags > 8) or self.tags[0] != 8:
             raise ValueError('Invalid binary observation scalar tag/root')
         if check_finite and not np.isfinite(np.frombuffer(data[count:], '<f8')[tags == 5]).all():
@@ -220,6 +224,34 @@ class Frame:
                          or np.any(first[1:] != first[:-1]+lengths[:-1])):
             raise ValueError('Binary observation contains overlapping/orphan nodes')
 
+    def build(self):
+        """Every node as ordinary Python values: value(node) for all nodes in one pass."""
+        tags, bits = self.tag_array, self.value_array
+        nodes = bits.astype(object)  # unsigned integers, and containers' child ranges
+        floats = tags == 5
+        nodes[floats] = np.frombuffer(self.raw, '<f8', offset=len(tags))[floats]
+        signed = tags == 3
+        nodes[signed] = bits[signed].astype('<i8')
+        text = tags == 6
+        strings = self.strings
+        nodes[text] = [strings[i] for i in bits[text].tolist()]
+        nodes[tags == 2] = True
+        nodes[tags == 1] = False
+        nodes[tags == 0] = None
+        nodes = nodes.tolist()
+        schemas = self.schemas
+        # All children follow their parent, so a backward pass finds them built.
+        containers = np.flatnonzero(tags >= 7)[::-1]
+        for node, tag in zip(containers.tolist(), tags[containers].tolist()):
+            packed = nodes[node]
+            start, size = packed & 0xffffffff, packed >> 32
+            if tag == 7:
+                nodes[node] = nodes[start:start+size]
+            else:
+                fields = schemas[size]
+                nodes[node] = dict(zip(fields, nodes[start:start+len(fields)]))
+        return nodes
+
     def value(self, node):
         tag, bits = self.tags[node], self.values[node]
         if tag == 0:
@@ -245,7 +277,7 @@ class Frame:
         return {key:self.value(start+offset) for key, offset in self.schemas[size].items()}
 
 
-def load_block(stored, text, count, raw_size, crc, flags, strings, schemas, check_finite):
+def load_block(stored, text, count, raw_size, crc, flags, strings, schemas, check_finite, trusted=False):
     if flags:
         inflater = zlib.decompressobj()
         try:
@@ -256,11 +288,57 @@ def load_block(stored, text, count, raw_size, crc, flags, strings, schemas, chec
             raise ValueError('Invalid compressed binary observation')
     else:
         raw = stored
-    if len(raw) != raw_size or zlib.crc32(raw, zlib.crc32(text)) != crc:
+    if len(raw) != raw_size or (not trusted and zlib.crc32(raw, zlib.crc32(text)) != crc):
         raise ValueError('Binary block checksum/size mismatch')
     if count:
-        frame = Frame(raw, count, strings, schemas, check_finite=check_finite)
+        frame = Frame(raw, count, strings, schemas, check_finite=check_finite, trusted=trusted)
         return ObjectView(frame, 0, observation=True)
+
+
+def trim_export(source, destination, last_frame, crc_comparisons):
+    """Turn a CRC-diverged export into a finished one ending at `last_frame`.
+
+    Blocks are self-contained apart from the dictionaries earlier blocks grow, so
+    the kept rows are a byte prefix. The file is cut in place, not rewritten.
+    """
+    source, destination = Path(source), Path(destination)
+    samples = commands = waits = 0
+    cut = footer = None
+    with source.open('r+b') as stream:
+        if stream.read(8) != MAGIC:
+            raise ValueError('Unsupported binary replay signature/version')
+        while footer is None:
+            offset = stream.tell()
+            header = stream.read(BLOCK.size)
+            if len(header) != BLOCK.size:
+                raise ValueError('Diverged export has no footer')
+            _, meta_size, _, _, stored_size, _, _ = BLOCK.unpack(header)
+            record = json.loads(stream.read(meta_size).decode('utf-8'))['record']
+            stream.seek(stored_size, 1)
+            if record['record'] == 'footer':
+                footer = record
+            elif record['record'] == 'sample':
+                if record['frame'] > last_frame:
+                    cut = offset if cut is None else cut
+                elif cut is not None:
+                    raise ValueError('Export samples are not in frame order')
+                else:
+                    samples += 1
+                    commands += len(record['actions'])
+                    waits += not record['actions']
+        if footer['valid'] or not footer['crc_mismatch']:
+            raise ValueError('Only a CRC-diverged export can be trimmed')
+        # These counters describe the removed rows too; audit treats them as optional.
+        kept = {k:v for k, v in footer.items() if k not in ('observed_sighting_removals', 'temporary_sightings_forgotten')}
+        kept.update(valid=True, samples=samples, commands=commands, wait_samples=waits, final_frame=last_frame,
+                    verified_through_frame=last_frame, recorded_crc_messages_compared=crc_comparisons,
+                    result='recorded simulation CRC checks passed through verified_through_frame')
+        metadata = json.dumps(dict(record=kept, strings=[], schemas=[])).encode('utf-8')
+        stream.seek(offset if cut is None else cut)
+        stream.truncate()
+        stream.write(BLOCK.pack(b'BLK1', len(metadata), 0, 0, 0, zlib.crc32(b'', zlib.crc32(metadata)), 0))
+        stream.write(metadata)
+    os.replace(source, destination)
 
 
 def records(path, *, decoder=None, check_finite=False, lazy=False, player=None, validated=False):
@@ -280,7 +358,10 @@ def stream_records(stream, *, decoder=None, check_finite=False, lazy=False, play
     if sys.byteorder != 'little':
         raise ValueError('Binary replay reader requires little-endian host')
     decoder = decoder or json.JSONDecoder()
+    scan = decoder.raw_decode
     strings, schemas = [], Layouts()
+    # Only a complete audit, which reads every block itself, may leave blocks unchecked.
+    trusted = validated and lazy and not check_finite
     if stream.read(8) != MAGIC:
         raise ValueError('Unsupported binary replay signature/version')
     while True:
@@ -297,13 +378,19 @@ def stream_records(stream, *, decoder=None, check_finite=False, lazy=False, play
         text = stream.read(meta_size)
         if len(text) != meta_size:
             raise ValueError('Truncated binary metadata')
-        envelope = decoder.decode(text.decode('utf-8'))
-        if not isinstance(envelope, dict) or set(envelope) != {'record', 'strings', 'schemas'}:
+        decoded = text.decode('utf-8')
+        envelope, end = scan(decoded)
+        if end != len(decoded):
+            raise ValueError('Invalid binary metadata envelope')
+        if not isinstance(envelope, dict) or len(envelope) != 3 or not {'record', 'strings', 'schemas'} <= envelope.keys():
             raise ValueError('Invalid binary metadata envelope')
         added = envelope['strings']
-        if not isinstance(added, list) or any(not isinstance(s, str) for s in added):
+        if not isinstance(added, list):
             raise ValueError('Invalid binary string dictionary')
-        strings.extend(added)
+        if added:
+            if any(not isinstance(s, str) for s in added):
+                raise ValueError('Invalid binary string dictionary')
+            strings.extend(added)
         for layout in envelope['schemas']:
             if not isinstance(layout, list) or any(type(i) is not int or not 0 <= i < len(strings) for i in layout):
                 raise ValueError('Invalid binary field layout')
@@ -326,11 +413,11 @@ def stream_records(stream, *, decoder=None, check_finite=False, lazy=False, play
         stored = stream.read(stored_size)
         if len(stored) != stored_size:
             raise ValueError('Truncated binary observation')
-        loader = partial(load_block, stored, text, count, raw_size, crc, flags, strings, schemas, check_finite)
-        if count and validated and lazy and not check_finite:
-            record['observation'] = DeferredObservation(loader)
+        if count and trusted:
+            record['observation'] = DeferredObservation(
+                partial(load_block, stored, text, count, raw_size, crc, flags, strings, schemas, False, True))
         else:
-            view = loader()
+            view = load_block(stored, text, count, raw_size, crc, flags, strings, schemas, check_finite)
             if count:
                 record['observation'] = view if lazy else materialize(view)
         yield record

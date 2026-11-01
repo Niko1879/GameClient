@@ -30,6 +30,9 @@
 #pragma once
 
 // USER INCLUDES //////////////////////////////////////////////////////////////////////////////////
+#include <string>
+#include <unordered_map>
+
 #include "Common/AudioEventRTS.h"
 #include "Common/GameType.h"
 #include "Common/Overridable.h"
@@ -896,6 +899,8 @@ protected:
 
 	CommandButton *m_commandButtons;							///< list of possible commands to have
 	CommandSet *m_commandSets;										///< list of all command sets defined
+	std::unordered_map<std::string, CommandSet *> m_commandSetsByName;	///< the same sets, found by name; rebuilt when stale
+	Bool m_commandSetsByNameStale;
 	ControlBarSchemeManager *m_controlBarSchemeManager;		///< The Scheme singleton
 
 	GameWindow *m_contextParent[ NUM_CONTEXT_PARENTS ];		///< "parent" window for buttons that are part of the context sensitive interface

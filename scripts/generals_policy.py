@@ -90,6 +90,90 @@ class Encoder:
         self.types = {name: i for i, name in enumerate(config['types'])}
         self.identity = IdentityHierarchy(config)
         self.upgrade_ids = {name: i+1 for i, name in enumerate(config['upgrades'])}
+        # Per-game inputs, found by the identity of the game's terrain record.
+        self._extent, self._static, self._player, self._home = None, {}, {}, None
+        self._menus = {}
+
+    def _bounds(self, terrain):
+        extent = self._extent
+        if extent is None or extent[0] is not terrain:
+            if terrain['grid_size'] != 32:
+                raise ValueError('Observation schema expects a 32x32 map')
+            low, high = np.asarray(terrain['extent_low'][:2]), np.asarray(terrain['extent_high'][:2])
+            span = high - low
+            if np.any(span <= 0):
+                raise ValueError('Invalid map extent')
+            extent = self._extent = (terrain, low, high, span)
+        return extent[1:]
+
+    def _static_map(self, terrain, low, high, span, rotated):
+        """Map columns that do not change during a game, in one orientation."""
+        entry = self._static.get(rotated)
+        if entry is not None and entry[0] is terrain:
+            return entry[1], entry[2]
+        n, scale = self.config['map_side'], 32 // self.config['map_side']
+        height, cliff = np.asarray(terrain['height']), np.asarray(terrain['cliff'])
+        sources = terrain.get('supply_sources', [])
+        if rotated:
+            height, cliff = (grid.reshape(32, 32)[::-1, ::-1].reshape(-1) for grid in (height, cliff))
+            sources = [[*(low+high-np.asarray(s['position'][:2])).tolist(), *s['position'][2:]] for s in sources]
+        else:
+            sources = [s['position'] for s in sources]
+        def pool(values):
+            return values.reshape(n, scale, n, scale).mean(axis=(1, 3)).reshape(-1)
+        coords = (np.stack(np.meshgrid(np.arange(n), np.arange(n)), axis=-1).reshape(-1, 2) + .5) / n
+        base = np.zeros((n*n, MAP_CHANNELS))
+        base[:, 0] = pool(height) / 512
+        base[:, 1] = pool(cliff)
+        base[:, 10:12] = coords
+        # Public static supply positions are available before scouting. Never
+        # import supply quantities or enemy entities from the global simulator.
+        for source in sources:
+            pos = (np.asarray(source[:2])-low)/span
+            x, y = np.clip((pos*n).astype(int), 0, n-1)
+            base[y*n+x, 9] += 1
+        self._static[rotated] = (terrain, base, coords)
+        return base, coords
+
+    def _player_flags(self, player):
+        """Completed player upgrades, owned promotions and currently purchasable promotions."""
+        key = (tuple(player.get('upgrades', [])), tuple(player.get('sciences', [])),
+               tuple(player.get('purchasable_sciences', [])))
+        flags = self._player.get(key)
+        if flags is None:
+            upgrades, sciences = self.config['upgrades'], self.config['sciences']
+            owned_upgrades, owned_sciences, purchasable = map(set, key)
+            if len(self._player) > 4096:
+                self._player = {}
+            flags = self._player[key] = (
+                np.asarray([name in owned_upgrades for name in upgrades]
+                           + [name in owned_sciences for name in sciences]
+                           + [name in purchasable for name in sciences], dtype=float),
+                np.asarray([name in purchasable for name in sciences], dtype=bool))
+        return flags
+
+    def _menu_flags(self, name):
+        flags = self._menus.get(name)
+        if flags is None:
+            menus = self.config['menus']
+            flags = self._menus[name] = (bool(menus.get(name+'|build')), bool(menus.get(name+'|train')))
+        return flags
+
+    def schedule_inputs(self, observation, terrain):
+        """What policy.target() reads to accept or reject a command.
+
+        Acceptance does not depend on entity order or map orientation, so the
+        capture schedule skips them and every feature column (test_scheduled_capture).
+        """
+        low, _, span = self._bounds(terrain)
+        entities = observation['own_entities'] + observation['known_nonowned_entities']
+        real_count = len(entities)
+        return {'entities': entities, 'ids': {e['id']: i for i, e in enumerate(entities)},
+                'own': np.asarray([e['own'] for e in entities] if real_count else [False]),
+                'visible_target': np.asarray([not e['own'] and e['visible'] and e['health'] > 0 and e['max_health'] > 0
+                                              for e in entities] if real_count else [False]),
+                'low': low, 'span': span, 'rotated': False,
+                'purchasable_sciences': self._player_flags(observation['player'])[1]}
 
     def encode(self, observation, terrain, frame, *, previous_frame=None, home_position=None,
                source_ticks_per_second=60):
@@ -97,22 +181,20 @@ class Encoder:
             raise ValueError('Policy requires observation version %d' % OBSERVATION_VERSION)
         if observation['player']['faction'] != 'FactionChina':
             raise ValueError('Policy is for vanilla China')
-        if terrain['grid_size'] != 32:
-            raise ValueError('Observation schema expects a 32x32 map')
-        low, high = np.asarray(terrain['extent_low'][:2]), np.asarray(terrain['extent_high'][:2])
-        span = high - low
-        if np.any(span <= 0):
-            raise ValueError('Invalid map extent')
+        low, high, span = self._bounds(terrain)
         # Canonical coordinates: every player starts in the same half of the map.
         home_position = home_position if home_position is not None else initial_home(observation)
-        home = (np.asarray(home_position)-low)/span-.5 if home_position is not None else np.zeros(2)
-        rotated = bool(home[int(np.argmax(abs(home)))] > 0)
+        cached = self._home
+        if cached is not None and cached[0] is home_position and home_position is not None and cached[1] is low:
+            rotated = cached[2]
+        else:
+            home = (np.asarray(home_position)-low)/span-.5 if home_position is not None else np.zeros(2)
+            rotated = bool(home[int(np.argmax(abs(home)))] > 0)
+            self._home = (home_position, low, rotated)
+        n = self.config['map_side']
         if rotated:
-            def position(xyz):
-                return [*(low+high-np.asarray(xyz[:2])).tolist(), *xyz[2:]]
-
             def rotate(rows):
-                # position() for every row at once: the same float64 operations.
+                # The mirrored position for every row at once: the same float64 operations.
                 if not rows:
                     return []
                 xy = (low+high-np.asarray([e['position'][:2] for e in rows], dtype=float)).tolist()
@@ -121,12 +203,11 @@ class Encoder:
                            'own_entities': rotate(observation['own_entities']),
                            'known_nonowned_entities': rotate(observation['known_nonowned_entities']),
                            'visibility_grid': np.asarray(observation['visibility_grid']).reshape(32, 32)[::-1, ::-1].reshape(-1)}
-            terrain = {**terrain, 'height': np.asarray(terrain['height']).reshape(32, 32)[::-1, ::-1].reshape(-1),
-                       'cliff': np.asarray(terrain['cliff']).reshape(32, 32)[::-1, ::-1].reshape(-1),
-                       'supply_sources': [{**s, 'position': position(s['position'])} for s in terrain.get('supply_sources', [])]}
         entities = sorted(observation['own_entities'] + observation['known_nonowned_entities'], key=entity_key)
         real_count = len(entities)
         types = [self.types.get(entity['type'], 0) for entity in entities]
+        owns = [e['own'] for e in entities]
+        visibles = [e['visible'] for e in entities]
         if real_count:
             # Column-wise, with the same float64 operations as a per-entity row.
             def column(name, default=None):
@@ -140,7 +221,7 @@ class Encoder:
                 xy[:, 0], xy[:, 1], position[:, 2] / 512,
                 health / np.maximum(maximum, 1),
                 np.log1p(np.maximum(maximum, 0)) / 10,
-                column('own'), column('visible'),
+                np.asarray(owns, dtype=float), np.asarray(visibles, dtype=float),
                 np.asarray([e['owner'] >= 2 and not e['own'] for e in entities], dtype=float),
                 np.log1p(np.maximum(0, frame - column('last_seen_frame')) / 60) / 10,
                 (construction == -1).astype(float),
@@ -155,92 +236,91 @@ class Encoder:
         since_decision = max(0, frame - (frame if previous_frame is None else previous_frame))
         submission = observation.get('last_submission', {})
         since_command = submission.get('age_seconds', 0) if submission.get('available', False) else 0
-        scalars = np.concatenate([np.clip([
+        scalars = np.concatenate([np.minimum(np.maximum(np.asarray([
             np.log1p(p['cash']) / 10, p['power_production'] / 100, p['power_consumption'] / 100,
             float(p['radar']), p['rank'] / 5, p['skill_points'] / 10, p['science_points'] / 10,
             float(p['dead']), np.log1p(frame / 60) / 10, np.log1p(since_decision / 60),
             len(observation['own_entities']) / 100, len(observation['known_nonowned_entities']) / 100,
-            span[0] / 4000, span[1] / 4000], -10, 10),
+            span[0] / 4000, span[1] / 4000]), -10), 10),
             [np.log1p(since_command)/5, source_ticks_per_second/60]])
         visible_target = np.asarray([not e['own'] and e['visible'] and e['health'] > 0 and e['max_health'] > 0
                                      for e in entities] if real_count else [False])
         encoded = {'entities': entities, 'ids': {e['id']: i for i, e in enumerate(entities)},
                    'numeric': numeric, 'types': np.asarray(types if types else [0], dtype=int),
-                   'own': np.asarray([e['own'] for e in entities] if real_count else [False]),
+                   'own': np.asarray(owns if real_count else [False]),
                    'visible_target': visible_target, 'scalars': scalars,
                    'low': low, 'span': span, 'rotated': rotated, 'frame': frame}
         if self.config['placement_mode'] == 'full_mask':
             encoded['placement_records'] = observation.get('build_placements', [])
             encoded['placement_source_rate'] = source_ticks_per_second
-        n = self.config['map_side']
         # Map cells retain categorical shroud information. The native enum is
         # 0=clear, 1=fogged, 2=unseen, not a continuous visibility score.
         visibility = np.asarray(observation['visibility_grid']).reshape(32, 32)
-        def pool(values):
-            scale = 32 // n
-            return np.asarray(values).reshape(n, scale, n, scale).mean(axis=(1, 3)).reshape(-1)
-        coords = (np.stack(np.meshgrid(np.arange(n), np.arange(n)), axis=-1).reshape(-1, 2) + .5) / n
-        map_inputs = np.zeros((n*n, MAP_CHANNELS))
-        map_inputs[:, 0] = pool(terrain['height']) / 512
-        map_inputs[:, 1] = pool(terrain['cliff'])
+        scale = 32 // n
+        base, coords = self._static_map(terrain, low, high, span, rotated)
+        map_inputs = base.copy()
         for category in range(3):
-            map_inputs[:, 2 + category] = pool(visibility == category)
-        map_inputs[:, 10:12] = coords
-        cells, channels, extra, queued_types = [], [], [], []
-        upgrade_ids, menus, catalog_types = self.upgrade_ids, self.config['menus'], self.types
+            map_inputs[:, 2 + category] = np.add.reduce((visibility == category).reshape(n, scale, n, scale),
+                                                        axis=(1, 3), dtype=float).reshape(-1) / (scale*scale)
+        upgrade_ids, catalog_types = self.upgrade_ids, self.types
         entity_upgrades = np.zeros((max(real_count, 1), ENTITY_UPGRADE_SLOTS), dtype=int)
         info = self.config['command_info']
         grid_xy = np.clip((numeric[:real_count, :2] * n).astype(int), 0, n-1)
-        for index, (e, (x, y)) in enumerate(zip(entities, grid_xy)):
-            cell = int(y*n+x); cells.append(cell)
-            channels.append(5 if e['own'] else (6 if e['visible'] and e['owner'] >= 2
-                                                 else 7 if e['owner'] >= 2 else 8))
-            build_menu = menus.get(e['type']+'|build', []) if e['own'] else []
-            train_menu = menus.get(e['type']+'|train', []) if e['own'] else []
-            # Owner-only command capabilities; nonowned rows stay zero.
-            commands = e.get('commands', []) if e['own'] else []
-            kinds = [info.get(name, ['', ''])[0] for name in commands]
-            charging = e.get('command_cooldowns', []) if e['own'] else []
-            capacity = e.get('capacity', 0) if e['own'] else 0
-            extra.append([bool(build_menu), bool(train_menu),
-                          min(len(e.get('buildable_templates', [])), 20)/20,
-                          min(len(e.get('trainable_templates', [])), 20)/20,
-                          float('ability' in kinds), float('upgrade' in kinds), float('evacuate' in kinds),
-                          min(len(commands), 10)/10, float(bool(charging)),
-                          min(c['ready_percent'] for c in charging)/100 if charging else 0,
-                          float(bool(e.get('container_id', 0))) if e['own'] else 0, float(capacity > 0),
-                          e.get('occupants', 0)/max(capacity, 1), float(bool(e.get('enter_targets'))) if e['own'] else 0])
-            if e['own']:
-                known = [upgrade_ids[name] for name in e.get('upgrades', []) if name in upgrade_ids]
+        cells = (grid_xy[:, 1]*n+grid_xy[:, 0]).tolist()
+        channels = [5 if own else (6 if visible and e['owner'] >= 2 else 7 if e['owner'] >= 2 else 8)
+                    for e, own, visible in zip(entities, owns, visibles)]
+        queued_types = [0]*real_count
+        extra_rows, extra_index = [], []
+        for index, e in enumerate(entities):
+            if not e['own']:
+                # Owner-only command capabilities; nonowned rows stay zero.
+                if 'occupants' in e or 'buildable_templates' in e or 'trainable_templates' in e:
+                    extra_index.append(index)
+                    extra_rows.append([False, False, min(len(e.get('buildable_templates', [])), 20)/20,
+                                       min(len(e.get('trainable_templates', [])), 20)/20,
+                                       0., 0., 0., 0., 0., 0, 0, 0., e.get('occupants', 0), 0])
+                continue
+            has_build, has_train = self._menu_flags(e['type'])
+            commands = e.get('commands', [])
+            kinds = [info.get(name, ('', ''))[0] for name in commands]
+            charging = e.get('command_cooldowns', [])
+            capacity = e.get('capacity', 0)
+            extra_index.append(index)
+            extra_rows.append([has_build, has_train,
+                               min(len(e.get('buildable_templates', [])), 20)/20,
+                               min(len(e.get('trainable_templates', [])), 20)/20,
+                               float('ability' in kinds), float('upgrade' in kinds), float('evacuate' in kinds),
+                               min(len(commands), 10)/10, float(bool(charging)),
+                               min(c['ready_percent'] for c in charging)/100 if charging else 0,
+                               float(bool(e.get('container_id', 0))), float(capacity > 0),
+                               e.get('occupants', 0)/max(capacity, 1), float(bool(e.get('enter_targets')))])
+            names = e.get('upgrades')
+            if names:
+                known = [upgrade_ids[name] for name in names if name in upgrade_ids]
                 entity_upgrades[index, :len(known[:ENTITY_UPGRADE_SLOTS])] = known[:ENTITY_UPGRADE_SLOTS]
-            queue = e.get('production_queue', []) if e['own'] else []
-            queued_types.append(catalog_types.get(queue[0].get('unit_type'), 0) if queue else 0)
+            queue = e.get('production_queue')
+            if queue:
+                queued_types[index] = catalog_types.get(queue[0].get('unit_type'), 0)
+        if real_count:
+            extra = np.zeros((real_count, EXTRA_ENTITY_FEATURES))
+            if extra_rows:
+                extra[extra_index] = extra_rows
+        else:
+            extra = np.asarray([[0]*EXTRA_ENTITY_FEATURES])
         if cells:  # entity counts per cell and category (exact in any order)
             np.add.at(map_inputs, (np.asarray(cells), np.asarray(channels)), 1)
-        # Public static supply positions are available before scouting. Never
-        # import supply quantities or enemy entities from the global simulator.
-        for source in terrain.get('supply_sources', []):
-            pos = (np.asarray(source['position'][:2])-low)/span
-            x, y = np.clip((pos*n).astype(int), 0, n-1)
-            map_inputs[y*n+x, 9] += 1
         map_inputs[:, 5:10] = np.log1p(map_inputs[:, 5:10]) / 4
-        # Completed player upgrades, owned promotions and currently purchasable promotions.
-        upgrades, sciences = self.config['upgrades'], self.config['sciences']
-        owned_upgrades, owned_sciences = set(p.get('upgrades', [])), set(p.get('sciences', []))
-        purchasable = set(p.get('purchasable_sciences', []))
-        player_flags = np.asarray([name in owned_upgrades for name in upgrades]
-                                  + [name in owned_sciences for name in sciences]
-                                  + [name in purchasable for name in sciences], dtype=float)
+        player_flags, purchasable_sciences = self._player_flags(p)
         encoded.update(map_inputs=map_inputs, map_coords=coords, cells=np.asarray(cells or [0]),
-                       extra_numeric=np.asarray(extra or [[0]*EXTRA_ENTITY_FEATURES]),
+                       extra_numeric=extra,
                        queued_types=np.asarray(queued_types or [0]),
                        entity_upgrades=entity_upgrades, player_flags=player_flags,
-                       purchasable_sciences=np.asarray([name in purchasable for name in sciences], dtype=bool),
+                       purchasable_sciences=purchasable_sciences,
                        player_identity=self.identity.player_identity(p['faction']))
         from unit_tasks import encode
         # Unit-task coordinates remain native world coordinates in the
         # transport snapshot; this helper rotates them exactly once.
-        encode(self.config, observation, encoded, rotated=rotated)
+        encode(self.config, observation, encoded, rotated=rotated, types=self.types)
         return encoded
 
 
@@ -255,6 +335,7 @@ class NeuralPolicy:
         self._masks = threading.local()
         self.command_index = {name: i for i, name in enumerate(config['commands'])}
         self.science_index = {name: i for i, name in enumerate(config['sciences'])}
+        self._choices, self._menus = set(config['templates']), {}
         self.parameters = {}
         self.mobile_types, self.structure_types = set(), set()
         for key, choices in config['menus'].items():
@@ -383,70 +464,115 @@ class NeuralPolicy:
         chunk of up to 128 rows is written), so recent observations' masks are
         kept per thread. Entries hold their observation, so ids are not reused.
         """
+        return self._cached_mask(encoded, kind)[0].copy()
+
+    def _cached_mask(self, encoded, kind):
+        """(mask, whether any actor passes): the caller must not modify the mask."""
         cache = getattr(self._masks, 'recent', None)
         if cache is None:
             cache = self._masks.recent = OrderedDict()
         entry = cache.get(id(encoded))
         if entry is None or entry[0] is not encoded:
-            entry = cache[id(encoded)] = (encoded, {})
+            rows = [(i, e) for i, e in enumerate(encoded['entities']) if e['own']]
+            entry = cache[id(encoded)] = (encoded, {}, rows)
             if len(cache) > MASK_CACHE_ROWS:
                 cache.popitem(last=False)
         masks = entry[1]
-        if kind not in masks:
-            masks[kind] = self._actor_mask(encoded, kind)
-        return masks[kind].copy()
+        cached = masks.get(kind)
+        if cached is None:
+            mask = self._actor_mask(encoded, kind, entry[2])
+            cached = masks[kind] = (mask, bool(mask.any()))
+        return cached
 
-    def _actor_mask(self, encoded, kind):
-        entities = encoded['entities']
+    def _production_menu(self, name, kind):
+        """The templates this type offers for `kind`, within the production scope."""
+        key = (name, kind)
+        menu = self._menus.get(key)
+        if menu is None:
+            menu = self.config['menus'].get(name + '|' + ('train' if kind == 'rally' else kind), [])
+            if kind in ('build', 'train') and self.config.get('production_scope') is not None:
+                choices = self._choices
+                menu = [template for template in menu if template in choices] if in_production_scope(self.config, name) else []
+            menu = self._menus[key] = frozenset(menu)
+        return menu
+
+    def _actor_mask(self, encoded, kind, rows):
+        """`rows` lists the owned entities: every other mask entry starts and stays False."""
         mask = encoded['own'].copy()
-        if kind == 'dock':
-            mask &= self.dock_matrix(encoded).any(axis=1)
+        if kind in PAIR_FIELDS:
+            mask[[i for i, e in rows if not self._has_pair(encoded, i, e, kind)]] = False
         elif kind == 'resume_construction':
-            mask &= self.resume_matrix(encoded).any(axis=1)
+            entities, ids = encoded['entities'], encoded['ids']
+            def resumes(i, actor):
+                if actor.get('health', 0) <= 0 or actor.get('construction_percent', -1) != -1:
+                    return False
+                for identity in actor['resume_targets']:
+                    j = ids.get(identity)
+                    if j is not None and i != j:
+                        target = entities[j]
+                        if target['own'] and target.get('health', 0) > 0 and target.get('construction_percent', -1) >= 0:
+                            return True
+                return False
+            mask[[i for i, e in rows if not resumes(i, e)]] = False
         elif kind in ('build', 'train', 'rally'):
-            scoped = kind in ('build', 'train') and self.config.get('production_scope') is not None
-            choices = set(self.config['templates'])
-            for i, e in enumerate(entities):
-                menu = self.config['menus'].get(e['type'] + '|' + ('train' if kind == 'rally' else kind), [])
-                if scoped:
-                    menu = [name for name in menu if name in choices] if in_production_scope(self.config, e['type']) else []
-                mask[i] = bool(e['own'] and menu and (kind == 'rally' or e.get('construction_percent') == -1))
-                if kind in ('build', 'train') and mask[i]:
-                    mask[i] = bool(set(menu) & set(e['buildable_templates' if kind == 'build' else 'trainable_templates']))
+            field = 'buildable_templates' if kind == 'build' else 'trainable_templates'
+            for i, e in rows:
+                menu = self._production_menu(e['type'], kind)
+                passes = bool(menu and (kind == 'rally' or e.get('construction_percent') == -1))
+                if kind != 'rally' and passes:
+                    passes = not menu.isdisjoint(e[field])
+                mask[i] = passes
         elif kind in ('move', 'attack_move', 'add_waypoint'):
-            mask &= np.asarray([e['type'] in self.mobile_types for e in entities] or [False])
+            mobile = self.mobile_types
+            mask[[i for i, e in rows if e['type'] not in mobile]] = False
         elif kind == 'sell':
-            mask &= np.asarray([e['type'] in self.structure_types for e in entities] or [False])
+            structure = self.structure_types
+            mask[[i for i, e in rows if e['type'] not in structure]] = False
         elif kind in COMMAND_KINDS:
-            mask &= np.asarray([bool(self._commands(e, kind)) for e in entities] or [False])
-        elif kind == 'enter':
-            mask &= self.enter_matrix(encoded).any(axis=1)
+            mask[[i for i, e in rows if not (e.get('commands') and self._commands(e, kind))]] = False
         elif kind == 'exit':
             observable = encoded['ids']
-            mask &= np.asarray([e['own'] and e.get('container_id', 0) in observable for e in entities] or [False])
+            mask[[i for i, e in rows if e.get('container_id', 0) not in observable]] = False
         elif kind == 'evacuate':
             info = self.config['command_info']
-            mask &= np.asarray([e['own'] and any(info.get(name, [''])[0] == 'evacuate' for name in e.get('commands', []))
-                                for e in entities] or [False])
+            mask[[i for i, e in rows if not any(info.get(name, [''])[0] == 'evacuate' for name in e.get('commands', ()))]] = False
         elif kind == 'science':
             mask[:] = False
         elif kind in GUARD_KINDS or kind == 'scatter':
             # Owner-only native flag: the group dispatch reaches every mobile AI.
-            mask &= np.asarray([e['own'] and e.get('can_guard', False) for e in entities] or [False])
-        elif kind in ('repair', 'get_repaired'):
-            mask &= self.pair_matrix(encoded, kind).any(axis=1)
+            mask[[i for i, e in rows if not e.get('can_guard', False)]] = False
         elif kind == 'cancel_production':
-            mask &= np.asarray([e['own'] and e.get('construction_percent', -1) == -1 and bool(e.get('production_queue'))
-                                for e in entities] or [False])
+            mask[[i for i, e in rows if not (e.get('construction_percent', -1) == -1 and e.get('production_queue'))]] = False
         elif kind == 'cancel_construction':
-            mask &= np.asarray([e['own'] and e['health'] > 0 and e.get('construction_percent', -1) >= 0
-                                for e in entities] or [False])
+            mask[[i for i, e in rows if not (e['health'] > 0 and e.get('construction_percent', -1) >= 0)]] = False
         if kind in ('attack', 'attack_move', 'force_attack', 'force_attack_ground'):
             # Owner-only engine flags: garrisons and disabled/deploying weapons need more than a type.
-            mask &= np.asarray([e['own'] and e['can_attack'] and (kind != 'attack_move' or e['can_attack_move'])
-                                and e['health'] > 0 and e.get('construction_percent', -1) == -1
-                                for e in entities] or [False])
+            moving = kind == 'attack_move'
+            mask[[i for i, e in rows if not (e['can_attack'] and (not moving or e['can_attack_move'])
+                                             and e['health'] > 0 and e.get('construction_percent', -1) == -1)]] = False
         return mask
+
+    def _has_pair(self, encoded, i, actor, kind):
+        """Whether this owned actor has a target in dock_matrix or pair_matrix."""
+        entities, ids = encoded['entities'], encoded['ids']
+        if kind == 'dock':
+            if actor['health'] <= 0 or actor.get('construction_percent', -1) != -1:
+                return False
+            for identity in actor['dock_targets']:
+                j = ids.get(identity)
+                if j is not None and j != i:
+                    e = entities[j]
+                    if ((e['own'] or e['visible']) and e.get('construction_percent', -1) == -1
+                            and not (e['max_health'] > 0 and e['health'] <= 0)):
+                        return True
+            return False
+        if actor['health'] <= 0:
+            return False
+        for identity in actor.get(PAIR_FIELDS[kind], ()):
+            j = ids.get(identity)
+            if j is not None and j != i and (entities[j]['own'] or entities[j]['visible']):
+                return True
+        return False
 
     def dock_matrix(self, encoded):
         """Owned actor/observable target pairs from the engine's own docking legality."""
@@ -569,7 +695,7 @@ class NeuralPolicy:
         return mask
 
     def verb_mask(self, encoded):
-        mask = np.asarray([True] + [bool(self.actor_mask(encoded, k).any()) for k in KINDS[1:]])
+        mask = np.asarray([True] + [self._cached_mask(encoded, k)[1] for k in KINDS[1:]])
         mask[KINDS.index('attack')] &= bool(encoded['visible_target'].any())
         mask[KINDS.index('science')] = bool(self.science_mask(encoded).any())
         # A forced attack needs some other observable object to aim at.
