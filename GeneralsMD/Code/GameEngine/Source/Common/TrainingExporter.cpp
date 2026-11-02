@@ -34,6 +34,7 @@
 #include "GameLogic/Module/ContainModule.h"
 #include "GameLogic/Module/SpawnBehavior.h"
 #include "GameLogic/Module/LifetimeUpdate.h"
+#include "GameLogic/Module/PhysicsUpdate.h"
 #include "GameNetwork/GeneralsOnline/json.hpp"
 #include "Common/ReplaySimulation.h"
 #include "GameClient/MapUtil.h"
@@ -78,7 +79,7 @@ template<class T> struct ExportAllocator {
 };
 using Json = nlohmann::basic_json<nlohmann::ordered_map, std::vector, std::string,
     bool, std::int64_t, std::uint64_t, double, ExportAllocator>;
-constexpr int gridSize = 32;
+constexpr int gridSize = 128;
 std::filesystem::path outputDirectory, temporaryPath, finalPath;
 std::ofstream output;
 bool binaryFormat = false;
@@ -696,13 +697,35 @@ const CommandSet *commandSetFor(Object *object, ObservationLookups &lookups)
     return set;
 }
 
+// World units per logic frame; objects without physics do not move this way.
+Coord3D objectVelocity(const Object *object)
+{
+    const PhysicsBehavior *physics = object->getPhysics();
+    return physics ? *physics->getVelocity() : Coord3D{0, 0, 0};
+}
+
+// Frames until the current weapon can fire again; 0 when ready or unarmed.
+unsigned weaponCooldownTicks(const Object *object, unsigned frame)
+{
+    const Weapon *weapon = object->getCurrentWeapon();
+    const UnsignedInt next = weapon ? weapon->getPossibleNextShotFrame() : 0;
+    return next > frame ? next-frame : 0;
+}
+
+// Frames since this object last took damage; -1 if it never has.
+int ticksSinceDamage(const BodyModuleInterface *body, unsigned frame)
+{
+    const UnsignedInt last = body ? body->getLastDamageTimestamp() : 0;
+    return last == 0 || last == 0xffffffff || last > frame ? -1 : static_cast<int>(frame-last);
+}
+
 Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookups, Json j = Json())
 {
     ExportTimer timer(EXPORT_ENTITY);
     Player *owner = object->getControllingPlayer();
     BodyModuleInterface *body = object->getBodyModule();
     ExportTimer base(EXPORT_ENTITY_BASE);
-    if (!j.is_object() || j.value("own", !own) != own) j = reservedObject(own ? 32 : 9);
+    if (!j.is_object() || j.value("own", !own) != own) j = reservedObject(own ? 38 : 13);
     j["id"] = static_cast<unsigned>(object->getID());
     setString(j["type"], object->getTemplate()->getName().str());
     j["owner"] = owner ? static_cast<int>(owner->getPlayerIndex()) : -1;
@@ -712,6 +735,11 @@ Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookup
     j["last_seen_frame"] = frame;
     j["visible"] = true;
     j["own"] = own;
+    const Coord3D velocity = objectVelocity(object);
+    j["velocity_x"] = velocity.x;
+    j["velocity_y"] = velocity.y;
+    j["facing"] = object->getOrientation();
+    j["veterancy"] = static_cast<int>(object->getVeterancyLevel());
     base.stop();
     if (own) {
         // No game tick or INI override occurs during this read-only snapshot.
@@ -723,6 +751,8 @@ Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookup
         // Current capabilities belong only to the owner. In particular,
         // garrisons and disabled/deploying weapons need more than a type name.
         j["has_weapon"] = static_cast<bool>(object->hasAnyWeapon());
+        j["weapon_cooldown_ticks"] = weaponCooldownTicks(object, frame);
+        j["ticks_since_damage"] = ticksSinceDamage(body, frame);
         j["can_attack"] = static_cast<bool>(TrainingCanAttack(object));
         j["has_atk_move_cmd"] = hasAttackMoveCommand(set);
         j["can_attack_move"] = j["can_attack"].get<bool>() && j["has_atk_move_cmd"].get<bool>()
@@ -1035,7 +1065,7 @@ Json observation(Player *player, unsigned frame, Json result = Json())
     result["own_entities"] = std::move(own);
     result["known_nonowned_entities"] = std::move(known);
     result["visibility_grid"] = std::move(visibility);
-    result["observation_policy_version"] = 7;
+    result["observation_policy_version"] = 8;
     result["last_submission"] = commandContext(submissions, player, frame, std::move(result["last_submission"]));
     result["last_validation"] = commandContext(validations, player, frame, std::move(result["last_validation"]));
     return result;
@@ -1331,7 +1361,7 @@ Json observationPolicy()
     for (int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
         if (ThePlayerList->getNthPlayer(i)->isPlayableSide()) playable.push_back(i);
     Json result = reservedObject(8);
-    result["version"] = 7;
+    result["version"] = 8;
     result["excluded_templates"] = std::move(excluded);
     result["visible_only_templates"] = std::move(visibleOnly);
     // These templates are omitted unless a playable side controls the object.

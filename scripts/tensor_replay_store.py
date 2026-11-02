@@ -11,12 +11,12 @@ import struct
 
 import numpy as np
 
-from prepared_io import _dtype, _json_bytes, STATIC_MAP_COLUMNS
+from prepared_io import COMMON_FIELDS, _dtype, _json_bytes
 
 VERSION = 1
 ARRAY_FIELDS = ('numeric', 'extra_numeric', 'types', 'queued_types',
-                'cells', 'own', 'map_inputs', 'scalars', 'player_identity',
-                'map_coords', 'low', 'span', 'build_mask', 'build_signature', 'build_features',
+                'cells', 'own', 'map_visibility', 'scalars', 'player_identity',
+                'map_static', 'low', 'span', 'build_mask', 'build_signature', 'build_features',
                 'task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features',
                 'task_commands', 'task_command_templates', 'task_command_template_present',
                 'entity_upgrades', 'player_flags', 'purchasable_sciences')
@@ -191,16 +191,9 @@ class TensorRows(Sequence):
                     variants[name] = values[0]
             encoded.update({name[2:]: value for name, value in variants.items() if name.startswith('e/')})
             encoded.update(meta['encoded'])
-            for name in ('low', 'span', 'map_coords'):
+            for name in COMMON_FIELDS:
                 if name not in encoded and name in self.common:
                     encoded[name] = self.common[name]
-            if meta.get('shared_map'):
-                dynamic = self.columns['e/map_dynamic'].at(item)
-                maps = np.empty(self.common['map_shape'], dtype=dynamic.dtype)
-                maps[:, STATIC_MAP_COLUMNS] = self.common['map_static']
-                other = [i for i in range(maps.shape[1]) if i not in STATIC_MAP_COLUMNS]
-                maps[:, other] = dynamic
-                encoded['map_inputs'] = np.frombuffer(maps.tobytes(), dtype=maps.dtype).reshape(maps.shape)
             target = meta['row']['target']
             mask = {'key': self.key, 'teacher': target}
             mask.update({name[2:]: value for name, value in variants.items() if name.startswith('l/')})
@@ -231,18 +224,11 @@ def project(rows, common, policy, key, *, float_dtype=None):
             raise ValueError('Column projection legality differs from teacher')
         meta = {'row': {name: row[name] for name in ('target', 'hold_ticks', 'scope') if name in row},
                 'encoded': {'entity_count': len(encoded['entities']), 'rotated': bool(encoded['rotated'])}}
-        maps = encoded['map_inputs']
-        shared_map = ('map_static' in common and list(maps.shape) == common['map_shape']
-                      and maps.dtype == common['map_static'].dtype
-                      and maps[:, STATIC_MAP_COLUMNS].tobytes() == common['map_static'].tobytes())
-        meta['shared_map'] = shared_map
         for name in ARRAY_FIELDS:
             value = encoded.get(name)
-            if name in ('low', 'span', 'map_coords') and value is not None and name in common:
+            if name in COMMON_FIELDS and value is not None and name in common:
                 if value.dtype == common[name].dtype and value.shape == common[name].shape and value.tobytes() == common[name].tobytes():
                     continue
-            if name == 'map_inputs' and shared_map:
-                name, value = 'map_dynamic', maps[:, [i for i in range(maps.shape[1]) if i not in STATIC_MAP_COLUMNS]]
             if value is not None:
                 values.setdefault('e/'+name, [None]*len(rows))[len(metadata)] = value
         for name in MASK_FIELDS+LIST_FIELDS:

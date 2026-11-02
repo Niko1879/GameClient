@@ -1,8 +1,9 @@
 """Memory-free event policy: encoder, factual action masks, teacher targets and NumPy inference.
 
-Relational entities, spatial pointers and autoregressive argument heads, inspired by
-AlphaStar's modalities. The PyTorch learner (torch_policy_v3.py) trains these same
-parameters; this module is the deployed inference path and the reference for tests.
+Spatial processing follows AlphaStar (scripts/micro_feature_review.md): binary positions, a
+3-layer entity transformer, entities scattered onto a 128x128 map, a convolutional encoder with
+skips and a FiLM location head upsampled to 256x256. The PyTorch learner (torch_policy_v3.py)
+trains these same parameters; this module is the deployed inference path and the test reference.
 """
 from __future__ import annotations
 
@@ -18,10 +19,10 @@ import threading
 import numpy as np
 
 from generals_identity import IdentityHierarchy, in_production_scope, validate_production_scope
-from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d_same, scatter_mean
+from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum
 
 ARCHITECTURE = 'generals-relational-v4-event'
-OBSERVATION_VERSION = 7
+OBSERVATION_VERSION = 8
 KINDS = ('wait', 'move', 'attack_move', 'attack', 'stop', 'sell', 'build', 'train', 'rally', 'dock',
          'resume_construction', 'upgrade', 'science', 'ability', 'enter', 'exit', 'evacuate',
          'guard', 'guard_air', 'cancel_production', 'cancel_construction', 'scatter', 'add_waypoint',
@@ -40,12 +41,38 @@ QUEUE_SLOTS = 9
 PAIR_FIELDS = {'dock': 'dock_targets', 'enter': 'enter_targets', 'repair': 'repair_targets',
                'get_repaired': 'repair_depots'}
 COMMAND_KINDS = ('upgrade', 'ability')
-ENTITY_FEATURES = 14
+ENTITY_FEATURES = 21
+# Divides world units per second, so a fast ground unit is near 1.
+VELOCITY_SCALE = 100
+# Numeric columns read back when building model inputs.
+OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN, COOLDOWN_COLUMN, UNDER_ATTACK_COLUMN = 5, 6, 7, 14, 15
 EXTRA_ENTITY_FEATURES = 14
 ENTITY_UPGRADE_SLOTS = 4
 SCALAR_FEATURES = 16
-MAP_CHANNELS = 12
-RELATIVE_FEATURES = 5
+# since_decision and since_command stay in stored scalars but never reach the model:
+# quiet rows are kept at most 120 ticks apart, so these clocks give away wait vs command.
+HIDDEN_SCALARS = (9, 14)
+# Height, cliff, supply, x, y; three visibility states; own, seen enemy, remembered enemy and neutral counts; alert.
+STATIC_MAP_CHANNELS = 5
+MAP_CHANNELS = 13
+POSITION_BITS = 16
+# Attack cooldown as AlphaStar encodes it: one-hot in 45 ms game steps, capped at 31.
+COOLDOWN_BINS = 32
+COOLDOWN_BIN_SECONDS = .045
+MAX_COOLDOWN_SECONDS = 10
+DERIVED_ENTITY_FEATURES = POSITION_BITS+COOLDOWN_BINS
+# A unit counts as under attack on the alert map for this long after taking damage.
+UNDER_ATTACK_TICKS = 120
+ATTENTION_LAYERS = 3
+# The scatter image is this many times map_side per axis, and is downsampled three times.
+SCATTER_SCALE = 8
+# Up to this many entities on one scatter pixel add fully; more share that total.
+SCATTER_VOLUME = 4
+MAP_RESIDUAL_BLOCKS = 4
+LOCATION_BLOCKS = 4
+ACTION_RESIDUAL_BLOCKS = 16
+# Live sampling temperature for every argument except the delay.
+SAMPLING_TEMPERATURE = .8
 
 
 def selection_limit(config, kind):
@@ -75,6 +102,86 @@ def entity_key(entity):
             tuple(entity['position']), entity['last_seen_frame'])
 
 
+def head_sizes(config):
+    """(autoregressive, head and pointer key widths): AlphaStar's 1024, 256 and 32, capped for small test models."""
+    return min(config['hidden'], 1024), min(config['hidden'], 256), min(config['entity_hidden'], 32)
+
+
+def visible_scalars(scalars):
+    """Stored scalars as the model sees them, for one row or a batch."""
+    visible = np.array(scalars)
+    visible[..., HIDDEN_SCALARS] = 0
+    return visible
+
+
+def visible_task_commands(commands):
+    """Stored command receipts as the model sees them: their age is the same clock as since_command."""
+    from unit_tasks import COMMANDS
+    # unit_tasks.encode writes [present, *command one-hot, log age, ...]; that file is a hashed feature source.
+    visible = np.array(commands)
+    visible[..., 1+len(COMMANDS)] = 0
+    return visible
+
+
+def position_bits(xy):
+    """(..., 2) normalized positions as 8 bits per axis."""
+    cells = np.clip((np.asarray(xy, dtype=np.float64)*256).astype(np.int64), 0, 255).astype(np.uint8)
+    return np.unpackbits(cells[..., None], axis=-1).reshape(*cells.shape[:-1], POSITION_BITS)
+
+
+def derived_inputs(numeric):
+    """Model-only entity inputs from stored columns: position bits and the cooldown one-hot."""
+    numeric = np.asarray(numeric, dtype=np.float64)
+    bins = np.minimum((numeric[..., COOLDOWN_COLUMN]/COOLDOWN_BIN_SECONDS+1e-6).astype(np.int64), COOLDOWN_BINS-1)
+    return np.concatenate([position_bits(numeric[..., :2]), np.eye(COOLDOWN_BINS)[bins]], axis=-1)
+
+
+def count_channels(numeric, count):
+    """The count plane of each real entity (own, seen enemy, remembered enemy, neutral)."""
+    own, visible, enemy = (numeric[:count, column] > .5 for column in (OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN))
+    return np.where(own, 0, np.where(~enemy, 3, np.where(visible, 1, 2)))
+
+
+def map_planes(encoded):
+    """(MAP_CHANNELS, side, side): terrain, visibility, entity counts and the under-attack alert."""
+    numeric, pixels = np.asarray(encoded['numeric']), np.asarray(encoded['cells'])
+    count = len(encoded['entities']) if 'entities' in encoded else encoded['entity_count']
+    visibility = np.asarray(encoded['map_visibility'])
+    side = int(math.isqrt(visibility.size))
+    planes = np.zeros((MAP_CHANNELS, side*side))
+    planes[:STATIC_MAP_CHANNELS] = np.asarray(encoded['map_static']).T
+    for category in range(3):
+        planes[STATIC_MAP_CHANNELS+category] = visibility == category
+    if count:
+        counts = np.zeros((4, side*side))
+        np.add.at(counts, (count_channels(numeric, count), pixels[:count]), 1)
+        planes[STATIC_MAP_CHANNELS+3:STATIC_MAP_CHANNELS+7] = np.log1p(counts)/4
+        attacked = pixels[:count][numeric[:count, UNDER_ATTACK_COLUMN] > .5]
+        planes[STATIC_MAP_CHANNELS+7, attacked] = 1
+    return planes.reshape(MAP_CHANNELS, side, side)
+
+
+def scatter_weights(pixels, real, side):
+    """Each real entity's share of its pixel: 1 up to SCATTER_VOLUME entities there."""
+    counts = np.bincount(np.asarray(pixels)[real], minlength=side*side)
+    return SCATTER_VOLUME/np.maximum(counts[pixels], SCATTER_VOLUME)*real
+
+
+def location_order(config):
+    """Flat 256x256 indices laid out as (map cell, offset within it)."""
+    n, bins = config['map_side'], config['position_bins']
+    fine = bins//n
+    cell, offset = np.meshgrid(np.arange(n*n), np.arange(fine*fine), indexing='ij')
+    return ((cell//n)*fine+offset//fine)*bins+(cell%n)*fine+offset%fine
+
+
+def location_stages(config):
+    """Output channels of each 2x upsampling from map_side to position_bins."""
+    fine, channels = config['position_bins']//config['map_side'], config['map_hidden']
+    stages = int(math.log2(fine))
+    return [max(1, channels >> (i+1)) for i in range(stages-1)]+[1]
+
+
 def initial_home(observation):
     entities = observation['own_entities']
     return np.mean([e['position'][:2] for e in entities], axis=0).tolist() if entities else None
@@ -97,8 +204,8 @@ class Encoder:
     def _bounds(self, terrain):
         extent = self._extent
         if extent is None or extent[0] is not terrain:
-            if terrain['grid_size'] != 32:
-                raise ValueError('Observation schema expects a 32x32 map')
+            if terrain['grid_size'] != self.config['map_side']*SCATTER_SCALE:
+                raise ValueError('Observation grid differs from the policy map')
             low, high = np.asarray(terrain['extent_low'][:2]), np.asarray(terrain['extent_high'][:2])
             span = high - low
             if np.any(span <= 0):
@@ -110,30 +217,28 @@ class Encoder:
         """Map columns that do not change during a game, in one orientation."""
         entry = self._static.get(rotated)
         if entry is not None and entry[0] is terrain:
-            return entry[1], entry[2]
-        n, scale = self.config['map_side'], 32 // self.config['map_side']
-        height, cliff = np.asarray(terrain['height']), np.asarray(terrain['cliff'])
+            return entry[1]
+        side = terrain['grid_size']
+        height, cliff = np.asarray(terrain['height'], dtype=float), np.asarray(terrain['cliff'], dtype=float)
         sources = terrain.get('supply_sources', [])
         if rotated:
-            height, cliff = (grid.reshape(32, 32)[::-1, ::-1].reshape(-1) for grid in (height, cliff))
+            height, cliff = (grid.reshape(side, side)[::-1, ::-1].reshape(-1) for grid in (height, cliff))
             sources = [[*(low+high-np.asarray(s['position'][:2])).tolist(), *s['position'][2:]] for s in sources]
         else:
             sources = [s['position'] for s in sources]
-        def pool(values):
-            return values.reshape(n, scale, n, scale).mean(axis=(1, 3)).reshape(-1)
-        coords = (np.stack(np.meshgrid(np.arange(n), np.arange(n)), axis=-1).reshape(-1, 2) + .5) / n
-        base = np.zeros((n*n, MAP_CHANNELS))
-        base[:, 0] = pool(height) / 512
-        base[:, 1] = pool(cliff)
-        base[:, 10:12] = coords
+        base = np.zeros((side*side, STATIC_MAP_CHANNELS))
+        base[:, 0] = height / 512
+        base[:, 1] = cliff
         # Public static supply positions are available before scouting. Never
         # import supply quantities or enemy entities from the global simulator.
         for source in sources:
             pos = (np.asarray(source[:2])-low)/span
-            x, y = np.clip((pos*n).astype(int), 0, n-1)
-            base[y*n+x, 9] += 1
-        self._static[rotated] = (terrain, base, coords)
-        return base, coords
+            x, y = np.clip((pos*side).astype(int), 0, side-1)
+            base[y*side+x, 2] += 1
+        base[:, 2] = np.log1p(base[:, 2]) / 4
+        base[:, 3:5] = (np.stack(np.meshgrid(np.arange(side), np.arange(side)), axis=-1).reshape(-1, 2) + .5) / side
+        self._static[rotated] = (terrain, base)
+        return base
 
     def _player_flags(self, player):
         """Completed player upgrades, owned promotions and currently purchasable promotions."""
@@ -191,7 +296,7 @@ class Encoder:
             home = (np.asarray(home_position)-low)/span-.5 if home_position is not None else np.zeros(2)
             rotated = bool(home[int(np.argmax(abs(home)))] > 0)
             self._home = (home_position, low, rotated)
-        n = self.config['map_side']
+        side = terrain['grid_size']
         if rotated:
             def rotate(rows):
                 # The mirrored position for every row at once: the same float64 operations.
@@ -202,7 +307,7 @@ class Encoder:
             observation = {**observation,
                            'own_entities': rotate(observation['own_entities']),
                            'known_nonowned_entities': rotate(observation['known_nonowned_entities']),
-                           'visibility_grid': np.asarray(observation['visibility_grid']).reshape(32, 32)[::-1, ::-1].reshape(-1)}
+                           'visibility_grid': np.asarray(observation['visibility_grid']).reshape(side, side)[::-1, ::-1].reshape(-1)}
         entities = sorted(observation['own_entities'] + observation['known_nonowned_entities'], key=entity_key)
         real_count = len(entities)
         types = [self.types.get(entity['type'], 0) for entity in entities]
@@ -217,6 +322,8 @@ class Encoder:
             health, maximum = column('health'), column('max_health')
             construction = column('construction_percent', -1)
             queues = [e.get('production_queue', []) for e in entities]
+            since_damage = column('ticks_since_damage', -1)
+            mirror, facing = -1. if rotated else 1., column('facing', 0)
             numeric = np.column_stack([
                 xy[:, 0], xy[:, 1], position[:, 2] / 512,
                 health / np.maximum(maximum, 1),
@@ -228,7 +335,16 @@ class Encoder:
                 np.maximum(0, construction) / 100,
                 np.asarray([min(len(q), 20) / 20 for q in queues], dtype=float),
                 np.asarray([np.mean([item['progress'] for item in q]) / 100 if q else 0 for q in queues], dtype=float),
-                np.asarray([min(sum(item['remaining_quantity'] for item in q), 20) / 20 for q in queues], dtype=float)])
+                np.asarray([min(sum(item['remaining_quantity'] for item in q), 20) / 20 for q in queues], dtype=float),
+                # Exported for owned entities only. Native frames become seconds and canonical ticks.
+                # A weapon that cannot fire again reports a huge next-shot frame.
+                np.minimum(column('weapon_cooldown_ticks', 0) / source_ticks_per_second, MAX_COOLDOWN_SECONDS),
+                np.logical_and(since_damage >= 0, since_damage*60/source_ticks_per_second <= UNDER_ATTACK_TICKS).astype(float),
+                # Mirrored maps reverse directions. A hidden sighting keeps its last facing and rank, but its motion is unknown.
+                mirror*column('velocity_x', 0)*source_ticks_per_second/VELOCITY_SCALE*np.asarray(visibles, dtype=float),
+                mirror*column('velocity_y', 0)*source_ticks_per_second/VELOCITY_SCALE*np.asarray(visibles, dtype=float),
+                mirror*np.sin(facing), mirror*np.cos(facing),
+                column('veterancy', 0) / 3])
         else:
             # A zero row keeps pooling and pointer shapes defined after defeat.
             numeric = np.asarray([[0] * ENTITY_FEATURES])
@@ -255,20 +371,13 @@ class Encoder:
             encoded['placement_source_rate'] = source_ticks_per_second
         # Map cells retain categorical shroud information. The native enum is
         # 0=clear, 1=fogged, 2=unseen, not a continuous visibility score.
-        visibility = np.asarray(observation['visibility_grid']).reshape(32, 32)
-        scale = 32 // n
-        base, coords = self._static_map(terrain, low, high, span, rotated)
-        map_inputs = base.copy()
-        for category in range(3):
-            map_inputs[:, 2 + category] = np.add.reduce((visibility == category).reshape(n, scale, n, scale),
-                                                        axis=(1, 3), dtype=float).reshape(-1) / (scale*scale)
+        visibility = np.asarray(observation['visibility_grid'], dtype=np.uint8)
+        base = self._static_map(terrain, low, high, span, rotated)
         upgrade_ids, catalog_types = self.upgrade_ids, self.types
         entity_upgrades = np.zeros((max(real_count, 1), ENTITY_UPGRADE_SLOTS), dtype=int)
         info = self.config['command_info']
-        grid_xy = np.clip((numeric[:real_count, :2] * n).astype(int), 0, n-1)
-        cells = (grid_xy[:, 1]*n+grid_xy[:, 0]).tolist()
-        channels = [5 if own else (6 if visible and e['owner'] >= 2 else 7 if e['owner'] >= 2 else 8)
-                    for e, own, visible in zip(entities, owns, visibles)]
+        grid_xy = np.clip((numeric[:real_count, :2] * side).astype(int), 0, side-1)
+        cells = (grid_xy[:, 1]*side+grid_xy[:, 0]).tolist()
         queued_types = [0]*real_count
         extra_rows, extra_index = [], []
         for index, e in enumerate(entities):
@@ -307,11 +416,8 @@ class Encoder:
                 extra[extra_index] = extra_rows
         else:
             extra = np.asarray([[0]*EXTRA_ENTITY_FEATURES])
-        if cells:  # entity counts per cell and category (exact in any order)
-            np.add.at(map_inputs, (np.asarray(cells), np.asarray(channels)), 1)
-        map_inputs[:, 5:10] = np.log1p(map_inputs[:, 5:10]) / 4
         player_flags, purchasable_sciences = self._player_flags(p)
-        encoded.update(map_inputs=map_inputs, map_coords=coords, cells=np.asarray(cells or [0]),
+        encoded.update(map_visibility=visibility, map_static=base, cells=np.asarray(cells or [0]),
                        extra_numeric=extra,
                        queued_types=np.asarray(queued_types or [0]),
                        entity_upgrades=entity_upgrades, player_flags=player_flags,
@@ -348,7 +454,8 @@ class NeuralPolicy:
                 self.structure_types.update(choices)
         self.structure_types -= self.mobile_types
         n, bins = config['map_side'], config['position_bins']
-        if n <= 0 or 32 % n or bins % n or config['entity_hidden'] % config['attention_heads']:
+        if (n <= 0 or 32 % n or bins % n or bins <= n or (bins//n) & (bins//n-1)
+                or config['entity_hidden'] % config['attention_heads']):
             raise ValueError('Invalid map/attention dimensions')
         if config['delay_ticks'] != list(range(1, config['event_max_delay']+1)):
             raise ValueError('Unsupported delay vocabulary')
@@ -365,6 +472,10 @@ class NeuralPolicy:
             self.parameters[name] = Tensor((generator or rng).normal(0, gain/math.sqrt(shape[0]), shape), requires_grad=True)
         def b(name, count, value=0):
             self.parameters[name] = Tensor(np.full(count, value), requires_grad=True)
+        def c(name, outputs, inputs, size, gain=math.sqrt(2)):
+            self.parameters[name] = Tensor(rng.normal(0, gain/math.sqrt(inputs*size*size), (outputs, inputs, size, size)),
+                                           requires_grad=True)
+            b(name+'_b', (outputs, 1, 1))
         vocab = self.encoder.identity.config
         # Embedding scale depends on vector width, not vocabulary size.
         self.parameters['family_embedding'] = Tensor(
@@ -374,26 +485,43 @@ class NeuralPolicy:
         self.parameters['base_faction_embedding'].data[0] = 0
         b('general_embedding', (len(vocab['generals']), e))
         b('variant_embedding', (len(vocab['objects']), e))
-        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+3*e, d)); b('entity_b', d)
+        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+3*e, d)); b('entity_b', d)
         # Row 0 is the empty upgrade slot; it is masked out of every sum.
         w('upgrade_embedding', (len(config['upgrades'])+1, e), .5)
         self.parameters['upgrade_embedding'].data[0] = 0
         w('player_flags_w', (len(config['upgrades'])+2*len(config['sciences']), s), .2)
+        ar, f, key = head_sizes(config)
+        kinds, delays = len(KINDS), len(config['delay_ticks'])
         w('command_embedding', (len(config['commands']), e), 1)
-        w('command_query_w', (h, e), .1); b('command_b', len(config['commands']))
-        w('command_context_w', (e, h), .2)
+        w('command_query_w', (ar, e), .1); b('command_b', len(config['commands']))
+        w('command_context_w', (e, ar), .2)
         w('science_embedding', (len(config['sciences']), e), 1)
-        w('science_query_w', (h, e), .1); b('science_b', len(config['sciences']))
-        w('science_context_w', (e, h), .2)
-        w('slot_w', (h, QUEUE_SLOTS), .1); b('slot_b', QUEUE_SLOTS)
-        for name in ('attn_q', 'attn_k', 'attn_v', 'attn_out', 'entity_ff'):
-            w(name, (d, d), .5)
-        w('relation_bias', (4, config['attention_heads']), .1)
-        w('scatter_w', (d, 8), .5)
-        w('map_input_w', (MAP_CHANNELS+8, m)); b('map_input_b', m)
-        w('map_conv', (9*m, m), .5); b('map_conv_b', m)
+        w('science_query_w', (ar, e), .1); b('science_b', len(config['sciences']))
+        w('science_context_w', (e, ar), .2)
+        w('slot_w', (ar, QUEUE_SLOTS), .1); b('slot_b', QUEUE_SLOTS)
+        for layer in range(ATTENTION_LAYERS):
+            for name in ('attn_q', 'attn_k', 'attn_v', 'attn_out'):
+                w(f'{name}{layer}', (d, d), .5)
+            w(f'entity_ff_in{layer}', (d, 4*d), .5)
+            w(f'entity_ff_out{layer}', (4*d, d), .5)
+        scatter = max(1, m//4)
+        w('scatter_w', (d, scatter), .5)
+        c('map_project', scatter, MAP_CHANNELS+scatter, 1)
+        c('map_down0', max(1, m//2), scatter, 4)
+        c('map_down1', m, max(1, m//2), 4)
+        c('map_down2', m, m, 4)
+        for block in range(MAP_RESIDUAL_BLOCKS):
+            c(f'map_res{block}_a', m, m, 3)
+            c(f'map_res{block}_b', m, m, 3)
+        w('map_fc', (n*n*m, d)); b('map_fc_b', d)
         w('scalar_w', (SCALAR_FEATURES, s)); b('scalar_b', s)
         w('player_identity_w', (e, s), .5, generator=identity_rng)
+        w('enemy_identity_w', (e, s), .5, generator=identity_rng)
+        w('unit_counts_w', (len(config['types']), s), .2)
+        w('available_actions_w', (kinds, s), .2)
+        # scalar_context: what AlphaStar gates its action head and autoregressive embedding with.
+        w('gate_identity_w', (e, s), .5, generator=identity_rng); w('gate_enemy_w', (e, s), .5, generator=identity_rng)
+        w('gate_actions_w', (kinds, s), .5); b('gate_b', s)
         from unit_tasks import NUMERIC, RELATIONS, RELATION_FEATURES, COMMAND_FEATURES, VALIDATION_COLUMNS
         w('task_w', (NUMERIC, d), .5)
         self.parameters['task_w'].data[list(VALIDATION_COLUMNS)] = 0
@@ -408,29 +536,59 @@ class NeuralPolicy:
         b('task_validation_template_w', (e, s))
         if config['placement_mode'] == 'full_mask':
             w('build_map_w', (1, m), .2)
-            w('build_angle_embedding', (16, h), .2)
-        w('event_input_w', (s+4*d+m, h), .7); b('event_input_b', h)
+            w('build_angle_embedding', (16, ar), .2)
+        w('event_input_w', (s+5*d, h), .7); b('event_input_b', h)
         w('event_hidden_w', (h, h), .7); b('event_hidden_b', h)
         w('pool_query', (s, d), .2)
-        w('map_pool_query', (s, m), .2)
-        w('verb_w', (h, len(KINDS)), .1); b('verb_b', len(KINDS))
-        w('verb_embedding', (len(KINDS), h), .2)
-        w('context_w', (h, h), .5); w('selected_w', (d, h), .5)
-        w('actor_pointer_w', (h, d), .2); w('target_pointer_w', (h, d), .2)
-        w('stop_w', (h, 1), .1); b('stop_b', 1, 1)
+        # Action type: residual blocks, then a GLU gated by scalar_context.
+        w('verb_in_w', (h, f)); b('verb_in_b', f)
+        for block in range(ACTION_RESIDUAL_BLOCKS):
+            w(f'verb_res{block}_a', (f, f), .5); b(f'verb_res{block}_a_b', f)
+            w(f'verb_res{block}_b', (f, f), .5); b(f'verb_res{block}_b_b', f)
+        w('verb_w', (f, kinds), .1); w('verb_gate_w', (s, kinds), .1); b('verb_gate_b', kinds, 2); b('verb_b', kinds)
+        # Autoregressive embedding from the action type and the core, each gated by scalar_context.
+        w('ar_verb_w', (kinds, f)); b('ar_verb_b', f)
+        w('ar_verb_out_w', (f, ar), .5); w('ar_verb_gate_w', (s, ar), .1); b('ar_verb_gate_b', ar, 2)
+        w('ar_core_w', (h, ar), .5); w('ar_core_gate_w', (s, ar), .1); b('ar_core_gate_b', ar, 2)
+        # Delay: decided after the action type, then visible to every later argument.
+        w('delay_in_w', (ar, f)); b('delay_in_b', f)
+        w('delay_hidden_w', (f, f)); b('delay_hidden_b', f)
+        w('delay_w', (f, delays), .1); b('delay_b', delays)
+        w('delay_embed_in_w', (delays, f)); b('delay_embed_in_b', f)
+        w('delay_embed_hidden_w', (f, f)); b('delay_embed_hidden_b', f)
+        w('delay_embed_out_w', (f, ar), .2); b('delay_embed_out_b', ar)
+        # Selected units: which entity types can act, a pointer key per entity and a small LSTM query.
+        w('func_w', (len(config['types']), f), .2); b('func_b', f)
+        w('entity_key_w', (d, key), .5)
+        self.parameters['unit_end_key'] = Tensor(rng.normal(0, 1/math.sqrt(key), key), requires_grad=True)
+        w('unit_in_w', (ar, f), .5); b('unit_in_b', f)
+        w('unit_query_w', (f, key), .5); b('unit_query_b', key)
+        w('unit_lstm_input_w', (key, 4*key), .5); w('unit_lstm_hidden_w', (key, 4*key), .5); b('unit_lstm_b', 4*key)
+        w('unit_ar_w', (key, ar), .5); b('unit_ar_b', ar)
+        # Target unit: the same keys, queried from the autoregressive embedding and func_embed.
+        w('target_in_w', (ar, f), .5); b('target_in_b', f)
+        w('target_pointer_w', (f, key), .5); b('target_pointer_b', key)
         b('template_b', len(config['templates']))
         # The same object representation informs sightings, queues, choice
         # logits and placement context. Exact template IDs still dispatch.
-        w('template_query_w', (h, e), .1, generator=identity_rng)
-        w('template_context_w', (e, h), .2, generator=identity_rng)
-        w('spatial_query', (h, m), .2)
-        # Relative cell positions to the selected units are learned features,
-        # not a rule selecting attack/defend/harass sites.
-        w('relative_w', (RELATIVE_FEATURES, m), .5)
-        w('cell_context_w', (m, h), .5)
-        w('offset_w', (h, (bins//n)**2), .1); b('offset_b', (bins//n)**2)
-        w('angle_w', (h, config['angle_bins']), .1); b('angle_b', config['angle_bins'])
-        w('delay_w', (h, len(config['delay_ticks'])), .1); b('delay_b', len(config['delay_ticks']))
+        w('template_query_w', (ar, e), .1, generator=identity_rng)
+        w('template_context_w', (e, ar), .2, generator=identity_rng)
+        w('location_context_w', (ar, 4*n*n), .5)
+        c('location_input', m, m+4, 1)
+        w('location_film_w', (ar, 2*LOCATION_BLOCKS*m), .1); b('location_film_b', 2*LOCATION_BLOCKS*m)
+        for block in range(LOCATION_BLOCKS):
+            c(f'location_block{block}_a', m, m, 1)
+            c(f'location_block{block}_b', m, m, 3)
+        channels = m
+        stages = location_stages(config)
+        for stage, outputs in enumerate(stages):
+            # Transposed kernels are (in, out, K, K); the final logits start small.
+            self.parameters[f'location_up{stage}'] = Tensor(rng.normal(
+                0, (.1 if stage == len(stages)-1 else math.sqrt(2))/math.sqrt(channels*16), (channels, outputs, 4, 4)), requires_grad=True)
+            b(f'location_up{stage}_b', (outputs, 1, 1))
+            channels = outputs
+        w('cell_context_w', (m, ar), .5)
+        w('angle_w', (ar, config['angle_bins']), .1); b('angle_b', config['angle_bins'])
         w('value_hidden_w', (h, s), .5); b('value_hidden_b', s)
         w('value_w', (s, 1), .1); b('value_b', 1)
 
@@ -774,15 +932,58 @@ class NeuralPolicy:
                 raise Unrepresentable('Quantized build placement outside observed legality mask')
         return target
 
-    def _spatial_features(self, encoded, selected):
-        xy = encoded['numeric'][selected, :2].mean(axis=0)
-        delta = encoded['map_coords']-xy
-        return np.column_stack([delta, (delta*delta).sum(axis=1),
-                                np.full(len(delta), xy[0]), np.full(len(delta), xy[1])])
+    def _conv(self, values, name, stride=1, padding=0):
+        return conv2d(values, self.parameters[name], stride, padding)+self.parameters[name+'_b']
+
+    def _encode_map(self, encoded, entity):
+        """(skips: (5, m, n, n), embedding) from map inputs and entities scattered onto the image."""
+        p, config = self.parameters, self.config
+        n, side = config['map_side'], config['map_side']*SCATTER_SCALE
+        real = np.zeros(len(entity.data), dtype=bool)
+        real[:len(encoded['entities'])] = True
+        pixels = np.asarray(encoded['cells'])
+        weights = scatter_weights(pixels, real, side)
+        image = scatter_sum((entity @ p['scatter_w']).relu()*Tensor(weights[:, None]), pixels, side)
+        x = self._conv(concatenate([Tensor(map_planes(encoded)), image]), 'map_project').relu()
+        for stage in range(3):
+            x = self._conv(x, f'map_down{stage}', 2, 1).relu()
+        skips = [x]
+        for block in range(MAP_RESIDUAL_BLOCKS):
+            residual = x
+            x = self._conv(x.relu(), f'map_res{block}_a', padding=1)
+            x = self._conv(x.relu(), f'map_res{block}_b', padding=1)+residual
+            skips.append(x)
+        embedded = (x.relu().reshape((-1,)) @ p['map_fc']+p['map_fc_b']).relu()
+        return concatenate(skips).reshape((len(skips), config['map_hidden'], n, n)), embedded
+
+    def _location(self, spatial, context, build_features=None):
+        """(cell features (m, n, n), logits (n*n, offsets)) for one position argument."""
+        p, config = self.parameters, self.config
+        n, m = config['map_side'], config['map_hidden']
+        x = concatenate([spatial[MAP_RESIDUAL_BLOCKS], (context @ p['location_context_w']).reshape((4, n, n))]).relu()
+        x = self._conv(x, 'location_input').relu()
+        film = context @ p['location_film_w']+p['location_film_b']
+        for block in range(LOCATION_BLOCKS):
+            residual = self._conv(x, f'location_block{block}_a').relu()
+            y = self._conv(residual, f'location_block{block}_b', padding=1)
+            gamma = film[2*block*m:(2*block+1)*m].reshape((m, 1, 1))+1
+            beta = film[(2*block+1)*m:(2*block+2)*m].reshape((m, 1, 1))
+            x = ((y*gamma+beta).relu()+residual+spatial[MAP_RESIDUAL_BLOCKS-1-block]).relu()
+        if build_features is not None:
+            x = x+(Tensor(build_features) @ p['build_map_w']).transpose().reshape((m, n, n))
+        cells, y = x, x
+        stages = location_stages(config)
+        for stage in range(len(stages)):
+            y = conv_transpose2d(y, p[f'location_up{stage}'], 2, 1)+p[f'location_up{stage}_b']
+            if stage < len(stages)-1:
+                y = y.relu()
+        fine = config['position_bins']//n
+        return cells, y.reshape((-1,))[location_order(config)].reshape((n*n, fine*fine))
 
     def _encode_modalities(self, encoded):
         p, d, e = self.parameters, self.config['entity_hidden'], self.config['embedding']
-        features = np.concatenate([encoded['numeric'], encoded['extra_numeric']], axis=1)
+        features = np.concatenate([encoded['numeric'], encoded['extra_numeric'],
+                                   derived_inputs(encoded['numeric'])], axis=1)
         offset = features.shape[1]
         slots = encoded['entity_upgrades']
         filled = Tensor((slots.reshape(-1) > 0).astype(float)[:, None])
@@ -799,46 +1000,42 @@ class NeuralPolicy:
             addition = addition + (linked @ p['task_'+role+'_w']) * Tensor(encoded['task_relation_valid'][:, i:i+1])
             addition = addition + Tensor(encoded['task_relation_features'][:, i]) @ p['task_'+role+'_features_w']
         entity = (base+addition).tanh()
-        q, k, v = (entity @ p[name] for name in ('attn_q', 'attn_k', 'attn_v'))
         count, heads = len(entity.data), self.config['attention_heads']
-        positions = encoded['numeric'][:, :2]
-        delta = positions[:, None, :] - positions[None, :, :]
-        owners = np.asarray([e['owner'] for e in encoded['entities']] or [-1])
-        relative = np.stack([delta[:, :, 0], delta[:, :, 1], (delta*delta).sum(axis=-1),
-                             (owners[:, None] == owners[None, :]).astype(float)], axis=-1).reshape(count*count, 4)
-        bias = Tensor(relative) @ p['relation_bias']
-        attended = []
         width = d//heads
-        for head in range(heads):
-            sl = slice(head*width, (head+1)*width)
-            scores = q[:, sl] @ k[:, sl].transpose() / math.sqrt(width)
-            weights = (scores + bias[:, head].reshape((count, count))).softmax(axis=1)
-            attended.append(weights @ v[:, sl])
-        # concatenate() is vector-oriented; use a reshape around the head join.
-        joined = concatenate([a.transpose().reshape((-1,)) for a in attended]).reshape((d, count)).transpose()
-        entity = (entity + joined @ p['attn_out']).layer_norm()
-        entity = (entity + (entity @ p['entity_ff']).tanh()).layer_norm()
-        if encoded['entities']:
-            spatial_entities = scatter_mean(entity @ p['scatter_w'], encoded['cells'], self.config['map_side']**2)
-        else:
-            spatial_entities = Tensor(np.zeros((self.config['map_side']**2, 8)))
-        # Matrix join, via projections, keeps the existing autodiff API small.
-        spatial = (Tensor(encoded['map_inputs']) @ p['map_input_w'][:MAP_CHANNELS]
-                   + spatial_entities @ p['map_input_w'][MAP_CHANNELS:] + p['map_input_b']).tanh()
-        spatial = (spatial + (conv2d_same(spatial, p['map_conv'], self.config['map_side'])
-                              + p['map_conv_b']).tanh()).layer_norm()
-        scalar = Tensor(encoded['scalars']) @ p['scalar_w'] + p['scalar_b']
+        for layer in range(ATTENTION_LAYERS):
+            q, k, v = (entity @ p[f'{name}{layer}'] for name in ('attn_q', 'attn_k', 'attn_v'))
+            attended = []
+            for head in range(heads):
+                sl = slice(head*width, (head+1)*width)
+                weights = (q[:, sl] @ k[:, sl].transpose() / math.sqrt(width)).softmax(axis=1)
+                attended.append(weights @ v[:, sl])
+            # concatenate() is vector-oriented; use a reshape around the head join.
+            joined = concatenate([a.transpose().reshape((-1,)) for a in attended]).reshape((d, count)).transpose()
+            entity = (entity + joined @ p[f'attn_out{layer}']).layer_norm()
+            entity = (entity + (entity @ p[f'entity_ff_in{layer}']).relu() @ p[f'entity_ff_out{layer}']).layer_norm()
+        spatial, map_embedding = self._encode_map(encoded, entity)
+        scalar = Tensor(visible_scalars(encoded['scalars'])) @ p['scalar_w'] + p['scalar_b']
+        commands = visible_task_commands(encoded['task_commands'])
         for i, prefix in enumerate(('task_command', 'task_validation')):
-            scalar = scalar + Tensor(encoded['task_commands'][i]) @ p[prefix+'_w']
+            scalar = scalar + Tensor(commands[i]) @ p[prefix+'_w']
             embedding = self.type_embedding(encoded['task_command_templates'][i:i+1])[0]
             scalar = scalar + (embedding @ p[prefix+'_template_w']) * float(encoded['task_command_template_present'][i])
         faction, general = encoded['player_identity']
-        scalar = scalar + (p['base_faction_embedding'][faction]+p['general_embedding'][general]) @ p['player_identity_w']
+        identity = p['base_faction_embedding'][faction]+p['general_embedding'][general]
+        scalar = scalar + identity @ p['player_identity_w']
+        # Known from the lobby in fair play. (0, 0) is the unknown row.
+        faction, general = encoded.get('enemy_identity', (0, 0))
+        enemy = p['base_faction_embedding'][faction]+p['general_embedding'][general]
+        scalar = scalar + enemy @ p['enemy_identity_w']
         scalar = scalar + Tensor(encoded['player_flags']) @ p['player_flags_w']
-        return scalar.tanh(), entity, spatial
+        counts = np.bincount(np.asarray(encoded['types'])[:len(encoded['entities'])], minlength=len(self.config['types']))
+        available = Tensor(np.asarray(self.verb_mask(encoded), dtype=float))
+        scalar = scalar + Tensor(np.sqrt(counts)) @ p['unit_counts_w'] + available @ p['available_actions_w']
+        gate = (identity @ p['gate_identity_w'] + enemy @ p['gate_enemy_w'] + available @ p['gate_actions_w'] + p['gate_b']).relu()
+        return scalar.tanh(), entity, spatial, map_embedding, gate
 
     def _trunk(self, encoded):
-        scalar, entity, spatial = self._encode_modalities(encoded)
+        scalar, entity, spatial, map_embedding, gate = self._encode_modalities(encoded)
         p = self.parameters
         query = scalar @ p['pool_query']
         def pool(mask):
@@ -851,53 +1048,86 @@ class NeuralPolicy:
         enemy = np.asarray([not e['own'] and e['owner'] >= 2 for e in entities] or [False])
         visible = np.asarray([e['visible'] for e in entities] or [False])
         neutral = np.asarray([not e['own'] and e['owner'] < 2 for e in entities] or [False])
-        map_pool = (spatial @ (scalar @ p['map_pool_query'])).softmax() @ spatial
         features = concatenate([scalar, pool(encoded['own']), pool(enemy & visible), pool(enemy & ~visible),
-                                pool(neutral), map_pool])
+                                pool(neutral), map_embedding])
         hidden = ((features @ p['event_input_w'] + p['event_input_b']).tanh()
                   @ p['event_hidden_w'] + p['event_hidden_b']).tanh()
         value = (((hidden @ p['value_hidden_w'] + p['value_hidden_b']).tanh()) @ p['value_w'] + p['value_b'])[0]
-        return hidden, entity, spatial, value
+        return hidden, entity, spatial, value, gate
+
+    def _action_type(self, hidden, gate):
+        """(logits, autoregressive input of the core): AlphaStar's action type head without its LSTM."""
+        p = self.parameters
+        x = (hidden @ p['verb_in_w']+p['verb_in_b']).relu()
+        for block in range(ACTION_RESIDUAL_BLOCKS):
+            y = (x @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']).layer_norm().relu()
+            x = x+(y @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b']).layer_norm().relu()
+        logits = x.relu() @ p['verb_w']*(gate @ p['verb_gate_w']+p['verb_gate_b']).sigmoid()+p['verb_b']
+        return logits, hidden @ p['ar_core_w']*(gate @ p['ar_core_gate_w']+p['ar_core_gate_b']).sigmoid()
+
+    def _lstm_step(self, query, state):
+        """One step of torch's LSTM equations; state is (hidden, cell)."""
+        p, key = self.parameters, len(query.data)
+        gates = query @ p['unit_lstm_input_w']+state[0] @ p['unit_lstm_hidden_w']+p['unit_lstm_b']
+        cell = gates[key:2*key].sigmoid()*state[1]+gates[:key].sigmoid()*gates[2*key:3*key].tanh()
+        return gates[3*key:].sigmoid()*cell.tanh(), cell
 
     def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False):
-        """One decision: DEFER plus delay, or one command with arguments plus delay."""
+        """One decision: action type, delay, then a command's arguments; DEFER has only the first two."""
         from event_schedule import delay_mask
-        hidden, entity, spatial, value = self._trunk(encoded)
+        hidden, entity, spatial, value, gate = self._trunk(encoded)
         p, config, trace = self.parameters, self.config, {}
         logp, entropy = Tensor(0), Tensor(0)
         def draw(name, logits, mask, override=None):
             nonlocal logp, entropy
             choice = override if override is not None else (teacher.get(name) if teacher is not None else None)
+            if teacher is None and name != 'delay' and not deterministic:
+                logits = logits/SAMPLING_TEMPERATURE
             choice, lp, ent = categorical(logits, mask, choice=choice, rng=rng, deterministic=deterministic)
             logp, entropy = logp+lp, entropy+ent
             trace[name] = choice
             return choice
         delays = delay_mask(config, encoded.get('event_rate', 60))
         first_delay = int(np.flatnonzero(delays)[0])
-        verb = draw('decision', hidden @ p['verb_w']+p['verb_b'], self.verb_mask(encoded),
+        logits, core = self._action_type(hidden, gate)
+        verb = draw('decision', logits, self.verb_mask(encoded),
                     KINDS.index(teacher['kind']) if teacher is not None else None)
+        one_hot = np.zeros(len(KINDS))
+        one_hot[verb] = 1
+        action = (Tensor(one_hot) @ p['ar_verb_w']+p['ar_verb_b']).relu()
+        context = core+action @ p['ar_verb_out_w']*(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']).sigmoid()
+        x = (context @ p['delay_in_w']+p['delay_in_b']).relu()
+        x = (x @ p['delay_hidden_w']+p['delay_hidden_b']).relu()
+        delay = draw('delay', x @ p['delay_w']+p['delay_b'], delays, teacher.get('delay', first_delay) if teacher else None)
         if verb == 0:
-            context = (hidden @ p['context_w']+p['verb_embedding'][0]).tanh()
-            delay = draw('delay', context @ p['delay_w']+p['delay_b'], delays,
-                         teacher.get('delay', first_delay) if teacher else None)
             return [], {'kind': 'wait', 'delay': delay}, hidden, value, logp, entropy
+        # A censored teacher delay is unknown: later arguments do not see the placeholder.
+        if teacher is None or 'delay' in teacher:
+            one_hot = np.zeros(len(config['delay_ticks']))
+            one_hot[delay] = 1
+            x = (Tensor(one_hot) @ p['delay_embed_in_w']+p['delay_embed_in_b']).relu()
+            x = (x @ p['delay_embed_hidden_w']+p['delay_embed_hidden_b']).relu()
+            context = context+x @ p['delay_embed_out_w']+p['delay_embed_out_b']
         kind = KINDS[verb]
-        context = (hidden @ p['context_w']+p['verb_embedding'][verb]).tanh()
         if kind == 'science':
             # A player-level purchase: no actor selection.
             embeddings = p['science_embedding']
             index = draw('science', embeddings @ (context @ p['science_query_w']) + p['science_b'], self.science_mask(encoded))
-            context = (context+embeddings[index] @ p['science_context_w']).tanh()
-            trace = {'kind': kind, 'selection': [], 'science': index}
-            draw('delay', context @ p['delay_w']+p['delay_b'], delays,
-                 override=teacher.get('delay', first_delay) if teacher is not None else None)
+            trace = {'kind': kind, 'selection': [], 'science': index, 'delay': delay}
             return [{'kind': kind, 'science': config['sciences'][index]}], trace, hidden, value, logp, entropy
         actors, selected = self.actor_mask(encoded, kind), []
         limit = selection_limit(config, kind)
         selection = teacher['selection'] if teacher else None
+        keys = entity @ p['entity_key_w']
+        func = np.zeros(len(config['types']))
+        func[np.asarray(encoded['types'])[actors]] = 1
+        func = Tensor(func) @ p['func_w']+p['func_b']
+        size = head_sizes(config)[2]
+        state = Tensor(np.zeros(size)), Tensor(np.zeros(size))
         for ordinal in range(limit):
-            scores = entity @ (context @ p['actor_pointer_w']) / math.sqrt(config['entity_hidden'])
-            scores = concatenate([scores, context @ p['stop_w']+p['stop_b']])
+            query = ((context @ p['unit_in_w']+p['unit_in_b']+func).relu() @ p['unit_query_w']+p['unit_query_b'])
+            state = self._lstm_step(query, state)
+            scores = concatenate([keys @ state[0], (p['unit_end_key'] @ state[0]).reshape((1,))])
             available = self.selection_mask(encoded, kind, selected, actors)
             actor_mask = np.concatenate([available, [ordinal > 0]])
             actor_mask[selected] = False
@@ -906,12 +1136,11 @@ class NeuralPolicy:
             if index == len(actors):
                 break
             selected.append(index)
-            context = (hidden @ p['context_w']+p['verb_embedding'][verb]
-                       + entity[selected].mean(axis=0) @ p['selected_w']).tanh()
+            context = context+(keys[index]/len(actors)) @ p['unit_ar_w']+p['unit_ar_b']
             available = self.selection_mask(encoded, kind, selected, actors)
             if not any(available[i] for i in range(len(actors)) if i not in selected):
                 break
-        trace = {'kind': kind, 'selection': selected}
+        trace = {'kind': kind, 'selection': selected, 'delay': delay}
         ids = [encoded['entities'][i]['id'] for i in selected]
         action = {'kind': kind}
         if kind in GROUP_KINDS:
@@ -923,13 +1152,13 @@ class NeuralPolicy:
             command = draw('command', embeddings @ (context @ p['command_query_w']) + p['command_b'],
                            self.command_mask(encoded, kind, selected))
             action['command'] = config['commands'][command]
-            context = (context+embeddings[command] @ p['command_context_w']).tanh()
+            context = context+embeddings[command] @ p['command_context_w']
         if kind == 'cancel_production':
             action['slot'] = draw('slot', context @ p['slot_w']+p['slot_b'], self.slot_mask(encoded, selected))
         mode = command_target(config, trace)
         if mode == 'entity':
-            index = draw('target', entity @ (context @ p['target_pointer_w'])/math.sqrt(config['entity_hidden']),
-                         self.target_mask(encoded, kind, selected, trace.get('command')))
+            query = (context @ p['target_in_w']+p['target_in_b']+func).relu() @ p['target_pointer_w']+p['target_pointer_b']
+            index = draw('target', keys @ query, self.target_mask(encoded, kind, selected, trace.get('command')))
             action['target'] = encoded['entities'][index]['id']
         if kind in ('build', 'train'):
             actor = encoded['entities'][selected[0]]
@@ -939,13 +1168,13 @@ class NeuralPolicy:
             embeddings = self.object_embedding(self.encoder.identity.template_objects)
             index = draw('template', embeddings @ (context @ p['template_query_w']) + p['template_b'], choices)
             action['template'] = config['templates'][index]
-            context = (context+embeddings[index] @ p['template_context_w']).tanh()
+            context = context+embeddings[index] @ p['template_context_w']
         build_mask = None
         placement_unavailable = False
         if kind == 'build' and config['placement_mode'] == 'full_mask':
             from build_placement import mask_for
             angle = draw('angle', context @ p['angle_w']+p['angle_b'], np.ones(16, bool))
-            context = (context+p['build_angle_embedding'][angle]).tanh()
+            context = context+p['build_angle_embedding'][angle]
             build_mask = mask_for(config, encoded, selected[0], index, angle)
             placement_unavailable = not build_mask.any()
             action['angle'] = math.tau*((angle+8*encoded['rotated'])%16)/16
@@ -954,18 +1183,19 @@ class NeuralPolicy:
         if mode == 'position' and not placement_unavailable:
             bins, n = config['position_bins'], config['map_side']
             fine = bins//n
-            cells = (spatial + Tensor(self._spatial_features(encoded, selected)) @ p['relative_w']).tanh()
             cell_mask, offset_mask = np.ones(n*n, dtype=bool), np.ones(fine*fine, dtype=bool)
+            build_features = None
             if build_mask is not None:
                 from build_placement import categorical_masks, coarse_features
-                cells = (cells + Tensor(coarse_features(build_mask, n)) @ p['build_map_w']).tanh()
+                build_features = coarse_features(build_mask, n)
                 cell_mask, _ = categorical_masks(build_mask, n)
-            scores = cells @ (context @ p['spatial_query'])/math.sqrt(config['map_hidden'])
-            cell = draw('cell', scores, cell_mask)
-            context = (context+cells[cell] @ p['cell_context_w']).tanh()
+            cells, logits = self._location(spatial, context, build_features)
+            # One 256x256 distribution, drawn as its map cell and then the offset within it.
+            cell = draw('cell', logits.logsumexp(axis=1), cell_mask)
+            context = context+cells[:, cell//n, cell%n] @ p['cell_context_w']
             if build_mask is not None:
                 _, offset_mask = categorical_masks(build_mask, n, cell)
-            offset = draw('offset', context @ p['offset_w']+p['offset_b'], offset_mask)
+            offset = draw('offset', logits[cell], offset_mask)
             x, y = (cell%n)*fine+offset%fine, (cell//n)*fine+offset//fine
             trace['x'], trace['y'] = x, y
             normalized = (np.asarray([x, y])+.5)/bins
@@ -978,9 +1208,6 @@ class NeuralPolicy:
             action['angle'] = math.tau*angle/config['angle_bins']
             if encoded['rotated']:
                 action['angle'] = (action['angle']+math.pi)%math.tau
-        # The delay schedules the next decision after this command.
-        draw('delay', context @ p['delay_w']+p['delay_b'], delays,
-             override=teacher.get('delay', first_delay) if teacher is not None else None)
         return ([] if placement_unavailable else [action]), trace, hidden, value, logp, entropy
 
     def weight_hash(self):

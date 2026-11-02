@@ -115,6 +115,17 @@ class Tensor:
         result = np.tanh(self.data)
         return Tensor(result, (self,), lambda g: self.add_grad(g * (1 - result * result)))
 
+    def relu(self):
+        return Tensor(np.maximum(self.data, 0), (self,), lambda g: self.add_grad(g * (self.data > 0)))
+
+    def logsumexp(self, axis):
+        peak = self.data.max(axis=axis, keepdims=True)
+        exponent = np.exp(self.data - peak)
+        total = exponent.sum(axis=axis, keepdims=True)
+        share = exponent / total
+        result = (peak + np.log(total)).squeeze(axis)
+        return Tensor(result, (self,), lambda g: self.add_grad(np.expand_dims(g, axis) * share))
+
     def sigmoid(self):
         # tanh form avoids overflow for large positive/negative inputs.
         result = (1 + np.tanh(self.data / 2)) / 2
@@ -212,35 +223,67 @@ def minimum(first, second):
     return Tensor(np.minimum(first.data, second.data), (first, second), backward)
 
 
-def scatter_mean(values, indices, size):
-    """Entity embeddings -> map cells, without an expensive dense scatter matrix."""
+def scatter_sum(values, pixels, side):
+    """Entity rows (N, C) summed onto a (C, side, side) image; pixels index y*side+x."""
     values = tensor(values)
-    indices = np.asarray(indices, dtype=int).copy()
-    counts = np.maximum(np.bincount(indices, minlength=size), 1)
-    result = np.zeros((size, values.data.shape[1]))
-    np.add.at(result, indices, values.data)
-    result /= counts[:, None]
-    return Tensor(result, (values,), lambda g: values.add_grad(g[indices] / counts[indices, None]))
-
-
-def conv2d_same(values, kernel, side):
-    """A shared 3x3 convolution on flattened HWC cells, with zero padding."""
-    values, kernel = tensor(values), tensor(kernel)
+    pixels = np.asarray(pixels, dtype=int).copy()
     channels = values.data.shape[1]
-    if values.data.shape[0] != side * side or kernel.data.shape[0] != 9 * channels:
-        raise ValueError('Invalid convolution dimensions')
-    padded = np.pad(values.data.reshape(side, side, channels), ((1, 1), (1, 1), (0, 0)))
-    patches = np.concatenate([padded[y:y+side, x:x+side].reshape(side * side, channels)
-                              for y in range(3) for x in range(3)], axis=1)
+    flat = np.zeros((side*side, channels))
+    np.add.at(flat, pixels, values.data)
+    return Tensor(flat.T.reshape(channels, side, side), (values,),
+                  lambda g: values.add_grad(g.reshape(channels, side*side).T[pixels]))
+
+
+def _window(array, y, x, stride, rows, columns):
+    return array[:, y:y+stride*rows:stride, x:x+stride*columns:stride]
+
+
+def conv2d(values, kernel, stride=1, padding=0):
+    """torch's conv2d on one (C, H, W) image; kernel is (out, in, K, K)."""
+    values, kernel = tensor(values), tensor(kernel)
+    size = kernel.data.shape[2]
+    padded = np.pad(values.data, ((0, 0), (padding, padding), (padding, padding)))
+    rows, columns = ((length-size)//stride+1 for length in padded.shape[1:])
+    offsets = [(y, x) for y in range(size) for x in range(size)]
+    result = np.zeros((kernel.data.shape[0], rows, columns))
+    for y, x in offsets:
+        result += np.tensordot(kernel.data[:, :, y, x], _window(padded, y, x, stride, rows, columns), 1)
     def backward(g):
-        kernel.add_grad(patches.T @ g)
-        if values.requires_grad:
-            dpatch = g @ kernel.data.T
-            gradient = np.zeros_like(padded)
-            for ordinal, (y, x) in enumerate((y, x) for y in range(3) for x in range(3)):
-                gradient[y:y+side, x:x+side] += dpatch[:, ordinal*channels:(ordinal+1)*channels].reshape(side, side, channels)
-            values.add_grad(gradient[1:-1, 1:-1].reshape(values.data.shape))
-    return Tensor(patches @ kernel.data, (values, kernel), backward)
+        kernel_gradient = np.zeros_like(kernel.data)
+        gradient = np.zeros_like(padded)
+        for y, x in offsets:
+            kernel_gradient[:, :, y, x] = np.tensordot(g, _window(padded, y, x, stride, rows, columns), ((1, 2), (1, 2)))
+            _window(gradient, y, x, stride, rows, columns)[...] += np.tensordot(kernel.data[:, :, y, x].T, g, 1)
+        kernel.add_grad(kernel_gradient)
+        height, width = values.data.shape[1:]
+        values.add_grad(gradient[:, padding:padding+height, padding:padding+width])
+    return Tensor(result, (values, kernel), backward)
+
+
+def conv_transpose2d(values, kernel, stride=1, padding=0):
+    """torch's conv_transpose2d on one (C, H, W) image; kernel is (in, out, K, K)."""
+    values, kernel = tensor(values), tensor(kernel)
+    size = kernel.data.shape[2]
+    rows, columns = values.data.shape[1:]
+    shape = (kernel.data.shape[1], stride*(rows-1)+size, stride*(columns-1)+size)
+    offsets = [(y, x) for y in range(size) for x in range(size)]
+    full = np.zeros(shape)
+    for y, x in offsets:
+        _window(full, y, x, stride, rows, columns)[...] += np.tensordot(kernel.data[:, :, y, x].T, values.data, 1)
+    def crop(array):
+        return array[:, padding:shape[1]-padding, padding:shape[2]-padding]
+    def backward(g):
+        expanded = np.zeros(shape)
+        crop(expanded)[...] = g
+        kernel_gradient = np.zeros_like(kernel.data)
+        gradient = np.zeros_like(values.data)
+        for y, x in offsets:
+            window = _window(expanded, y, x, stride, rows, columns)
+            kernel_gradient[:, :, y, x] = np.tensordot(values.data, window, ((1, 2), (1, 2)))
+            gradient += np.tensordot(kernel.data[:, :, y, x], window, 1)
+        kernel.add_grad(kernel_gradient)
+        values.add_grad(gradient)
+    return Tensor(crop(full), (values, kernel), backward)
 
 
 def categorical(logits, mask, *, choice=None, rng=None, deterministic=False):

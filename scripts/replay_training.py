@@ -13,7 +13,7 @@ from collections import Counter
 from replay_storage import open_trajectory, manifest_path
 
 # Mirrors generals_policy.OBSERVATION_VERSION; this module stays importable without NumPy.
-OBSERVATION_VERSION = 7
+OBSERVATION_VERSION = 8
 
 
 def _finite_float(token):
@@ -66,7 +66,8 @@ PRIVATE_FIELDS = frozenset(("production_queue", "ai_state", "construction_percen
                             "trainable_templates", "builder_id", "producer_id", "has_weapon", "can_attack",
                             "has_atk_move_cmd", "can_attack_move", "dock_targets", "resume_targets",
                             "commands", "command_cooldowns", "command_targets", "enter_targets", "container_id",
-                            "occupants", "capacity", "upgrades", "can_guard", "repair_targets", "repair_depots"))
+                            "occupants", "capacity", "upgrades", "can_guard", "repair_targets", "repair_depots",
+                            "weapon_cooldown_ticks", "ticks_since_damage"))
 # Canonical actions the engine resolves at dispatch (upgrades, abilities, garrison, promotions).
 RESOLVED_KINDS = frozenset(("upgrade", "science", "ability", "enter", "exit", "evacuate",
                             "guard", "guard_air", "cancel_production", "cancel_construction", "scatter",

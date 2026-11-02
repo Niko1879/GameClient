@@ -187,6 +187,8 @@ def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, t
     for player, policy in zip(env.controlled_players, policies):
         policy.reset()
         policy.configure_clock(env.metadata['ticks_per_second'])
+        # Policy opponents are vanilla China; a Hard AI's named faction is its lobby side.
+        policy.configure_enemy('FactionChina' if opponent_kind == 'policy' else opponent_faction)
         if policy.policy.config['placement_mode'] == 'full_mask':
             policy.placement_query = lambda builder, template, angle, bins, player=player: env.placement(
                 player, builder, template, angle, bins)

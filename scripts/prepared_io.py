@@ -9,9 +9,9 @@ import tempfile
 
 import numpy as np
 
-# Terrain height, cliffs, public supply sources and cell coordinates do not
-# change within a perspective; prepared events share one copy of them.
-STATIC_MAP_COLUMNS = (0, 1, 9, 10, 11)
+# Extent, terrain, public supply sources and cell coordinates do not change within a
+# perspective; prepared events share one copy of them.
+COMMON_FIELDS = ('low', 'span', 'map_static')
 
 
 def _json_bytes(value):
@@ -48,16 +48,12 @@ def _write_json(path, value):
 
 
 def _array_bytes(encoded):
-    """Bytes of a row's encoded feature arrays: what a chunk stores, without its transient entity dicts."""
-    return sum(value.nbytes for value in encoded.values() if isinstance(value, np.ndarray))
+    """Bytes of a row's encoded feature arrays: what a chunk stores, without its transient entity dicts
+    or the per-episode inputs in COMMON_FIELDS."""
+    return sum(value.nbytes for name, value in encoded.items() if isinstance(value, np.ndarray) and name not in COMMON_FIELDS)
 
 
 def _common(row):
     """Perspective-constant inputs stored once per prepared episode."""
     encoded = row['encoded']
-    shared = {key: np.array(encoded[key], copy=True, order='K') for key in ('low', 'span') if key in encoded}
-    maps = encoded.get('map_inputs')
-    if isinstance(maps, np.ndarray) and maps.ndim == 2 and maps.shape[1] > max(STATIC_MAP_COLUMNS):
-        shared.update(map_static=np.array(maps[:, STATIC_MAP_COLUMNS], copy=True, order='C'),
-                      map_shape=list(maps.shape))
-    return shared
+    return {key: np.array(encoded[key], copy=True, order='K') for key in COMMON_FIELDS if key in encoded}

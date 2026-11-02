@@ -9,7 +9,8 @@ from __future__ import annotations
 import numpy as np
 
 from event_schedule import delay_mask
-from generals_policy import COMMAND_KINDS, KINDS, NeuralPolicy, command_target
+from generals_policy import (COMMAND_KINDS, DERIVED_ENTITY_FEATURES, KINDS, NeuralPolicy, command_target,
+                             count_channels, derived_inputs, visible_scalars, visible_task_commands)
 from training_legality import cached_legality
 
 # Fitted Radeon encoder cost: per microbatch, per padded token, per padded pair.
@@ -47,13 +48,24 @@ def microbatches(rows, pair_budget, cost=MICROBATCH_COST):
         yield ordered[start:end]
 
 
+def available_actions(spec, row):
+    cached = row.get('_training_legality')
+    if cached is not None and cached['key'] == spec.legality_key:
+        return cached['verb']
+    return spec.reference.verb_mask(row)
+
+
 def encode_values(spec, encoded):
     """Pad only this chunk's entity dimension; padding never enters attention/pooling."""
     batch, count = len(encoded), max(len(row['numeric']) for row in encoded)
     numeric_size = encoded[0]['numeric'].shape[1] + encoded[0]['extra_numeric'].shape[1]
-    numeric = np.zeros((batch, count, numeric_size), dtype=spec.float_dtype)
+    numeric = np.zeros((batch, count, numeric_size+DERIVED_ENTITY_FEATURES), dtype=spec.float_dtype)
     types = np.zeros((batch, count), dtype=np.int64)
-    queued, cells, owners = types.copy(), types.copy(), np.full_like(types, -1)
+    queued, pixels, owners = types.copy(), types.copy(), np.full_like(types, -1)
+    # Entities outside the four count planes, including padding, land in a fifth that is discarded.
+    channels = np.full_like(types, 4)
+    # Rows of one game share their terrain; stage it once per game in this microbatch.
+    statics, static_index, static_ids = [], np.zeros(batch, dtype=np.int64), {}
     slots = encoded[0]['entity_upgrades'].shape[1]
     upgrades = np.zeros((batch, count, slots), dtype=np.int64)
     valid, real, own, visible = [np.zeros((batch, count), dtype=bool) for _ in range(4)]
@@ -61,12 +73,20 @@ def encode_values(spec, encoded):
         length = len(row['numeric'])
         width = row['numeric'].shape[1]
         numeric[index, :length, :width] = row['numeric']
-        numeric[index, :length, width:] = row['extra_numeric']
+        numeric[index, :length, width:numeric_size] = row['extra_numeric']
+        numeric[index, :length, numeric_size:] = derived_inputs(row['numeric'])
         types[index, :length], queued[index, :length] = row['types'], row['queued_types']
         upgrades[index, :length] = row['entity_upgrades']
-        cells[index, :length] = row['cells']
+        pixels[index, :length] = row['cells']
         valid[index, :length] = True  # Includes the reference's single empty-entity dummy.
-        real[index, :row['entity_count'] if 'entity_count' in row else len(row['entities'])] = True
+        entities = row['entity_count'] if 'entity_count' in row else len(row['entities'])
+        real[index, :entities] = True
+        channels[index, :entities] = count_channels(row['numeric'], entities)
+        terrain = row['map_static']
+        if id(terrain) not in static_ids:
+            static_ids[id(terrain)] = len(statics)
+            statics.append(terrain)
+        static_index[index] = static_ids[id(terrain)]
         own[index, :length] = row['own']
         cached = row.get('_training_legality')
         if cached is not None and cached['key'] == spec.legality_key:
@@ -77,15 +97,19 @@ def encode_values(spec, encoded):
     enemy = real & ~own & (owners >= 2)
     neutral = real & ~own & (owners < 2)
     values = {'numeric': (numeric, 'float'), 'types': (types, 'int64'),
-        'queued': (queued, 'int64'), 'cells': (cells, 'int64'), 'owners': (owners, 'int64'),
+        'queued': (queued, 'int64'), 'scatter_pixels': (pixels, 'int64'),
         'valid': (valid, 'bool'), 'real': (real, 'float'),
         'pool_own': (own, 'bool'), 'pool_visible': (enemy & visible, 'bool'),
         'pool_hidden': (enemy & ~visible, 'bool'), 'pool_neutral': (neutral, 'bool'),
-        'map_inputs': (np.stack([row['map_inputs'] for row in encoded]), 'float'),
-        'scalars': (np.stack([row['scalars'] for row in encoded]), 'float'),
+        'map_channels': (channels, 'int64'),
+        'map_statics': (np.stack(statics), 'float'), 'map_static_index': (static_index, 'int64'),
+        'map_visibility': (np.stack([row['map_visibility'] for row in encoded]).astype(np.int64), 'int64'),
+        'scalars': (visible_scalars(np.stack([row['scalars'] for row in encoded])), 'float'),
         'entity_upgrades': (upgrades, 'int64'),
         'player_flags': (np.stack([row['player_flags'] for row in encoded]), 'float'),
-        'identities': ([row['player_identity'] for row in encoded], 'int64')}
+        'available_actions': (np.stack([available_actions(spec, row) for row in encoded]), 'float'),
+        'identities': ([row['player_identity'] for row in encoded], 'int64'),
+        'enemy_identities': ([row.get('enemy_identity', (0, 0)) for row in encoded], 'int64')}
     # unit_tasks fills task inputs only for owned entities; every other
     # row is zero and adds exactly nothing. Stage owned rows compactly,
     # with relation targets as flat (row*count+entity) indices.
@@ -96,11 +120,9 @@ def encode_values(spec, encoded):
     for name, dtype in (('task_numeric', 'float'), ('task_relation_valid', 'bool'),
                         ('task_relation_features', 'float')):
         values[name] = np.concatenate([np.asarray(row[name])[rows] for row, rows in zip(encoded, owned)]), dtype
-    for name, dtype in (('task_commands', 'float'), ('task_command_templates', 'int64'),
-                        ('task_command_template_present', 'bool')):
+    values['task_commands'] = visible_task_commands(np.stack([row['task_commands'] for row in encoded])), 'float'
+    for name, dtype in (('task_command_templates', 'int64'), ('task_command_template_present', 'bool')):
         values[name] = np.stack([row[name] for row in encoded]), dtype
-    if spec.device_type == 'cuda':
-        values['positions'] = numeric[:, :, :2], 'float'
     return values, numeric
 
 
@@ -129,6 +151,7 @@ def teacher_plan(spec, encoded, teachers, entity_count):
     delay_masks = [delay_mask(config, row.get('event_rate', 60)) for row in encoded]
     choices = [t.get('delay', int(np.flatnonzero(mask)[0])) for t, mask in zip(teachers, delay_masks)]
     categorical('event_delay', delay_masks, choices)
+    add('delay_known', ['delay' in t for t in teachers], 'float')
     add('all_verbs', [KINDS.index(t['kind']) for t in teachers])
     add('conditional_mask', verbs[:, 1:], 'bool')
     command_rows = np.asarray([i for i, target in enumerate(teachers) if target['kind'] != 'wait'], dtype=np.int64)
@@ -140,7 +163,11 @@ def teacher_plan(spec, encoded, teachers, entity_count):
     rows = [encoded[i] for i in command_rows]
     targets = [teachers[i] for i in command_rows]
     legal = [masks[i] for i in command_rows]
-    add('verbs', np.asarray([KINDS.index(target['kind']) for target in targets]))
+    func = np.zeros((len(rows), len(config['types'])), dtype=np.float32)
+    for i, (row, entry) in enumerate(zip(rows, legal)):
+        func[i, np.asarray(row['types'])[np.asarray(entry['actor'], dtype=bool)]] = 1
+    add('func_types', func, 'float')
+    add('entity_counts', [len(row['numeric']) for row in rows], 'float')
     selected = [entry['selected'] for entry in legal]
     plan['selected'] = selected
     longest = max(1, max(map(len, selected)))
@@ -156,7 +183,6 @@ def teacher_plan(spec, encoded, teachers, entity_count):
             unit_choices.append(entity_count if choice == real_count else choice)
     add('selected_indices', selected_indices)
     add('command_range', np.arange(len(rows)))
-    add('selected_divisors', np.arange(1, longest+1), 'float')
     add('selected_lengths', list(map(len, selected)))
     add('unit_rows', unit_rows); add('unit_prefixes', unit_prefixes)
     # Player-level commands (science) select no units: a microbatch of only
@@ -199,7 +225,6 @@ def teacher_plan(spec, encoded, teachers, entity_count):
                     [targets[i]['angle'] for i in indices], indices)
     indices = branch('spatial', lambda t: command_target(config, t) == 'position')
     if len(indices):
-        add('relative', np.stack([spec.reference._spatial_features(rows[i], selected[i]) for i in indices]), 'float')
         add('spatial_range', np.arange(len(indices)))
         categorical('cell', [legal[i]['cell'] for i in indices], [targets[i]['cell'] for i in indices], indices)
         categorical('offset', [legal[i]['offset'] for i in indices], [targets[i]['offset'] for i in indices], indices)

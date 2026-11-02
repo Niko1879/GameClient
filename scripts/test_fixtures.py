@@ -1,4 +1,4 @@
-"""Small observation-v7 vanilla China fixtures shared by the policy, learner and pipeline tests."""
+"""Small vanilla China fixtures shared by the policy, learner and pipeline tests."""
 import copy
 
 import numpy as np
@@ -21,7 +21,7 @@ VOCABULARY = {'types': ['<unknown>', 'ChinaVehicleDozer', 'ChinaCommandCenter', 
               'command_shortcuts': {'FactionChina': ['Command_ArtilleryBarrage']},
               'promotions': {'FactionChina': ['SCIENCE_ArtilleryBarrage1', 'SCIENCE_Frenzy1']},
               'upgrades': ['Upgrade_ChinaRadar', 'Upgrade_InfantryCaptureBuilding']}
-SMALL = dict(hidden=16, entity_hidden=8, embedding=4, map_hidden=6, scalar_hidden=6, map_side=8, position_bins=16)
+SMALL = dict(hidden=16, entity_hidden=8, embedding=4, map_hidden=6, scalar_hidden=6, map_side=4, position_bins=16)
 
 
 def task(kind='idle', **changes):

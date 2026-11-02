@@ -80,7 +80,7 @@ def confirmation_suite(args):
                 expected = dict(batches=count, warmup=8, prefetch=1, pair_budget=args.pair_budget,
                     batch_size=args.batch_size, buffer_mib=args.buffer_mib, threads=args.threads,
                     device=args.device, seed=args.seed, split=split, instrument=instrument,
-                    checkpoint_benchmark=checkpoint, loader_only=False, relation_mode='current')
+                    checkpoint_benchmark=checkpoint, loader_only=False)
                 prior_path = args.output/(label+'.json')
                 prior = json.loads(prior_path.read_text()) if prior_path.exists() else {}
                 reusable = (prior.get('dataset_sha256') == state['dataset_sha256']
@@ -302,10 +302,8 @@ def main():
     parser.add_argument('--buffer-mib', type=int, default=64)
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
-    parser.add_argument('--relation-mode', choices=('current', 'baseline', 'reduction'), default='current')
     parser.add_argument('--encoder-source', type=Path,
                         help='Benchmark torch_policy_v3.py from a local source ZIP')
-    parser.add_argument('--verify-relation', action='store_true', help='Compare real-data Adam updates against baseline')
     parser.add_argument('--verify-updates', action='store_true', help='Compare complete real-data updates with archived original')
     parser.add_argument('--compare', action='store_true', help='Paired learner timings against archived original source')
     parser.add_argument('--prefetch', type=int, default=0)
@@ -327,8 +325,7 @@ def main():
         sys.setswitchinterval(args.gil_ms/1000)
     if min(args.batches, args.batch_size, args.buffer_mib, args.threads, args.pair_budget) < 1 or args.warmup < 0:
         parser.error('Positive profile budgets required')
-    if args.full_epoch and (args.compare or args.abba or args.verify_relation or args.verify_updates
-                            or args.confirmation_suite):
+    if args.full_epoch and (args.compare or args.abba or args.verify_updates or args.confirmation_suite):
         parser.error('--full-epoch requires the ordinary profiling path')
     if not 0 <= args.restore_converter_workers <= 64:
         parser.error('Converter workers must be between 0 and 64')
@@ -383,9 +380,6 @@ def main():
             sys.modules['torch_policy_v3'] = torch_policy_v3 = encoder
             report['sources']['torch_policy_v3.py'] = hashlib.sha256(source).hexdigest()
             report['encoder_source_archive_sha256'] = hashlib.sha256(args.encoder_source.read_bytes()).hexdigest()
-        if args.relation_mode != 'current':
-            torch_policy_v3.relation_bias = (torch_policy_v3._RelationBias.apply if args.relation_mode == 'reduction'
-                                            else lambda relative, weight: relative @ weight)
         torch.manual_seed(args.seed)
         reference = NeuralPolicy(dataset.config, args.seed)
         learner = EventLearner(reference, device=args.device, threads=args.threads, pair_budget=args.pair_budget)
@@ -437,26 +431,14 @@ def main():
         print(json.dumps(dict(label=args.label, examples=samples, **timings,
                              speedup=report['paired_learner_speedup'])), flush=True)
         return
-    if args.verify_relation or args.verify_updates:
-        modules = None
-        if args.verify_updates:
-            other, modules = original_learner(dataset.config, args)
-        else:
-            other = EventLearner(NeuralPolicy(dataset.config, args.seed),
-                                 device=args.device, threads=args.threads, pair_budget=args.pair_budget)
+    if args.verify_updates:
+        other, modules = original_learner(dataset.config, args)
         differences = []
         for i in range(args.batches):
             rows, _ = next(iterator)
-            if args.verify_updates:
-                with module_overrides(modules):left = other.batch(rows, train=True)
-                right = learner.batch(rows, train=True)
-                original, candidate = other, learner
-            else:
-                torch_policy_v3.relation_bias = lambda relative, weight: relative @ weight
-                left = learner.batch(rows, train=True)
-                torch_policy_v3.relation_bias = torch_policy_v3._RelationBias.apply
-                right = other.batch(rows, train=True)
-                original, candidate = learner, other
+            with module_overrides(modules):left = other.batch(rows, train=True)
+            right = learner.batch(rows, train=True)
+            original, candidate = other, learner
             for name, value in original.model.weights.items():
                 torch.testing.assert_close(candidate.model.weights[name], value, atol=5e-6, rtol=3e-4)
             differences.append(max((candidate.model.weights[name]-value).abs().max().item()

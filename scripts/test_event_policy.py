@@ -85,7 +85,7 @@ class EventTests(unittest.TestCase):
             game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
             return list(encoded_events(self.policy, game, Counter()))
         a, b = convert(30), convert(70)
-        for name in ('scalars', 'numeric', 'extra_numeric', 'map_inputs'):
+        for name in ('scalars', 'numeric', 'extra_numeric', 'map_visibility'):
             np.testing.assert_array_equal(a[0]['encoded'][name], b[0]['encoded'][name])
         self.assertNotEqual(a[0]['target']['delay'], b[0]['target']['delay'])
 

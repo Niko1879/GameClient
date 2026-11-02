@@ -94,7 +94,6 @@ def write_shard(destination, games, policy, source):
                 for row in encoded_events(policy, game, episode_counts):
                     if common is None:
                         common = _common(row)
-                        common['map_coords'] = np.array(row['encoded']['map_coords'], copy=True)
                     estimate = _array_bytes(row['encoded'])
                     if buffer and (len(buffer) >= 128 or size+estimate > CHUNK_ARRAY_BYTES):
                         flush()
@@ -105,8 +104,7 @@ def write_shard(destination, games, policy, source):
                 if common is None:
                     continue
                 raw = encode_columns({name: Column.build([value], float_dtype=float_dtype) for name, value in common.items()
-                                      if isinstance(value, np.ndarray)}, [{'map_shape': common.get('map_shape')}],
-                                     float_dtype=float_dtype)
+                                      if isinstance(value, np.ndarray)}, [{}], float_dtype=float_dtype)
                 member = f'shared/{number:04d}.bin'
                 archive.writestr(member, raw)
                 index['shared'][str(number)] = {'member': member, 'bytes': len(raw),

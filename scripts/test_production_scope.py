@@ -55,7 +55,7 @@ class ProductionScopeTests(unittest.TestCase):
         self.assertEqual(vanilla_china_production(self.wide),self.config)
         wide = NeuralPolicy(self.wide,5)
         encoded = wide.encoder.encode(self.obs,self.terrain,0)
-        for key in ('types','numeric','extra_numeric','queued_types','scalars','map_inputs','player_identity'):
+        for key in ('types','numeric','extra_numeric','queued_types','scalars','map_visibility','player_identity'):
             np.testing.assert_array_equal(self.encoded[key],encoded[key])
         self.assertNotEqual(feature_identity(self.policy),feature_identity(wide))
 

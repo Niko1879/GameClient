@@ -20,7 +20,7 @@ def fixture(rate):
     header = dict(record='header', schema_version=1, controlled_faction='FactionChina',
         ticks_per_second=rate, template_catalog={'7': 'ChinaPowerPlant', '8': 'ChinaInfantryRedguard'},
         engine_git_sha='fixture', engine_git_dirty=True, engine_exe_crc=1, engine_ini_crc=2, placement_mode='fast', quiet_capture='all',
-        observation_policy=dict(version=7, excluded_templates=[], visible_only_templates=[],
+        observation_policy=dict(version=8, excluded_templates=[], visible_only_templates=[],
                                 neutral_excluded_templates=[], playable_players=[2, 3, 4]))
     terrain = dict(record='map', grid_size=1, height=[0], cliff=[False])
     rows, previous = [], {}
@@ -28,7 +28,7 @@ def fixture(rate):
         observation = dict(player={'index': player, 'faction': 'FactionChina'}, visibility_grid=[0],
             own_entities=[dict(id=player, type='ChinaVehicleDozer', owner=player, own=True,
                 visible=True, last_seen_frame=frame, resume_targets=[])], known_nonowned_entities=[],
-            observation_policy_version=7)
+            observation_policy_version=8)
         delta = frame-previous[player] if player in previous else 0
         previous[player] = frame
         rows.append(dict(record='sample', player_index=player, frame=frame, delta_ticks=delta,

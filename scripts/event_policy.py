@@ -29,8 +29,8 @@ def default_config(vocabulary, placement_mode='fast'):
               'promotions': vocabulary['promotions'], 'upgrades': vocabulary['upgrades'],
               'sciences': sorted({name for names in vocabulary['promotions'].values() for name in names}),
               'architecture': ARCHITECTURE, 'observation_policy_version': OBSERVATION_VERSION,
-              # About 9.9M parameters; widths are model-only and never change shard columns.
-              'hidden': 1408, 'entity_hidden': 256, 'embedding': 64, 'attention_heads': 4,
+              # Widths are model-only and never change shard columns.
+              'hidden': 1408, 'entity_hidden': 256, 'embedding': 64, 'attention_heads': 2,
               'map_side': 16, 'map_hidden': 128, 'scalar_hidden': 256, 'max_group': 64,
               'position_bins': 256, 'angle_bins': 16,
               'event_max_delay': 120, 'delay_ticks': list(range(1, 121)), 'event_observation_ms': 100,
@@ -67,12 +67,17 @@ class EventActor:
         self.next_decision_frame = 0
         self.home_position = None
         self.rate = 60
+        self.enemy_identity = (0, 0)
         self.counters = Counter()
         self.last = {}
 
     def configure_clock(self, rate):
         canonical_frame(0, rate)
         self.rate = rate
+
+    def configure_enemy(self, faction):
+        """The opponent's native faction name, as a lobby shows it; None or a random pick is unknown."""
+        self.enemy_identity = self.policy.encoder.identity.player_identity(faction)
 
     @property
     def next_deadline_native(self):
@@ -90,6 +95,7 @@ class EventActor:
         encoded = self.policy.encoder.encode(observation, terrain, frame, previous_frame=self.previous_frame,
             home_position=self.home_position, source_ticks_per_second=self.rate)
         encoded['event_rate'] = self.rate
+        encoded['enemy_identity'] = self.enemy_identity
         if self.policy.config['placement_mode'] == 'full_mask':
             if not hasattr(self, 'placement_query'):
                 raise ValueError('Placement-aware event actor needs a placement-capable environment')

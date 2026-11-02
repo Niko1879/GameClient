@@ -15,7 +15,7 @@ RUN=ROOT/'model-training'
 DATA=ROOT/'training-data'
 CATALOG=ROOT/'replays/catalog/replay-catalog.sqlite3'
 MANIFEST=DATA/'.model-training.json'
-ENGINE=ROOT/'replay-runtime/game/engine-6ae8ca8cd3cf2cc5.exe'
+ENGINE=ROOT/'replay-runtime/game/engine-ab1c9849e5c41595.exe'
 STOP=RUN/'stop.json'
 
 for name in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):os.environ[name]='1'
@@ -73,7 +73,9 @@ def selection(args):
     from event_dataset import EventDataset
     from generals_policy import NeuralPolicy
     policy=load(ROOT/'replay-runtime/policy.json')
-    key=feature_identity(NeuralPolicy(policy,parameters=False))
+    from enemy_side import enemy_faction
+    model=NeuralPolicy(policy,parameters=False)
+    key=feature_identity(model)
     db=connect(CATALOG);db.row_factory=__import__('sqlite3').Row
     try:
         protected={r[0] for r in db.execute("SELECT match_key FROM replay_assignment WHERE split='test'")}
@@ -102,6 +104,7 @@ def selection(args):
             entry.update(path=Path(row['storage_path']).name,split=row['split'])
             if entry['index']['source']['replay_sha256']!=row['replay_sha256']:
                 raise ValueError('Catalogue entry differs from original replay identity')
+            entry['enemy_identity']=list(model.encoder.identity.player_identity(enemy_faction(entry['index']['source']['original_replay'])))
             entries.append(entry)
         doc=dict(schema=1,kind='generals_event_dataset',complete=True,config=policy,deployment=deployment,
             capability_catalog_sha256=next(iter(profile_cache.values()))['capability_catalog_sha256'],entries=entries,
@@ -243,6 +246,8 @@ def run(args):
             for variable,name in (('MIOPEN_USER_DB_PATH','user-db'),('MIOPEN_CUSTOM_CACHE_DIR','kernels')):
                 cache=ROOT/'.cache/miopen'/name;cache.mkdir(parents=True,exist_ok=True)
                 os.environ[variable]=str(cache)
+            # The full search reruns for every new microbatch shape: 8 against 184 rows/s on the 6750 XT.
+            os.environ['MIOPEN_FIND_MODE']='FAST'
             while not plan.get('checkpoint'):
                 checkpoint_stop=RUN/'checkpoint-stop.json';checkpoint_stop.unlink(missing_ok=True)
                 command=[sys.executable,'-B',ROOT/'scripts/train_events.py','train','--dataset',MANIFEST,'--output',RUN,

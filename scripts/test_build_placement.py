@@ -52,7 +52,7 @@ class PlacementTests(unittest.TestCase):
             self.assertEqual(actions[0]['position'][:2], [343.75, 343.75])
             self.assertAlmostEqual(actions[0]['angle'], 3*np.pi/8)
             mask = row['encoded']['build_mask']
-            cell, offset = categorical_masks(mask, 8, trace['cell'])
+            cell, offset = categorical_masks(mask, self.config['map_side'], trace['cell'])
             self.assertTrue(cell[trace['cell']]); self.assertTrue(offset[trace['offset']])
 
     def test_masked_quantized_teacher_is_excluded_instead_of_relocated(self):
@@ -100,7 +100,7 @@ class PlacementTests(unittest.TestCase):
         obs['build_placements'] = [record]
         encoded = self.policy.encoder.encode(obs, self.terrain, 0)
         mask_for(self.config, encoded, a['target']['selection'][0], a['target']['template'], 3)
-        for field in ('map_inputs', 'scalars', 'numeric', 'build_mask', 'build_features'):
+        for field in ('map_visibility', 'scalars', 'numeric', 'build_mask', 'build_features'):
             np.testing.assert_array_equal(a['encoded'][field], encoded[field])
 
     def test_teacher_placement_information_cannot_change_earlier_heads(self):

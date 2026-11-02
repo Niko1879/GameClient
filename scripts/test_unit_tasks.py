@@ -107,6 +107,7 @@ class UnitTaskTests(unittest.TestCase):
         for key in ('own_entities', 'known_nonowned_entities'):
             for entity in obs[key]:
                 entity['position'][:2] = (1000-np.asarray(entity['position'][:2])).tolist()
+                entity['facing'] = np.pi
                 if entity.get('task', {}).get('destination') is not None:
                     entity['task']['destination'][:2] = (1000-np.asarray(entity['task']['destination'][:2])).tolist()
         obs['last_submission']['position'][:2] = (1000-np.asarray(obs['last_submission']['position'][:2])).tolist()

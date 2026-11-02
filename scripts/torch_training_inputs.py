@@ -6,8 +6,9 @@ import math
 import os
 import numpy as np
 import torch
+from torch.nn import functional as F
 
-from generals_policy import KINDS
+from generals_policy import ACTION_RESIDUAL_BLOCKS, KINDS
 from training_preparation import teacher_plan
 
 
@@ -106,7 +107,12 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         return categorical(logits, mask, choices, details=not loss_only,
                            predict=not loss_only or name in ('decision', 'event_delay'))
 
-    logits = memories @ p['verb_w'] + p['verb_b']
+    core, gate = memories[:, :config['hidden']], memories[:, config['hidden']:]
+    x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])
+    for block in range(ACTION_RESIDUAL_BLOCKS):
+        y = F.relu(model.normalize(x @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']))
+        x = x+F.relu(model.normalize(y @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b']))
+    logits = (F.relu(x) @ p['verb_w'])*torch.sigmoid(gate @ p['verb_gate_w']+p['verb_gate_b'])+p['verb_b']
     timing, entropy, decision = draw('decision', logits)
     outputs = {'by_head': {'decision': timing}, 'head_counts': {'decision': np.ones(batch, dtype=int)},
                'predictions': [('decision', np.arange(batch), decision)]}
@@ -115,22 +121,24 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
                        event_prediction=(decision != 0).long(),
                        conditional_prediction=logits[:, 1:].masked_fill(~inputs['conditional_mask'], -torch.inf).argmax(dim=1),
                        order_probability=1-logits.masked_fill(~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0])
-    # Command delays use the completed autoregressive argument context below;
-    # DEFER has only its verb embedding. This matches deployed sampling.
-    delay_context = torch.tanh(memories @ p['context_w']+p['verb_embedding'][inputs['all_verbs']])
-
-    def finish(context):
-        lp, ent, prediction = draw('event_delay', context @ p['delay_w']+p['delay_b'])
-        outputs['by_head']['delay'] = lp
-        outputs['head_counts']['delay'] = np.ones(batch, dtype=int)
-        if not loss_only:
-            outputs['logp'] = outputs['logp']+lp
-            outputs['entropy'] = outputs['entropy']+ent
-        outputs['predictions'].append(('delay', np.arange(batch), prediction))
-        return outputs
-
+    # The autoregressive embedding, then the delay, which every later argument sees.
+    action = F.relu(F.one_hot(inputs['all_verbs'], len(KINDS)).to(model.dtype) @ p['ar_verb_w']+p['ar_verb_b'])
+    ar = ((core @ p['ar_core_w'])*torch.sigmoid(gate @ p['ar_core_gate_w']+p['ar_core_gate_b'])
+          + (action @ p['ar_verb_out_w'])*torch.sigmoid(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']))
+    x = F.relu(F.relu(ar @ p['delay_in_w']+p['delay_in_b']) @ p['delay_hidden_w']+p['delay_hidden_b'])
+    lp, ent, prediction = draw('event_delay', x @ p['delay_w']+p['delay_b'])
+    outputs['by_head']['delay'] = lp
+    outputs['head_counts']['delay'] = np.ones(batch, dtype=int)
+    if not loss_only:
+        outputs['logp'] = outputs['logp']+lp
+        outputs['entropy'] = outputs['entropy']+ent
+    outputs['predictions'].append(('delay', np.arange(batch), prediction))
     if not count:
-        return finish(delay_context)
+        return outputs
+    x = F.one_hot(inputs['event_delay_choices'], len(config['delay_ticks'])).to(model.dtype)
+    x = F.relu(F.relu(x @ p['delay_embed_in_w']+p['delay_embed_in_b']) @ p['delay_embed_hidden_w']+p['delay_embed_hidden_b'])
+    # A censored teacher delay is unknown: later arguments do not see the placeholder.
+    ar = ar+(x @ p['delay_embed_out_w']+p['delay_embed_out_b'])*inputs['delay_known'][:, None]
 
     def record(name, values, *, start=None, stop=None):
         lp, ent, prediction = values
@@ -147,60 +155,69 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
             outputs['predictions'].append((name, global_rows.copy(), prediction))
 
     command = inputs['command_rows']
-    entity, maps = entities[command], spatial[command]
-    base = memories[command] @ p['context_w'] + p['verb_embedding'][inputs['verbs']]
-    embeddings = entity[inputs['command_range'][:, None], inputs['selected_indices']]
-    cumulative = embeddings.cumsum(dim=1)/inputs['selected_divisors'][None, :, None]
-    means = torch.cat([torch.zeros((count, 1, config['entity_hidden']), device=model.device,
-                                  dtype=model.dtype), cumulative], dim=1)
+    keys = entities[command] @ p['entity_key_w']
+    func = inputs['func_types'] @ p['func_w']+p['func_b']
+    # Teacher selections fix each step's embedding, so the query LSTM runs across them in one pass.
+    chosen = keys[inputs['command_range'][:, None], inputs['selected_indices']]/inputs['entity_counts'][:, None, None]
+    steps = (chosen @ p['unit_ar_w']+p['unit_ar_b']).cumsum(dim=1)
+    steps = ar[command][:, None]+torch.cat([torch.zeros_like(steps[:, :1]), steps], dim=1)
+    if plan['unit_tokens']:
+        queries = F.relu(steps @ p['unit_in_w']+p['unit_in_b']+func[:, None]) @ p['unit_query_w']+p['unit_query_b']
+        size = queries.shape[-1]
+        hidden, cell = queries.new_zeros((count, size)), queries.new_zeros((count, size))
+        outputs_by_step = []
+        for step in range(int(inputs['unit_prefixes'].max())+1):
+            gates = queries[:, step] @ p['unit_lstm_input_w']+hidden @ p['unit_lstm_hidden_w']+p['unit_lstm_b']
+            cell = torch.sigmoid(gates[:, size:2*size])*cell+torch.sigmoid(gates[:, :size])*torch.tanh(gates[:, 2*size:3*size])
+            hidden = torch.sigmoid(gates[:, 3*size:])*torch.tanh(cell)
+            outputs_by_step.append(hidden)
+        lstm_outputs = torch.stack(outputs_by_step, dim=1)
     for start in range(0, plan['unit_tokens'], 256):
         stop = start+256
         rows, prefixes = inputs['unit_rows'][start:stop], inputs['unit_prefixes'][start:stop]
-        context = torch.tanh(base[rows] + means[rows, prefixes] @ p['selected_w'])
-        scores = torch.bmm(entity[rows], (context @ p['actor_pointer_w']).unsqueeze(-1)).squeeze(-1)
-        unit_logits = torch.cat([scores/math.sqrt(config['entity_hidden']), context @ p['stop_w']+p['stop_b']], dim=1)
+        query = lstm_outputs[rows, prefixes]
+        scores = torch.bmm(keys[rows], query.unsqueeze(-1)).squeeze(-1)
+        unit_logits = torch.cat([scores, (query @ p['unit_end_key']).unsqueeze(-1)], dim=1)
         record('unit', draw('unit', unit_logits, start, stop), start=start, stop=stop)
-    final = means[inputs['command_range'], inputs['selected_lengths']]
-    context = torch.tanh(base + final @ p['selected_w'])
+    context = steps[inputs['command_range'], inputs['selected_lengths']]
 
     if len(plan['science_rows']):
         ix, choices = inputs['science_rows'], inputs['science_choices']
         table = p['science_embedding']
         record('science', draw('science', (context[ix] @ p['science_query_w']) @ table.T + p['science_b']))
-        context = context.index_copy(0, ix, torch.tanh(context[ix]+table[choices] @ p['science_context_w']))
+        context = context.index_copy(0, ix, context[ix]+table[choices] @ p['science_context_w'])
     if len(plan['command_head_rows']):
         ix, choices = inputs['command_head_rows'], inputs['command_choices']
         table = p['command_embedding']
         record('command', draw('command', (context[ix] @ p['command_query_w']) @ table.T + p['command_b']))
-        context = context.index_copy(0, ix, torch.tanh(context[ix]+table[choices] @ p['command_context_w']))
+        context = context.index_copy(0, ix, context[ix]+table[choices] @ p['command_context_w'])
 
     if len(plan['slot_rows']):
         ix = inputs['slot_rows']
         record('slot', draw('slot', context[ix] @ p['slot_w']+p['slot_b']))
     if len(plan['target_rows']):
         ix = inputs['target_rows']
-        target_logits = torch.bmm(entity[ix], (context[ix] @ p['target_pointer_w']).unsqueeze(-1)).squeeze(-1)
-        record('target', draw('target', target_logits/math.sqrt(config['entity_hidden'])))
+        query = F.relu(context[ix] @ p['target_in_w']+p['target_in_b']+func[ix]) @ p['target_pointer_w']+p['target_pointer_b']
+        record('target', draw('target', torch.bmm(keys[ix], query.unsqueeze(-1)).squeeze(-1)))
     if len(plan['template_rows']):
         ix, choices = inputs['template_rows'], inputs['template_choices']
         objects = model.object_embedding(model.identity_template_objects)
         record('template', draw('template', (context[ix] @ p['template_query_w']) @ objects.T + p['template_b']))
-        context = context.index_copy(0, ix, torch.tanh(context[ix]+objects[choices] @ p['template_context_w']))
+        context = context.index_copy(0, ix, context[ix]+objects[choices] @ p['template_context_w'])
     if placement and len(plan['angle_rows']):
         ix = inputs['angle_rows']
         record('angle', draw('angle', context[ix] @ p['angle_w']+p['angle_b']))
-        context = context.index_copy(0, ix, torch.tanh(context[ix]+p['build_angle_embedding'][inputs['angle_choices']]))
+        context = context.index_copy(0, ix, context[ix]+p['build_angle_embedding'][inputs['angle_choices']])
     if len(plan['spatial_rows']):
         ix = inputs['spatial_rows']
-        cells = torch.tanh(maps[ix] + inputs['relative'] @ p['relative_w'])
-        if placement and inputs['build_spatial'].numel():
-            build = inputs['build_spatial']
-            cells = cells.index_copy(0, build, torch.tanh(cells[build]+inputs['build_features'] @ p['build_map_w']))
-        cell_logits = torch.bmm(cells, (context[ix] @ p['spatial_query']).unsqueeze(-1)).squeeze(-1)
-        record('cell', draw('cell', cell_logits/math.sqrt(config['map_hidden'])))
-        chosen = cells[inputs['spatial_range'], inputs['cell_choices']]
-        context = context.index_copy(0, ix, torch.tanh(context[ix]+chosen @ p['cell_context_w']))
-        record('offset', draw('offset', context[ix] @ p['offset_w']+p['offset_b']))
+        build = (inputs['build_spatial'], inputs['build_features']) if placement and inputs['build_spatial'].numel() else None
+        cells, logits = model.location(spatial[command[ix]], context[ix], build)
+        # One 256x256 distribution, scored as its map cell and then the offset within it.
+        record('cell', draw('cell', logits.logsumexp(dim=2)))
+        choices, side = inputs['cell_choices'], config['map_side']
+        chosen = cells[inputs['spatial_range'], :, torch.div(choices, side, rounding_mode='floor'), choices % side]
+        context = context.index_copy(0, ix, context[ix]+chosen @ p['cell_context_w'])
+        record('offset', draw('offset', logits[inputs['spatial_range'], choices]))
     if not placement and len(plan['angle_rows']):
         record('angle', draw('angle', context[inputs['angle_rows']] @ p['angle_w']+p['angle_b']))
-    return finish(delay_context.index_copy(0, command, context))
+    return outputs

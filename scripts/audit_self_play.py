@@ -55,7 +55,8 @@ def audit_rollout(path):
                                                                  'has_weapon', 'can_attack', 'has_atk_move_cmd', 'can_attack_move', 'dock_targets',
                                                                  'resume_targets', 'commands', 'command_cooldowns', 'command_targets',
                                                                  'enter_targets', 'container_id', 'occupants', 'capacity', 'upgrades',
-                                                                 'can_guard', 'repair_targets', 'repair_depots'))
+                                                                 'can_guard', 'repair_targets', 'repair_depots',
+                                                                 'weapon_cooldown_ticks', 'ticks_since_damage'))
                                 for e in observation['known_nonowned_entities']), 'Private enemy state leaked')
             for feedback in record['action_feedback']:
                 require(feedback['player'] in header['controlled_players'], 'Command issued to a built-in AI player')

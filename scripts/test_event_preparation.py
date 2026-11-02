@@ -29,7 +29,7 @@ class PreparationTests(unittest.TestCase):
             match = f'test:{index}'
             self.paths.append(path)
             self.sources.append(dict(path=str(path), sha256=_digest(path), match_key=match,
-                audit=dict(observation_policy_version=7, placement_mode='fast')))
+                audit=dict(observation_policy_version=8, placement_mode='fast')))
             rows = [raw_row(0, self.obs), raw_row(30, self.obs, [{'kind': 'stop', 'units': [10]}]),
                     raw_row(60, self.obs, terminal=True)]
             self.games.append(dict(path=str(path), player=2, map=self.terrain, rows=rows, source_ticks_per_second=60))
@@ -39,7 +39,7 @@ class PreparationTests(unittest.TestCase):
         _write_json(self.root/'config.json', self.config)
         _write_json(self.root/'catalog.json', {})
         self.addCleanup(patch.stopall)
-        patch('event_ingest.verify_entry', return_value=dict(audit=dict(observation_policy_version=7,
+        patch('event_ingest.verify_entry', return_value=dict(audit=dict(observation_policy_version=8,
                                                                         placement_mode='fast'))).start()
         patch('replay_loading.load_replays', side_effect=self.load).start()
 

@@ -15,7 +15,7 @@ import numpy as np
 
 from event_store import SCHEMA
 from generals_policy import ARCHITECTURE
-from prepared_io import _digest, _json_bytes, STATIC_MAP_COLUMNS
+from prepared_io import COMMON_FIELDS, _digest, _json_bytes
 from tensor_replay_store import ARRAY_FIELDS, LIST_FIELDS, MASK_FIELDS, decode_columns
 
 
@@ -50,8 +50,6 @@ def chunk_rows(columns, metadata, common, key):
     for name in columns:
         if '|' in name:
             variants.setdefault(name.partition('|')[0], []).append(views[name])
-    dynamic = views.get('e/map_dynamic')
-    other = None
     result = []
     for item, meta in enumerate(metadata):
         encoded = {}
@@ -68,17 +66,9 @@ def chunk_rows(columns, metadata, common, key):
                 chosen[name] = values[0]
         encoded.update({name[2:]: value for name, value in chosen.items() if name.startswith('e/')})
         encoded.update(meta['encoded'])
-        for name in ('low', 'span', 'map_coords'):
+        for name in COMMON_FIELDS:
             if name not in encoded and name in common:
                 encoded[name] = common[name]
-        if meta.get('shared_map'):
-            values = dynamic.at(item)
-            maps = np.empty(common['map_shape'], dtype=values.dtype)
-            if other is None:
-                other = [i for i in range(maps.shape[1]) if i not in STATIC_MAP_COLUMNS]
-            maps[:, STATIC_MAP_COLUMNS] = common['map_static']
-            maps[:, other] = values
-            encoded['map_inputs'] = np.frombuffer(maps.tobytes(), dtype=maps.dtype).reshape(maps.shape)
         target = meta['row']['target']
         mask = {'key': key, 'teacher': target}
         mask.update({name[2:]: value for name, value in chosen.items() if name.startswith('l/')})
@@ -164,7 +154,12 @@ class EventDataset:
             columns, metadata = read_member(archive, descriptor)
         if len(metadata) != descriptor['rows']:
             raise ValueError('Event column row count mismatch')
-        return chunk_rows(columns, metadata, self.shared[identity], self.key)
+        rows = chunk_rows(columns, metadata, self.shared[identity], self.key)
+        # Not stored in the shard: run_prepared_training.selection adds it from the replay.
+        enemy = tuple(entry.get('enemy_identity', (0, 0)))
+        for row in rows:
+            row['encoded']['enemy_identity'] = enemy
+        return rows
 
     def windows(self, split, *, seed, epoch, buffer_bytes=64*1024*1024):
         """Shuffled chunk references grouped into byte-bounded windows.

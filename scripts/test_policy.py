@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 from event_policy import EventActor
-from generals_policy import KINDS, NeuralPolicy
-from nn_numpy import Tensor, categorical, conv2d_same, scatter_mean, no_grad
+from generals_policy import ENTITY_FEATURES, KINDS, NeuralPolicy, map_planes
+from nn_numpy import Tensor, categorical, conv2d, conv_transpose2d, scatter_sum, no_grad
 from tensor_replay_store import Column, decode_columns, encode_columns
 from test_fixtures import entity, fixture, grid
 from torch_policy_v3 import TorchPolicyV3
@@ -70,13 +70,27 @@ class PrimitiveTests(unittest.TestCase):
         finite_difference(self, loss, (a, b), 6)
 
     def test_spatial_primitives_have_correct_derivatives(self):
-        value = Tensor(np.arange(12).reshape(4, 3)/10, requires_grad=True)
-        kernel = Tensor(np.linspace(-.3, .4, 54).reshape(27, 2), requires_grad=True)
+        rows = Tensor(np.arange(1, 13).reshape(4, 3)/10, requires_grad=True)
+        down = Tensor(np.linspace(-.3, .4, 96).reshape(2, 3, 4, 4), requires_grad=True)
+        up = Tensor(np.linspace(-.5, .2, 36).reshape(2, 2, 3, 3), requires_grad=True)
         def loss():
-            x = conv2d_same(value, kernel, 2).layer_norm().sigmoid()
-            pooled = scatter_mean(x, [0, 0, 1, 2], 3)
-            return (pooled.softmax(axis=1)*pooled).sum()
-        finite_difference(self, loss, (value, kernel), 5)
+            image = scatter_sum(rows, [0, 5, 5, 15], 4)
+            x = conv2d(image, down, 2, 1)
+            y = conv_transpose2d(x, up, 2, 1).relu()
+            return (y*y).sum()+y.reshape((2, -1)).logsumexp(axis=1).sum()
+        finite_difference(self, loss, (rows, down, up), 5)
+
+    def test_convolutions_match_torch(self):
+        rng = np.random.default_rng(3)
+        image = rng.normal(size=(3, 8, 8))
+        down, up = rng.normal(size=(5, 3, 4, 4)), rng.normal(size=(3, 2, 4, 4))
+        result = conv2d(image, down, 2, 1).data
+        expected = torch.nn.functional.conv2d(torch.tensor(image)[None], torch.tensor(down), stride=2, padding=1)[0]
+        np.testing.assert_allclose(result, expected.numpy(), rtol=1e-12)
+        result = conv_transpose2d(image, up, 2, 1).data
+        expected = torch.nn.functional.conv_transpose2d(torch.tensor(image)[None], torch.tensor(up), stride=2, padding=1)[0]
+        self.assertEqual(result.shape, (2, 16, 16))
+        np.testing.assert_allclose(result, expected.numpy(), rtol=1e-12)
 
 
 class PolicyTests(unittest.TestCase):
@@ -86,17 +100,17 @@ class PolicyTests(unittest.TestCase):
         self.encoded = self.policy.encoder.encode(self.obs, self.terrain, 6)
 
     def test_entity_grid_cells_preserve_boundaries(self):
-        policy = NeuralPolicy({**self.config, 'map_side': 16})
+        policy = NeuralPolicy(self.config)
         observation = copy.deepcopy(self.obs)
         prototype = observation['own_entities'][0]
-        positions = [-1., 0., np.nextafter(62.5, 0), 62.5, np.nextafter(62.5, 1000), 999.99, 1000., 1001.]
+        positions = [-1., 0., np.nextafter(31.25, 0), 31.25, np.nextafter(31.25, 1000), 999.99, 1000., 1001.]
         observation['own_entities'] = [{**copy.deepcopy(prototype), 'id': 100+i, 'position': [float(x), 0., 0.]}
                                        for i, x in enumerate(positions)]
         observation['known_nonowned_entities'] = []
         unchanged = copy.deepcopy(observation)
         encoded = policy.encoder.encode(observation, self.terrain, 6)
         self.assertFalse(encoded['rotated'])
-        for i, cell in enumerate((0, 0, 0, 1, 1, 15, 15, 15)):
+        for i, cell in enumerate((0, 0, 0, 1, 1, 31, 31, 31)):
             self.assertEqual(encoded['cells'][encoded['ids'][100+i]], cell)
         self.assertEqual(observation, unchanged)
 
@@ -104,9 +118,9 @@ class PolicyTests(unittest.TestCase):
         observation = copy.deepcopy(self.obs)
         observation['own_entities'] = observation['known_nonowned_entities'] = []
         encoded = self.policy.encoder.encode(observation, self.terrain, 6)
-        np.testing.assert_array_equal(encoded['numeric'], np.zeros((1, 14)))
+        np.testing.assert_array_equal(encoded['numeric'], np.zeros((1, ENTITY_FEATURES)))
         np.testing.assert_array_equal(encoded['cells'], [0])
-        self.assertFalse(encoded['map_inputs'][:, 5:9].any())
+        self.assertFalse(map_planes(encoded)[8:13].any())
         self.assertEqual(self.policy.decide(encoded, teacher={'kind': 'wait'})[1]['kind'], 'wait')
 
     def test_entity_ids_and_order_do_not_enter_network(self):
@@ -128,6 +142,7 @@ class PolicyTests(unittest.TestCase):
         other = copy.deepcopy(self.obs)
         for e in other['own_entities']+other['known_nonowned_entities']:
             e['position'][:2] = [1000-x for x in e['position'][:2]]
+            e['facing'] = np.pi
         other['own_entities'][0]['task']['destination'] = [700, 600, 0]
         other['last_submission']['position'] = [700, 600, 0]
         original = self.policy.target(self.encoded, ACTIONS[7])
@@ -135,7 +150,7 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(rotated['rotated'] and not self.encoded['rotated'])
         transformed = self.policy.target(rotated, [{**ACTIONS[7][0], 'position': [770, 650, 0], 'angle': .5+np.pi}])
         self.assertEqual(original, transformed)
-        for name in ('numeric', 'map_inputs', 'scalars', 'task_numeric', 'task_relation_features'):
+        for name in ('numeric', 'map_visibility', 'scalars', 'task_numeric', 'task_relation_features'):
             np.testing.assert_allclose(self.encoded[name], rotated[name], atol=1e-12, err_msg=name)
         a = self.policy.decide(self.encoded, teacher=original)[0][0]
         b = self.policy.decide(rotated, teacher=transformed)[0][0]
@@ -158,9 +173,10 @@ class PolicyTests(unittest.TestCase):
         obs['visibility_grid'] = [0]*1024
         terrain['supply_sources'] = [{'id': 123, 'type': 'SupplyDock', 'position': [500, 500, 0]}]
         encoded = self.policy.encoder.encode(obs, terrain, 600)
-        self.assertTrue((encoded['map_inputs'][:, 2] == 1).all())
-        self.assertTrue((encoded['map_inputs'][:, 3:5] == 0).all())
-        self.assertGreater(encoded['map_inputs'][:, 9].sum(), 0)
+        planes = map_planes(encoded)
+        self.assertTrue((planes[5] == 1).all())
+        self.assertTrue((planes[6:8] == 0).all())
+        self.assertGreater(planes[2].sum(), 0)
         self.assertFalse(encoded['visible_target'][encoded['ids'][100]])
         self.assertGreater(encoded['numeric'][encoded['ids'][100], 8], 0)
 

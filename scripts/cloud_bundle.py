@@ -27,7 +27,7 @@ PYTHON = '3.14'
 
 SETUP = f"""#!/usr/bin/env bash
 # Python {PYTHON}, torch {TORCH} (CUDA) and numpy {NUMPY}: the versions the workstation learner uses.
-# CUDA wheel index: cu130 for recent drivers; use cu128/cu126 if `nvidia-smi` shows an older CUDA.
+# CUDA wheel index: cu130 for recent drivers; use cu126 if `nvidia-smi` shows an older CUDA.
 set -euo pipefail
 cd "$(dirname "$0")"
 INDEX=${{TORCH_INDEX:-https://download.pytorch.org/whl/cu130}}
@@ -45,7 +45,7 @@ fi
 cd code && TEST_TORCH_DEVICE=cuda ../.venv/bin/python -m unittest \\
   test_event_policy test_event_training_batches test_scheduled_capture test_policy \\
   test_unit_tasks test_command_actions test_build_placement test_resume_construction \\
-  test_event_dataset test_compiled_learner
+  test_event_dataset test_compiled_learner test_enemy_and_clock
 """
 
 TRAIN = """#!/usr/bin/env bash
@@ -69,7 +69,7 @@ fi
 EXTRA=()
 if [ "$COMPILE" = 1 ]; then EXTRA+=(--compile); fi
 exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json --output run \\
-  --device cuda --epochs 20 --early-stopping-patience 3 --seed 123 --threads 1 \\
+  --device cuda --epochs 20 --early-stopping-patience 3 --min-delta 0.005 --seed 123 --threads 1 \\
   --batch-size 256 --buffer-mib 64 --pair-budget 8000000 --checkpoint-seconds 600 \\
   --lr-decay 0.3 --min-lr 0.00001 --precision "$PRECISION" "${EXTRA[@]}" \\
   --reader-processes "$READERS" --prefetch-batches 2 \\
@@ -79,7 +79,8 @@ exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json 
 
 # Learner widths measured on the RTX 5070 Ti. Model-only: the feature key and
 # shards are unchanged. '10m' is replay-runtime/policy.json's default.
-WIDTHS = {'10m': {}, '50m': dict(hidden=3456, entity_hidden=512, map_hidden=256, scalar_hidden=512)}
+WIDTHS = {'10m': {},
+          '50m': dict(hidden=3456, entity_hidden=512, map_hidden=256, scalar_hidden=512)}
 
 
 def link_or_copy(source, destination):
@@ -101,6 +102,8 @@ def main():
     parser.add_argument('--widths', default='10m',
                         help="Learner size: '10m', '50m' or a JSON object of model-only widths")
     args = parser.parse_args()
+    from engine_runtime import disable_power_throttling
+    disable_power_throttling()
     from event_store import MODEL_ONLY
     widths = WIDTHS[args.widths] if args.widths in WIDTHS else json.loads(args.widths)
     if not isinstance(widths, dict) or not set(widths) <= MODEL_ONLY:
@@ -134,6 +137,7 @@ def main():
                'feature_key': key, 'dataset_sha256': experiment.digest(output/'data/dataset.json'),
                'training': sum(e['split'] == 'train' for e in doc['entries']),
                'validation': sum(e['split'] == 'validation' for e in doc['entries']),
+               'enemy_unknown': sum(e['enemy_identity'] == [0, 0] for e in doc['entries']),
                'shard_bytes': sum(p.stat().st_size for p in shards), **linked, 'widths': widths,
                'python': PYTHON, 'torch': TORCH, 'numpy': NUMPY, 'seconds': time.time()-started}
     experiment.save(output/'bundle.json', summary)
