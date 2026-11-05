@@ -13,7 +13,7 @@ from collections import Counter
 from replay_storage import open_trajectory, manifest_path
 
 # Mirrors generals_policy.OBSERVATION_VERSION; this module stays importable without NumPy.
-OBSERVATION_VERSION = 8
+OBSERVATION_VERSION = 9
 
 
 def _finite_float(token):

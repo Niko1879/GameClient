@@ -35,6 +35,7 @@ FEATURE_CODE = (generals_policy.entity_key, generals_policy.initial_home, genera
                 NeuralPolicy.target_mask, NeuralPolicy.selection_mask, NeuralPolicy.verb_mask, NeuralPolicy.target)
 FEATURE_CONSTANTS = ('OBSERVATION_VERSION', 'KINDS', 'TARGET_KINDS', 'BUILDER_KINDS', 'GROUP_KINDS', 'SPATIAL_KINDS',
                      'COMMAND_KINDS', 'GUARD_KINDS', 'QUEUE_SLOTS', 'PAIR_FIELDS', 'ENTITY_FEATURES', 'EXTRA_ENTITY_FEATURES', 'ENTITY_UPGRADE_SLOTS',
+                     'ENTITY_COMMAND_SLOTS', 'SUPPLY_BOX_SCALE',
                      'SCALAR_FEATURES', 'MAP_CHANNELS')
 MODEL_ONLY = {'hidden', 'entity_hidden', 'embedding', 'attention_heads', 'map_hidden', 'scalar_hidden',
               'variant_l2', 'argument_loss_weights', 'delay_loss_weight'}

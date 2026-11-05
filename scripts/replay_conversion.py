@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT/'.cache/replay-converter'
 CATALOG = ROOT/'replays/catalog/replay-catalog.sqlite3'
 POLICY = ROOT/'replay-runtime/policy.json'
-ENGINE = ROOT/'replay-runtime/game/engine-ab1c9849e5c41595.exe'
-ENGINE_SHA = 'ab1c9849e5c41595ca9f2dffc3c2de60de2d6e285aed07c0181c4659f963a0f5'
+ENGINE = ROOT/'replay-runtime/game/engine-38d28ef349dc3237.exe'
+ENGINE_SHA = '38d28ef349dc3237dbc669e865f03a4192ef07810f85f32a9f3e6e75a3bc9d9c'
 ENGINE_HAS_REPLAY_SERVER = True
 DATA = ROOT/'training-data'
 RAW = ROOT/'replays/vanilla-china'
@@ -500,6 +500,9 @@ def worker_main(slot,inbox,outbox,identity):
                             evidence=dict(error=text[:4000],traceback=traceback.format_exc().splitlines()[-40:]))
                         # Valid raw data for this policy cannot be prepared; its
                         # original recording and failure remain in the catalogue.
+                        # A reused engine that finished the game can still hold its
+                        # export open (4 Nov: a locked .training.bin killed the service).
+                        session.close()
                         remove_owned(job_directory(job,identity))
                         (DATA/('.conversion-'+job['replay_sha256']+'.json')).unlink(missing_ok=True)
             # A finished job leaves reference cycles worth up to ~80 MiB; collecting takes ~10 ms.

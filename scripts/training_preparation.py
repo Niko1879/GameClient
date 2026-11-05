@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from event_schedule import delay_mask
-from generals_policy import (COMMAND_KINDS, DERIVED_ENTITY_FEATURES, KINDS, NeuralPolicy, command_target,
+from generals_policy import (COMMAND_KINDS, DERIVED_ENTITY_FEATURES, KINDS, UNRATED, NeuralPolicy, command_target,
                              count_channels, derived_inputs, visible_scalars, visible_task_commands)
 from training_legality import cached_legality
 
@@ -68,6 +68,9 @@ def encode_values(spec, encoded):
     statics, static_index, static_ids = [], np.zeros(batch, dtype=np.int64), {}
     slots = encoded[0]['entity_upgrades'].shape[1]
     upgrades = np.zeros((batch, count, slots), dtype=np.int64)
+    command_slots = encoded[0]['entity_commands'].shape[1]
+    commands = np.zeros((batch, count, command_slots), dtype=np.int64)
+    command_states = np.zeros((batch, count, command_slots, 2), dtype=spec.float_dtype)
     valid, real, own, visible = [np.zeros((batch, count), dtype=bool) for _ in range(4)]
     for index, row in enumerate(encoded):
         length = len(row['numeric'])
@@ -77,6 +80,7 @@ def encode_values(spec, encoded):
         numeric[index, :length, numeric_size:] = derived_inputs(row['numeric'])
         types[index, :length], queued[index, :length] = row['types'], row['queued_types']
         upgrades[index, :length] = row['entity_upgrades']
+        commands[index, :length], command_states[index, :length] = row['entity_commands'], row['entity_command_states']
         pixels[index, :length] = row['cells']
         valid[index, :length] = True  # Includes the reference's single empty-entity dummy.
         entities = row['entity_count'] if 'entity_count' in row else len(row['entities'])
@@ -106,10 +110,12 @@ def encode_values(spec, encoded):
         'map_visibility': (np.stack([row['map_visibility'] for row in encoded]).astype(np.int64), 'int64'),
         'scalars': (visible_scalars(np.stack([row['scalars'] for row in encoded])), 'float'),
         'entity_upgrades': (upgrades, 'int64'),
+        'entity_commands': (commands, 'int64'), 'entity_command_states': (command_states, 'float'),
         'player_flags': (np.stack([row['player_flags'] for row in encoded]), 'float'),
         'available_actions': (np.stack([available_actions(spec, row) for row in encoded]), 'float'),
         'identities': ([row['player_identity'] for row in encoded], 'int64'),
-        'enemy_identities': ([row.get('enemy_identity', (0, 0)) for row in encoded], 'int64')}
+        'enemy_identities': ([row.get('enemy_identity', (0, 0)) for row in encoded], 'int64'),
+        'ratings': (np.stack([np.asarray(row.get('ratings', UNRATED), dtype=spec.float_dtype) for row in encoded]), 'float')}
     # unit_tasks fills task inputs only for owned entities; every other
     # row is zero and adds exactly nothing. Stage owned rows compactly,
     # with relation targets as flat (row*count+entity) indices.

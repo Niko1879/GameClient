@@ -139,6 +139,7 @@ struct DirectSighting : training_sightings::Flags {
     float health = 0, maximumHealth = 0;
     float velocityX = 0, velocityY = 0, facing = 0;
     int veterancy = 0;
+    int supplyBoxes = 0;
     const ThingTemplate *typeTemplate = nullptr;
 };
 std::array<std::vector<DirectSighting>, MAX_PLAYER_COUNT> directSightings;
@@ -171,18 +172,21 @@ void refreshDirectSighting(DirectSighting &result, Object *object, unsigned fram
     result.velocityY = velocity.y;
     result.facing = object->getOrientation();
     result.veterancy = static_cast<int>(object->getVeterancyLevel());
+    result.supplyBoxes = supplyBoxes(object);
     result.visible = true;
 }
 
 void writeDirectSighting(DirectOutput &out, DirectCursor &parent, const DirectSighting &entity)
 {
     auto fields = out.object(parent, {"id", "type", "owner", "position", "health", "max_health",
-                                      "last_seen_frame", "visible", "own", "velocity_x", "velocity_y", "facing", "veterancy"});
+                                      "last_seen_frame", "visible", "own", "velocity_x", "velocity_y", "facing", "veterancy",
+                                      "supply_boxes"});
     out.put(fields, entity.id); out.put(fields, entity.type); out.put(fields, entity.owner);
     out.point(fields, &entity.position); out.put(fields, entity.health); out.put(fields, entity.maximumHealth);
     out.put(fields, entity.lastSeen); out.put(fields, entity.visible); out.put(fields, false);
     out.put(fields, entity.velocityX); out.put(fields, entity.velocityY);
     out.put(fields, entity.facing); out.put(fields, entity.veterancy);
+    out.put(fields, entity.supplyBoxes);
     fields.finish();
 }
 
@@ -196,12 +200,12 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
     const bool hasProducer = producer && producer->getControllingPlayer() == owner;
     const bool hasBuilder = builder && builder->getControllingPlayer() == owner;
     const char *names[] = {"id", "type", "owner", "position", "health", "max_health", "last_seen_frame", "visible", "own",
-        "velocity_x", "velocity_y", "facing", "veterancy", "task", "radius", "has_weapon", "weapon_cooldown_ticks", "ticks_since_damage",
+        "velocity_x", "velocity_y", "facing", "veterancy", "supply_boxes", "task", "radius", "has_weapon", "weapon_cooldown_ticks", "ticks_since_damage",
         "can_attack", "has_atk_move_cmd", "can_attack_move", "dock_targets", "resume_targets",
         "construction_percent", "ai_state", "production_queue", "buildable_templates", "trainable_templates",
         "commands", "command_cooldowns", "command_targets", "enter_targets", "container_id", "occupants", "capacity",
         "upgrades", "can_guard", "repair_targets", "repair_depots", hasProducer ? "producer_id" : "builder_id", "builder_id"};
-    const size_t count = 39+hasProducer+hasBuilder;
+    const size_t count = 40+hasProducer+hasBuilder;
     auto fields = out.writer.literalObject(out.buffer, parent.next(), names, count);
     out.put(fields, static_cast<unsigned>(object->getID())); out.put(fields, object->getTemplate()->getName().str());
     out.put(fields, owner ? static_cast<int>(owner->getPlayerIndex()) : -1);
@@ -211,6 +215,7 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
     const Coord3D velocity = objectVelocity(object);
     out.put(fields, velocity.x); out.put(fields, velocity.y);
     out.put(fields, object->getOrientation()); out.put(fields, static_cast<int>(object->getVeterancyLevel()));
+    out.put(fields, supplyBoxes(object));
     const CommandSet *set = commandSetFor(object, lookups);
     directTask(out, fields, object);
     ExportTimer capabilities(EXPORT_CAPABILITIES);
@@ -428,7 +433,7 @@ void directObservation(Player *player, unsigned frame, const Json &actions, Dire
     }
     for (const auto &cell : cells)
         out.put(visibility, static_cast<int>(ThePartitionManager->getShroudStatusForPlayer(index, cell.first, cell.second)));
-    out.put(root, 8);
+    out.put(root, 9);
     directContext(out, root, submissions, player, frame);
     directContext(out, root, validations, player, frame);
     if (fullPlacementMask) directPlacements(out, root, index, actions);

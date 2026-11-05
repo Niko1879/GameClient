@@ -257,7 +257,9 @@ def parse_replay(data):
 class Client:
     def __init__(self, delay=2, retries=3):
         self.opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        self.delay, self.retries, self.last_request = delay, retries, 0
+        # Pace each host separately: a match costs one strata page and one
+        # matchdata file, and neither host should wait on the other's gap.
+        self.delay, self.retries, self.last_request = delay, retries, {}
         self.robots = {}
 
     def request(self, url, payload=None, check_robots=True):
@@ -279,12 +281,14 @@ class Client:
             robot = self.robots[origin]
             if not robot.can_fetch("GeneralsAIReplayCollector", url):
                 raise ValueError(f"robots.txt disallows {url}")
-            delay = max(self.delay, robot.crawl_delay("*") or 0)
+            delay = max(self.delay, robot.crawl_delay("GeneralsAIReplayCollector") or 0)
         else:
             delay = self.delay
         for attempt in range(self.retries):
-            time.sleep(max(0, delay - (time.monotonic() - self.last_request)))
-            self.last_request = time.monotonic()
+            last = self.last_request.get(parsed.hostname)
+            if last is not None:
+                time.sleep(max(0, delay - (time.monotonic() - last)))
+            self.last_request[parsed.hostname] = time.monotonic()
             headers = {"User-Agent": "Mozilla/5.0 GeneralsAIReplayCollector/1.0"}
             body = None
             if payload is not None:

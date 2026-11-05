@@ -59,7 +59,7 @@ cd "$(dirname "$0")"
 GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 READERS=${READERS:-$(( $(nproc) > 4 ? 4 : $(nproc) - 1 ))}
 PRECISION=${PRECISION:-bf16}
-COMPILE=${COMPILE:-1}
+COMPILE=${COMPILE:-0}  # --compile works since the 4 Nov Inductor stride fix; speed on the v9 model not yet measured
 # Readers hand updates over in shared memory (~4 slots of >= 16 MiB each).
 SHM_MB=$(df -m /dev/shm | awk 'NR==2 {print $4}')
 if [ "$SHM_MB" -lt $(( READERS * 100 )) ]; then
@@ -69,7 +69,7 @@ fi
 EXTRA=()
 if [ "$COMPILE" = 1 ]; then EXTRA+=(--compile); fi
 exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json --output run \\
-  --device cuda --epochs 20 --early-stopping-patience 3 --min-delta 0.005 --seed 123 --threads 1 \\
+  --device cuda --epochs 20 --early-stopping-patience 5 --min-delta 0.005 --seed 123 --threads 1 \\
   --batch-size 256 --buffer-mib 64 --pair-budget 8000000 --checkpoint-seconds 600 \\
   --lr-decay 0.3 --min-lr 0.00001 --precision "$PRECISION" "${EXTRA[@]}" \\
   --reader-processes "$READERS" --prefetch-batches 2 \\

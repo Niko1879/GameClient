@@ -159,7 +159,14 @@ class TorchPolicyV3(nn.Module):
         # Empty upgrade slots (index 0) are masked out, as in the reference.
         slots = inputs['entity_upgrades']
         upgrades = (F.embedding(slots, p['upgrade_embedding']) * (slots > 0)[..., None].to(self.dtype)).sum(dim=2)
-        entity = torch.tanh(torch.cat([features, types, upgrades], dim=-1) @ p['entity_w'] + p['entity_b'])
+        # Per-button state, as generals_policy.entity_command_inputs: ready, or charging plus progress.
+        ids, states = inputs['entity_commands'], inputs['entity_command_states']
+        ready, progress = states[..., :1], states[..., 1:]
+        charging = (1-ready)*(ids > 0)[..., None].to(self.dtype)
+        commands = (F.embedding(ids, p['entity_command_ready_embedding'])*ready
+                    + (F.embedding(ids, p['entity_command_charging_embedding'])
+                       + F.embedding(ids, p['entity_command_progress_embedding'])*progress)*charging).sum(dim=2)
+        entity = torch.tanh(torch.cat([features, types, upgrades, commands], dim=-1) @ p['entity_w'] + p['entity_b'])
         from unit_tasks import RELATIONS
         hidden = config['entity_hidden']
         base = entity.reshape(batch*count, hidden)
@@ -194,6 +201,7 @@ class TorchPolicyV3(nn.Module):
         identities = inputs['enemy_identities']
         enemy = p['base_faction_embedding'][identities[:, 0]]+p['general_embedding'][identities[:, 1]]
         scalar = scalar + enemy @ p['enemy_identity_w']
+        scalar = scalar + inputs['ratings'] @ p['ratings_w']
         scalar = scalar + inputs['player_flags'] @ p['player_flags_w']
         counts = torch.zeros((batch, len(config['types'])), dtype=self.dtype, device=self.device).scatter_add(
             1, inputs['types'], inputs['real'])

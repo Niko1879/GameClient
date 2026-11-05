@@ -15,7 +15,7 @@ RUN=ROOT/'model-training'
 DATA=ROOT/'training-data'
 CATALOG=ROOT/'replays/catalog/replay-catalog.sqlite3'
 MANIFEST=DATA/'.model-training.json'
-ENGINE=ROOT/'replay-runtime/game/engine-ab1c9849e5c41595.exe'
+ENGINE=ROOT/'replay-runtime/game/engine-38d28ef349dc3237.exe'
 STOP=RUN/'stop.json'
 
 for name in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):os.environ[name]='1'
@@ -86,12 +86,25 @@ def selection(args):
             path=Path(row['storage_path']);path=path if path.is_absolute() else ROOT/path
             if path.is_file() and path.parent.resolve()==DATA.resolve() and path.stat().st_size==row['bytes']:
                 candidates.append(dict(row))
+        cleaning=None
+        if getattr(args,'cleaning',True):
+            # Raw-replay data cleaning (scripts/replay_cleaning.py): thresholds are
+            # applied now, so any setting reuses one scan of the archive.
+            from replay_cleaning import selection_filter
+            dropped,scanned,cleaning=selection_filter(**getattr(args,'cleaning_options',{}))
+            unscanned=sorted({r['match_key'] for r in candidates}-scanned)
+            if unscanned:raise ValueError(f'{len(unscanned)} candidates lack cleaning metrics (e.g. {unscanned[0]}); run replay_cleaning.py scan')
+            before=len(candidates);candidates=[r for r in candidates if r['match_key'] not in dropped]
+            cleaning.update(candidates_before=before,candidates_after=len(candidates))
         reused=None
         if args.validation_from:
             reused={e['match_key'] for e in load(args.validation_from)['entries'] if e['split']=='validation'}
             if len(reused)!=args.validation:raise ValueError('Reused validation set has a different size')
         selected=choose(candidates,args.training,args.validation,args.seed,protected,protected_shas,reused)
         entries=[];profile_cache={};deployment=None
+        # Model rating inputs (generals_policy.rating_inputs), joined per match from the raw-replay scan.
+        from replay_cleaning import player_ratings
+        ratings=player_ratings()
         for ordinal,row in enumerate(selected,1):
             if STOP.exists():raise InterruptedError('Experiment stop requested')
             if row['profile_id'] not in profile_cache:
@@ -105,11 +118,12 @@ def selection(args):
             if entry['index']['source']['replay_sha256']!=row['replay_sha256']:
                 raise ValueError('Catalogue entry differs from original replay identity')
             entry['enemy_identity']=list(model.encoder.identity.player_identity(enemy_faction(entry['index']['source']['original_replay'])))
+            entry['ratings']=ratings.get(row['match_key'],{})
             entries.append(entry)
         doc=dict(schema=1,kind='generals_event_dataset',complete=True,config=policy,deployment=deployment,
             capability_catalog_sha256=next(iter(profile_cache.values()))['capability_catalog_sha256'],entries=entries,
             selection=dict(seed=args.seed,training=args.training,validation=args.validation,
-                split_policy='fresh_whole_match_and_raw_hash',feature_key=key))
+                split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning))
         return doc,key
     finally:db.close()
 
@@ -313,7 +327,16 @@ def main():
     parser.add_argument('--lr-decay',type=float,default=1.0,help='Learning-rate factor after each epoch without validation improvement (1 disables)')
     parser.add_argument('--min-lr',type=float,default=0.0)
     parser.add_argument('--validation-from',help='Reuse the validation matches of an earlier dataset manifest')
+    parser.add_argument('--no-cleaning',dest='cleaning',action='store_false',help='Select without the raw-replay cleaning filter')
+    parser.add_argument('--cleaning-option',action='append',default=[],metavar='NAME=VALUE',
+        help='Override a replay_cleaning threshold, e.g. checks=afk,early_end or early_end_minutes=4')
     args=parser.parse_args()
+    from replay_cleaning import DEFAULTS as cleaning_defaults
+    args.cleaning_options={}
+    for item in args.cleaning_option:
+        name,_,value=item.partition('=')
+        if name not in cleaning_defaults:parser.error('Unknown cleaning option '+name)
+        args.cleaning_options[name]=type(cleaning_defaults[name])(value)
     if min(args.training,args.validation,args.patience)<1 or args.max_epochs<0:parser.error('Positive splits/patience and nonnegative epoch ceiling required')
     if not 0<args.lr_decay<=1 or args.min_lr<0:parser.error('Learning-rate decay must be in (0, 1] and the floor nonnegative')
     if args.background:

@@ -166,7 +166,9 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         size = queries.shape[-1]
         hidden, cell = queries.new_zeros((count, size)), queries.new_zeros((count, size))
         outputs_by_step = []
-        for step in range(int(inputs['unit_prefixes'].max())+1):
+        # The step count comes from the host-side plan: reading the staged
+        # tensor here would synchronise with the GPU in every microbatch.
+        for step in range(max(plan['values']['unit_prefixes'][0])+1):
             gates = queries[:, step] @ p['unit_lstm_input_w']+hidden @ p['unit_lstm_hidden_w']+p['unit_lstm_b']
             cell = torch.sigmoid(gates[:, size:2*size])*cell+torch.sigmoid(gates[:, :size])*torch.tanh(gates[:, 2*size:3*size])
             hidden = torch.sigmoid(gates[:, 3*size:])*torch.tanh(cell)

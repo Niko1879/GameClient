@@ -33,6 +33,33 @@ PRECISIONS = ('fp32', 'tf32', 'bf16', 'fp16')
 PHASES = ((0, 5), (5, 10), (10, 15), (15, 20), (20, 30), (30, None))
 
 
+def stride_order_with_shape_env():
+    """Work around a torch 2.14 Inductor bug that kills --compile on real data.
+
+    graph.py's run_node sorts a lowered view's strides with ir.get_stride_order
+    but no shape env, so plain sympy compares them. A one-row microbatch saves
+    masks such as (slots > 0)[..., None] as [1, s1, 4, 1] with strides
+    (4*s1, 4, 1, 1), and sympy cannot decide 1 < s1 ("cannot determine truth
+    value of Relational"). lowering.py already passes V.graph.sizevars.shape_env;
+    this supplies it at the call sites that omit it, which guards on the
+    comparison like every other symbolic stride decision.
+    """
+    import torch._inductor.ir as ir
+    from torch._inductor.virtualized import V
+    if getattr(ir.get_stride_order, 'with_shape_env', False):
+        return
+    original = ir.get_stride_order
+    def get_stride_order(seq, shape_env=None):
+        if shape_env is None:
+            try:
+                shape_env = V.graph.sizevars.shape_env
+            except (AttributeError, AssertionError):
+                pass
+        return original(seq, shape_env)
+    get_stride_order.with_shape_env = True
+    ir.get_stride_order = get_stride_order
+
+
 def phase(row):
     minutes = row['frame']/row.get('source_ticks_per_second', 60)/60
     low, high = next(bounds for bounds in PHASES if bounds[1] is None or minutes < bounds[1])
@@ -78,6 +105,7 @@ class EventLearner:
             import importlib.util
             if device != 'cuda' or torch.version.hip is not None or importlib.util.find_spec('triton') is None:
                 raise ValueError('--compile needs an NVIDIA CUDA device with Triton')
+            stride_order_with_shape_env()
             self.model.encode_inputs = torch.compile(self.model.encode_inputs, dynamic=True)
         self.pair_budget = pair_budget
         # FP16 autocast keeps FP32 master weights and Adam state; dynamic loss

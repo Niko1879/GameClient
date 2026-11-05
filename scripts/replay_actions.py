@@ -12,16 +12,23 @@ from replay_training import audit, records
 class ReplayActionAdapter:
     def __init__(self, catalog):
         self.catalog = {str(k): v for k, v in catalog.items()}
-        self.selected = []
+        self.selected = None
         self.teams = {}
 
     def decode(self, sample):
-        actions, unsupported, rejected_builds = [], [], 0
+        actions, unsupported, rejected_builds, rejected_trains = [], [], 0, 0
         if not sample['actions']:
             # Quiet observations cannot change selection/team state. Their
             # body stays deferred until the event selector needs a DEFER.
-            return dict(actions=[], unsupported=[], imitation_loss_mask=True, rejected_build_requests=0)
+            return dict(actions=[], unsupported=[], imitation_loss_mask=True, rejected_build_requests=0,
+                        rejected_train_requests=0)
         own_rows = sample['observation']['own_entities']
+        if self.selected is None:
+            # Multiplayer start selects each player's first Command Center in
+            # logic without a replay message (GameLogic::startNewGame,
+            # findAndSelectCommandCenter). Only command samples change
+            # selection, so the first one still sees that start state.
+            self.selected = [e['id'] for e in own_rows if e.get('type', '').endswith('CommandCenter')][:1]
         other_rows = sample['observation'].get('known_nonowned_entities', [])
         owned = own_rows.ids() if hasattr(own_rows, 'ids') else {e['id'] for e in own_rows}
         visible = owned | (other_rows.ids(visible_only=True) if hasattr(other_rows, 'ids')
@@ -126,6 +133,12 @@ class ReplayActionAdapter:
                     if name == 'MSG_DOZER_CONSTRUCT':
                         actions.append({'kind': 'build', 'builder': units[0], 'template': template,
                                         'position': values[1], 'angle': values[2]})
+                    elif template not in next(e for e in own_rows if e['id'] == units[0])['trainable_templates']:
+                        # The engine ignores a queue its own canMakeUnit/queue check
+                        # refuses (full queue, no money, unit cap), which is what
+                        # trainable_templates reports at dispatch: spam clicks, not
+                        # demonstrations. Like a rejected build, it is UI noise.
+                        rejected_trains += 1
                     else:
                         actions.append({'kind': 'train', 'producer': units[0], 'template': template})
                 else:
@@ -137,7 +150,7 @@ class ReplayActionAdapter:
         if len(actions) > 16 or any(len(a.get('units', [])) > 64 for a in actions):
             loss_mask = False
         return {'actions': actions, 'unsupported': unsupported, 'imitation_loss_mask': loss_mask,
-                'rejected_build_requests': rejected_builds}
+                'rejected_build_requests': rejected_builds, 'rejected_train_requests': rejected_trains}
 
 
 def iter_demonstrations(path, *, validate=True, player=None, validated=False):

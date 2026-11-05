@@ -14,7 +14,7 @@ from audit_replay_commands import reconcile
 def fixture():
     header = {"record": "header", "schema_version": 1, "controlled_faction": "FactionChina", "ticks_per_second": 60,
               "placement_mode": "fast", "quiet_capture": "all",
-              "observation_policy": {"version": 8, "excluded_templates": [], "visible_only_templates": [],
+              "observation_policy": {"version": 9, "excluded_templates": [], "visible_only_templates": [],
                                      "neutral_excluded_templates": [], "playable_players": [2, 3]}}
     terrain = {"record": "map", "grid_size": 1, "height": [0], "cliff": [False]}
     sighting = {"id": 10, "owner": 2, "own": False, "visible": True,
@@ -22,7 +22,7 @@ def fixture():
     sample = {"record": "sample", "frame": 6, "player_index": 3, "delta_ticks": 0, "time_seconds": 0.1,
               "observation": {"player": {"index": 3, "faction": "FactionChina"}, "own_entities": [],
                               "known_nonowned_entities": [sighting], "visibility_grid": [0],
-                              "observation_policy_version": 8},
+                              "observation_policy_version": 9},
               "decision": "commands", "actions": [{"name": "MSG_DO_MOVETO", "arguments": []}]}
     wait = copy.deepcopy(sample)
     wait.update(frame=12, delta_ticks=6, time_seconds=0.2, decision="wait", actions=[])
@@ -183,7 +183,7 @@ class TrainingAuditTests(unittest.TestCase):
         for row in rows[2:4]:
             row['observation']['known_nonowned_entities'][0]['type'] = 'ChinaVehicleDozer'
         self.write(rows)
-        self.assertEqual(audit(self.path, level='full')['observation_policy_version'], 8)
+        self.assertEqual(audit(self.path, level='full')['observation_policy_version'], 9)
 
     def test_declared_effect_filter_is_enforced_for_owned_and_remembered_objects(self):
         for owned in (False, True):
@@ -206,7 +206,7 @@ class TrainingAuditTests(unittest.TestCase):
         for row in rows[2:4]:
             row['observation']['known_nonowned_entities'][0].update(type='CivilianBuilding', owner=1)
         self.write(rows)
-        self.assertEqual(audit(self.path, level='full')['observation_policy_version'], 8)
+        self.assertEqual(audit(self.path, level='full')['observation_policy_version'], 9)
 
     def test_foliage_cannot_enter_owned_or_remembered_entity_lists(self):
         for owned in (False, True):

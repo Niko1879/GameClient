@@ -19,7 +19,7 @@ ARRAY_FIELDS = ('numeric', 'extra_numeric', 'types', 'queued_types',
                 'map_static', 'low', 'span', 'build_mask', 'build_signature', 'build_features',
                 'task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features',
                 'task_commands', 'task_command_templates', 'task_command_template_present',
-                'entity_upgrades', 'player_flags', 'purchasable_sciences')
+                'entity_upgrades', 'entity_commands', 'entity_command_states', 'player_flags', 'purchasable_sciences')
 MASK_FIELDS = ('owners', 'visible', 'verb', 'actor', 'unit_masks', 'target',
                'template', 'command', 'science', 'slot', 'cell', 'offset')
 LIST_FIELDS = ('unit_choices', 'selected')

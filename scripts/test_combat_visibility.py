@@ -43,7 +43,7 @@ class CombatVisibilityTests(unittest.TestCase):
             def save():
                 path.write_text(''.join(json.dumps(r)+'\n' for r in rows), encoding='utf-8')
             save()
-            self.assertEqual(audit(path, level='full')["observation_policy_version"], 8)
+            self.assertEqual(audit(path, level='full')["observation_policy_version"], 9)
             rows[3]['observation']['known_nonowned_entities'][0]['position'][0] += 10
             save()
             with self.assertRaisesRegex(ValueError, 'Hidden sighting changed'):

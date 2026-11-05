@@ -29,7 +29,7 @@ class IngestTests(unittest.TestCase):
             raw.write_bytes(b'original'+bytes([i])); export.write_bytes(b'export'+bytes([i]))
             match = f'test:{i}'
             proof = dict(path=str(export), original_replay=str(raw), sha256=_digest(export),
-                replay_sha256=_digest(raw), match_key=match, audit=dict(observation_policy_version=8, placement_mode='fast'))
+                replay_sha256=_digest(raw), match_key=match, audit=dict(observation_policy_version=9, placement_mode='fast'))
             self.proofs[str(export)] = proof
             self.games[str(export)] = dict(path=str(export), player=2, map=terrain, source_ticks_per_second=60,
                 rows=[raw_row(0, obs), raw_row(30, obs, [{'kind':'stop','units':[10]}]), raw_row(60, obs, terminal=True)])
@@ -82,7 +82,7 @@ class IngestTests(unittest.TestCase):
         next(iter(self.proofs.values()))['audit']['observation_policy_version'] = 5
         with self.assertRaisesRegex(ValueError, 'different observation version'):
             self.prepare()
-        next(iter(self.proofs.values())).update(audit=dict(observation_policy_version=8, placement_mode='fast'))
+        next(iter(self.proofs.values())).update(audit=dict(observation_policy_version=9, placement_mode='fast'))
         self.config.update(placement_mode='full_mask', build_snap_radius=0.0)
         _write_json(self.root/'config.json', self.config)
         with self.assertRaisesRegex(ValueError, 'full-mask exports'):

@@ -22,7 +22,7 @@ from generals_identity import IdentityHierarchy, in_production_scope, validate_p
 from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum
 
 ARCHITECTURE = 'generals-relational-v4-event'
-OBSERVATION_VERSION = 8
+OBSERVATION_VERSION = 9
 KINDS = ('wait', 'move', 'attack_move', 'attack', 'stop', 'sell', 'build', 'train', 'rally', 'dock',
          'resume_construction', 'upgrade', 'science', 'ability', 'enter', 'exit', 'evacuate',
          'guard', 'guard_air', 'cancel_production', 'cancel_construction', 'scatter', 'add_waypoint',
@@ -41,13 +41,23 @@ QUEUE_SLOTS = 9
 PAIR_FIELDS = {'dock': 'dock_targets', 'enter': 'enter_targets', 'repair': 'repair_targets',
                'get_repaired': 'repair_depots'}
 COMMAND_KINDS = ('upgrade', 'ability')
-ENTITY_FEATURES = 21
+ENTITY_FEATURES = 22
 # Divides world units per second, so a fast ground unit is near 1.
 VELOCITY_SCALE = 100
 # Numeric columns read back when building model inputs.
 OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN, COOLDOWN_COLUMN, UNDER_ATTACK_COLUMN = 5, 6, 7, 14, 15
 EXTRA_ENTITY_FEATURES = 14
 ENTITY_UPGRADE_SLOTS = 4
+# Upgrade/ability buttons per owned entity: (available, ready fraction) each. Vanilla
+# China's command center has the most (its menu plus the faction shortcuts, 14).
+ENTITY_COMMAND_SLOTS = 16
+# A full supply dock holds a few hundred boxes.
+SUPPLY_BOX_SCALE = 8
+# Pre-match Overall ladder rating, the player's and the opponent's: (rating-centre)/scale
+# and a rated flag each. Vanilla China players, 3 Nov 2026: median 1094, sd 291, 20%
+# unrated. Live play conditions on the 95th percentile (1730) against an unrated opponent.
+RATING_CENTER, RATING_SCALE, PLAY_RATING = 1100, 300, 1730
+RATING_FEATURES = 4
 SCALAR_FEATURES = 16
 # since_decision and since_command stay in stored scalars but never reach the model:
 # quiet rows are kept at most 120 ticks apart, so these clocks give away wait vs command.
@@ -121,6 +131,31 @@ def visible_task_commands(commands):
     visible = np.array(commands)
     visible[..., 1+len(COMMANDS)] = 0
     return visible
+
+
+def entity_command_inputs(p, ids, states, e):
+    """Sum over an entity's command slots: ready buttons, or charging ones scaled by progress."""
+    flat = ids.reshape(-1)
+    ready = states[..., 0].reshape(-1, 1)
+    charging = Tensor((1-ready)*(flat[:, None] > 0))
+    slots = (p['entity_command_ready_embedding'][flat]*Tensor(ready)
+             + (p['entity_command_charging_embedding'][flat]
+                + p['entity_command_progress_embedding'][flat]*Tensor(states[..., 1].reshape(-1, 1)))*charging)
+    return slots.reshape((len(ids), ids.shape[1], e)).sum(axis=1)
+
+
+def rating_inputs(own, opponent):
+    """Model rating inputs from two pre-match ratings; None is unrated."""
+    values = []
+    for rating in (own, opponent):
+        if rating is None:
+            values += [0., 0.]
+        else:
+            values += [float(np.clip((rating-RATING_CENTER)/RATING_SCALE, -3, 5)), 1.]
+    return np.asarray(values)
+
+
+UNRATED = rating_inputs(None, None)
 
 
 def position_bits(xy):
@@ -197,6 +232,8 @@ class Encoder:
         self.types = {name: i for i, name in enumerate(config['types'])}
         self.identity = IdentityHierarchy(config)
         self.upgrade_ids = {name: i+1 for i, name in enumerate(config['upgrades'])}
+        # Row 0 is the empty command slot.
+        self.command_ids = {name: i+1 for i, name in enumerate(config['commands'])}
         # Per-game inputs, found by the identity of the game's terrain record.
         self._extent, self._static, self._player, self._home = None, {}, {}, None
         self._menus = {}
@@ -344,7 +381,9 @@ class Encoder:
                 mirror*column('velocity_x', 0)*source_ticks_per_second/VELOCITY_SCALE*np.asarray(visibles, dtype=float),
                 mirror*column('velocity_y', 0)*source_ticks_per_second/VELOCITY_SCALE*np.asarray(visibles, dtype=float),
                 mirror*np.sin(facing), mirror*np.cos(facing),
-                column('veterancy', 0) / 3])
+                column('veterancy', 0) / 3,
+                # Public: a seen pile's depletion; a fogged sighting keeps its last count.
+                np.log1p(column('supply_boxes')) / SUPPLY_BOX_SCALE])
         else:
             # A zero row keeps pooling and pointer shapes defined after defeat.
             numeric = np.asarray([[0] * ENTITY_FEATURES])
@@ -375,6 +414,9 @@ class Encoder:
         base = self._static_map(terrain, low, high, span, rotated)
         upgrade_ids, catalog_types = self.upgrade_ids, self.types
         entity_upgrades = np.zeros((max(real_count, 1), ENTITY_UPGRADE_SLOTS), dtype=int)
+        entity_commands = np.zeros((max(real_count, 1), ENTITY_COMMAND_SLOTS), dtype=int)
+        command_states = np.zeros((max(real_count, 1), ENTITY_COMMAND_SLOTS, 2))
+        command_ids = self.command_ids
         info = self.config['command_info']
         grid_xy = np.clip((numeric[:real_count, :2] * side).astype(int), 0, side-1)
         cells = (grid_xy[:, 1]*side+grid_xy[:, 0]).tolist()
@@ -394,6 +436,17 @@ class Encoder:
             kinds = [info.get(name, ('', ''))[0] for name in commands]
             charging = e.get('command_cooldowns', [])
             capacity = e.get('capacity', 0)
+            # Each button's own state: ready now, or charging with its progress
+            # (Red Guard capture, Dragon Tank firewall, general's powers).
+            # Evacuate is outside the command vocabulary.
+            slots = sorted([(command_ids[name], 1., 1.) for name in commands if name in command_ids]
+                           + [(command_ids[c['command']], 0., min(max(c['ready_percent'], 0), 100)/100)
+                              for c in charging if c['command'] in command_ids])
+            if len(slots) > ENTITY_COMMAND_SLOTS:
+                raise ValueError('Entity has more commands than command slots')
+            if slots:
+                entity_commands[index, :len(slots)] = [slot[0] for slot in slots]
+                command_states[index, :len(slots)] = [slot[1:] for slot in slots]
             extra_index.append(index)
             extra_rows.append([has_build, has_train,
                                min(len(e.get('buildable_templates', [])), 20)/20,
@@ -420,7 +473,8 @@ class Encoder:
         encoded.update(map_visibility=visibility, map_static=base, cells=np.asarray(cells or [0]),
                        extra_numeric=extra,
                        queued_types=np.asarray(queued_types or [0]),
-                       entity_upgrades=entity_upgrades, player_flags=player_flags,
+                       entity_upgrades=entity_upgrades, entity_commands=entity_commands,
+                       entity_command_states=command_states, player_flags=player_flags,
                        purchasable_sciences=purchasable_sciences,
                        player_identity=self.identity.player_identity(p['faction']))
         from unit_tasks import encode
@@ -485,10 +539,14 @@ class NeuralPolicy:
         self.parameters['base_faction_embedding'].data[0] = 0
         b('general_embedding', (len(vocab['generals']), e))
         b('variant_embedding', (len(vocab['objects']), e))
-        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+3*e, d)); b('entity_b', d)
+        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+4*e, d)); b('entity_b', d)
         # Row 0 is the empty upgrade slot; it is masked out of every sum.
         w('upgrade_embedding', (len(config['upgrades'])+1, e), .5)
         self.parameters['upgrade_embedding'].data[0] = 0
+        # Per-entity buttons: ready, or charging plus progress. Row 0 is the empty slot.
+        for name in ('entity_command_ready', 'entity_command_charging', 'entity_command_progress'):
+            w(name+'_embedding', (len(config['commands'])+1, e), .5)
+            self.parameters[name+'_embedding'].data[0] = 0
         w('player_flags_w', (len(config['upgrades'])+2*len(config['sciences']), s), .2)
         ar, f, key = head_sizes(config)
         kinds, delays = len(KINDS), len(config['delay_ticks'])
@@ -517,6 +575,7 @@ class NeuralPolicy:
         w('scalar_w', (SCALAR_FEATURES, s)); b('scalar_b', s)
         w('player_identity_w', (e, s), .5, generator=identity_rng)
         w('enemy_identity_w', (e, s), .5, generator=identity_rng)
+        w('ratings_w', (RATING_FEATURES, s), .5)
         w('unit_counts_w', (len(config['types']), s), .2)
         w('available_actions_w', (kinds, s), .2)
         # scalar_context: what AlphaStar gates its action head and autoregressive embedding with.
@@ -988,10 +1047,12 @@ class NeuralPolicy:
         slots = encoded['entity_upgrades']
         filled = Tensor((slots.reshape(-1) > 0).astype(float)[:, None])
         upgrades = (p['upgrade_embedding'][slots.reshape(-1)]*filled).reshape((len(slots), slots.shape[1], e)).sum(axis=1)
+        commands = entity_command_inputs(p, encoded['entity_commands'], encoded['entity_command_states'], e)
         base = (Tensor(features) @ p['entity_w'][:offset]
                 + self.type_embedding(encoded['types']) @ p['entity_w'][offset:offset+e]
                 + self.type_embedding(encoded['queued_types']) @ p['entity_w'][offset+e:offset+2*e]
                 + upgrades @ p['entity_w'][offset+2*e:offset+3*e]
+                + commands @ p['entity_w'][offset+3*e:offset+4*e]
                 + p['entity_b']).tanh()
         from unit_tasks import RELATIONS
         addition = Tensor(encoded['task_numeric']) @ p['task_w']
@@ -1027,6 +1088,8 @@ class NeuralPolicy:
         faction, general = encoded.get('enemy_identity', (0, 0))
         enemy = p['base_faction_embedding'][faction]+p['general_embedding'][general]
         scalar = scalar + enemy @ p['enemy_identity_w']
+        # Set per game by the dataset or the live actor; absent means both unrated.
+        scalar = scalar + Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)) @ p['ratings_w']
         scalar = scalar + Tensor(encoded['player_flags']) @ p['player_flags_w']
         counts = np.bincount(np.asarray(encoded['types'])[:len(encoded['entities'])], minlength=len(self.config['types']))
         available = Tensor(np.asarray(self.verb_mask(encoded), dtype=float))

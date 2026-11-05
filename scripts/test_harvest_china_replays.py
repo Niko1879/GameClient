@@ -42,6 +42,25 @@ class HarvestTests(unittest.TestCase):
                 "replay_url": "https://matchdata.playgenerals.online/replays/match_42.rep",
                 "factions": factions or ["China", "GLA"], "text": "example"}
 
+    def test_client_paces_each_host_separately(self):
+        class Response:
+            def __init__(self, url): self.url = url
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+            def read(self, limit): return b"ok"
+        client = h.Client(delay=2)
+        robot = h.RobotFileParser(); robot.parse(["User-agent: *", "Disallow:"])
+        client.robots = {"https://strata.gamereplays.org": robot, "https://" + h.REPLAY_HOST: robot}
+        clock, sleeps = [100.0], []
+        def sleep(seconds):
+            sleeps.append(round(seconds, 3)); clock[0] += seconds
+        with patch.object(h.time, "monotonic", lambda: clock[0]), patch.object(h.time, "sleep", sleep),                 patch.object(client.opener, "open", lambda request, timeout: Response(request.full_url)):
+            client.request(h.BASE + "/zh/match/1")
+            client.request("https://" + h.REPLAY_HOST + "/r/1.rep")
+            client.request(h.BASE + "/zh/match/2")
+        # The second host is not held back by the first; the same host still waits its full gap.
+        self.assertEqual([s for s in sleeps if s], [2.0])
+
     def test_rows_distinguish_vanilla_and_generals_and_decode_attributes(self):
         parser = h.parse_page('''<tr wire:key="match-1"><td>
           <img alt="China Tank"><img alt="China">

@@ -14,7 +14,7 @@ import zipfile
 import numpy as np
 
 from event_store import SCHEMA
-from generals_policy import ARCHITECTURE
+from generals_policy import ARCHITECTURE, UNRATED, rating_inputs
 from prepared_io import COMMON_FIELDS, _digest, _json_bytes
 from tensor_replay_store import ARRAY_FIELDS, LIST_FIELDS, MASK_FIELDS, decode_columns
 
@@ -83,6 +83,12 @@ def chunk_rows(columns, metadata, common, key):
         encoded['_training_legality'] = mask
         result.append({**meta['row'], 'encoded': encoded})
     return result
+
+
+def player_rating_inputs(ratings):
+    """{player index: model rating inputs}: own rating first, then the other player's."""
+    return {player: rating_inputs(rating, next((other for key, other in ratings.items() if key != player), None))
+            for player, rating in ratings.items()}
 
 
 class EventDataset:
@@ -157,8 +163,12 @@ class EventDataset:
         rows = chunk_rows(columns, metadata, self.shared[identity], self.key)
         # Not stored in the shard: run_prepared_training.selection adds it from the replay.
         enemy = tuple(entry.get('enemy_identity', (0, 0)))
+        # Pre-match ratings by player index (None: unrated), set by run_prepared_training.selection
+        # like enemy_identity; each row is one player's view.
+        inputs = player_rating_inputs(entry.get('ratings', {}))
         for row in rows:
             row['encoded']['enemy_identity'] = enemy
+            row['encoded']['ratings'] = inputs.get(str(row['player']), UNRATED)
         return rows
 
     def windows(self, split, *, seed, epoch, buffer_bytes=64*1024*1024):

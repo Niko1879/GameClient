@@ -56,6 +56,7 @@ def decisions(rows, config, counts, validate=None, observe=None):
         counts['source_observations'] += 1
         frame, actions = row['frame'], row['actions']
         counts['rejected_build_requests'] += row.get('rejected_build_requests', 0)
+        counts['rejected_train_requests'] += row.get('rejected_train_requests', 0)
         if previous_source_frame is not None:
             if frame <= previous_source_frame:
                 raise ValueError('Event observations must advance in source time')

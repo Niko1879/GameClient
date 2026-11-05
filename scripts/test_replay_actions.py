@@ -14,7 +14,8 @@ def command(name, *values):
 
 
 def sample(*commands):
-    return {'actions': list(commands), 'observation': {'own_entities': [{'id': 1}, {'id': 2}]}}
+    return {'actions': list(commands), 'observation': {'own_entities': [
+        {'id': 1}, {'id': 2, 'trainable_templates': ['ChinaInfantryRedguard']}]}}
 
 
 class ReplayAdapterTests(unittest.TestCase):
@@ -67,12 +68,36 @@ class ReplayAdapterTests(unittest.TestCase):
                                             command('MSG_QUEUE_UNIT_CREATE', 8, 555)))
         self.assertEqual(result['actions'], [{'kind': 'train', 'producer': 2, 'template': 'ChinaInfantryRedguard'}])
 
+    def test_train_the_engine_refuses_is_ui_noise(self):
+        # A full queue or no money: the engine ignores the order, as it does a rejected build.
+        refused = sample(command('MSG_CREATE_SELECTED_GROUP', True, 2), command('MSG_QUEUE_UNIT_CREATE', 8, 555))
+        refused['observation']['own_entities'][1]['trainable_templates'] = []
+        result = self.adapter.decode(refused)
+        self.assertEqual((result['actions'], result['unsupported']), ([], []))
+        self.assertEqual(result['rejected_train_requests'], 1)
+        self.assertFalse(result['imitation_loss_mask'])
+
     def test_missing_selection_and_template_are_masked(self):
         result = self.adapter.decode(sample(command('MSG_DO_MOVETO', [1, 2, 0])))
         self.assertFalse(result['imitation_loss_mask'])
         result = self.adapter.decode(sample(command('MSG_CREATE_SELECTED_GROUP', True, 1),
                                             command('MSG_DOZER_CONSTRUCT', 999, [1, 2, 0], 0)))
         self.assertFalse(result['imitation_loss_mask'])
+
+    def test_game_starts_with_command_center_selected(self):
+        # Replays carry no selection message for the opening dozer queue.
+        opening = {'actions': [command('MSG_QUEUE_UNIT_CREATE', 9, 1)],
+                   'observation': {'own_entities': [{'id': 3, 'type': 'ChinaVehicleDozer'},
+                                                    {'id': 4, 'type': 'ChinaCommandCenter',
+                                                     'trainable_templates': ['ChinaVehicleDozer']}]}}
+        adapter = ReplayActionAdapter({'9': 'ChinaVehicleDozer'})
+        result = adapter.decode(opening)
+        self.assertEqual(result['actions'], [{'kind': 'train', 'producer': 4, 'template': 'ChinaVehicleDozer'}])
+        self.assertTrue(result['imitation_loss_mask'])
+        # Later selection messages replace it as usual.
+        result = adapter.decode(dict(opening, actions=[command('MSG_CREATE_SELECTED_GROUP', True, 3),
+                                                       command('MSG_DO_MOVETO', [1, 2, 0])]))
+        self.assertEqual(result['actions'], [{'kind': 'move', 'units': [3], 'position': [1, 2, 0]}])
 
     def test_stream_reuses_each_players_selection_and_adapter(self):
         def row(player, frame, *commands):

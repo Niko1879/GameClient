@@ -10,7 +10,9 @@ import numpy as np
 import torch
 
 from event_policy import EventActor
-from generals_policy import ENTITY_FEATURES, KINDS, NeuralPolicy, map_planes
+from generals_policy import (ENTITY_COMMAND_SLOTS, ENTITY_FEATURES, KINDS, SUPPLY_BOX_SCALE, UNRATED, NeuralPolicy,
+                             map_planes, rating_inputs)
+from event_dataset import player_rating_inputs
 from nn_numpy import Tensor, categorical, conv2d, conv_transpose2d, scatter_sum, no_grad
 from tensor_replay_store import Column, decode_columns, encode_columns
 from test_fixtures import entity, fixture, grid
@@ -180,6 +182,35 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(encoded['visible_target'][encoded['ids'][100]])
         self.assertGreater(encoded['numeric'][encoded['ids'][100], 8], 0)
 
+    def test_each_command_keeps_its_own_readiness_and_supply_is_seen(self):
+        obs = copy.deepcopy(self.obs)
+        obs['own_entities'][1].update(commands=['Command_UpgradeChinaRadar', 'Command_ChinookUnload'],
+                                      command_cooldowns=[{'command': 'Command_ArtilleryBarrage', 'ready_percent': 40.0}])
+        obs['known_nonowned_entities'][0]['supply_boxes'] = 300
+        encoded = self.policy.encoder.encode(obs, self.terrain, 6)
+        ids, center, enemy = self.policy.encoder.command_ids, encoded['ids'][20], encoded['ids'][99]
+        # Sorted by command id; evacuate is outside the command vocabulary.
+        self.assertEqual(encoded['entity_commands'][center, :2].tolist(),
+                         [ids['Command_ArtilleryBarrage'], ids['Command_UpgradeChinaRadar']])
+        self.assertEqual(encoded['entity_command_states'][center, :2].tolist(), [[0, .4], [1, 1]])
+        self.assertFalse(encoded['entity_commands'][center, 2:].any())
+        self.assertFalse(encoded['entity_commands'][encoded['ids'][10]].any())
+        self.assertAlmostEqual(encoded['numeric'][enemy, ENTITY_FEATURES-1], np.log1p(300)/SUPPLY_BOX_SCALE)
+        self.assertEqual(encoded['numeric'][encoded['ids'][100], ENTITY_FEATURES-1], 0)
+        obs['own_entities'][1]['command_cooldowns'] = [{'command': 'Command_Capture', 'ready_percent': 0}]*(ENTITY_COMMAND_SLOTS+1)
+        with self.assertRaisesRegex(ValueError, 'command slots'):
+            self.policy.encoder.encode(obs, self.terrain, 6)
+
+    def test_ratings_are_per_player_with_unrated_flags(self):
+        np.testing.assert_allclose(rating_inputs(1700, None), [2, 1, 0, 0])
+        np.testing.assert_allclose(rating_inputs(500, 9000), [-2, 1, 5, 1])
+        self.assertFalse(UNRATED.any())
+        mirror = player_rating_inputs({'2': 1400, '3': None})
+        np.testing.assert_allclose(mirror['2'], [1, 1, 0, 0])
+        np.testing.assert_allclose(mirror['3'], [0, 0, 1, 1])
+        decision = self.policy.decide({**self.encoded, 'ratings': rating_inputs(1730, None)}, deterministic=True)
+        self.assertEqual(len(decision), 6)
+
     def test_masks_use_owner_capabilities_mobility_and_structures(self):
         own = self.encoded['ids']
         self.assertTrue(self.policy.actor_mask(self.encoded, 'move')[own[10]])
@@ -223,9 +254,15 @@ class AgreementTests(unittest.TestCase):
     def check(self, placement_mode):
         config, obs, terrain = fixture(placement_mode)
         policy = NeuralPolicy(config, 5)
+        # Ready and charging buttons, and a seen supply count, reach both implementations.
+        obs['own_entities'][1].update(commands=['Command_UpgradeChinaRadar'],
+                                      command_cooldowns=[{'command': 'Command_ArtilleryBarrage', 'ready_percent': 40.0}])
+        obs['known_nonowned_entities'][0]['supply_boxes'] = 300
         if placement_mode == 'full_mask':
             obs['build_placements'] = [grid(np.ones((16, 16), bool), angle=angle, frame=6) for angle in range(16)]
         rows = examples(policy, obs, terrain)
+        for i, row in enumerate(rows):
+            row['encoded']['ratings'] = rating_inputs(1500+100*i, None if i % 2 else 900)
         model = TorchPolicyV3(policy, dtype=torch.float64)
         encoded = [row['encoded'] for row in rows]
         output = model.teacher_heads(encoded, [row['target'] for row in rows], *model.events(encoded))

@@ -6,7 +6,7 @@ import numpy as np
 
 from event_schedule import canonical_frame, native_deadline
 from generals_identity import vanilla_china_production
-from generals_policy import ARCHITECTURE, OBSERVATION_VERSION, initial_home
+from generals_policy import ARCHITECTURE, OBSERVATION_VERSION, PLAY_RATING, initial_home, rating_inputs
 from nn_numpy import no_grad
 from replay_sequences import normalize_demonstration
 
@@ -68,6 +68,7 @@ class EventActor:
         self.home_position = None
         self.rate = 60
         self.enemy_identity = (0, 0)
+        self.ratings = rating_inputs(PLAY_RATING, None)
         self.counters = Counter()
         self.last = {}
 
@@ -78,6 +79,10 @@ class EventActor:
     def configure_enemy(self, faction):
         """The opponent's native faction name, as a lobby shows it; None or a random pick is unknown."""
         self.enemy_identity = self.policy.encoder.identity.player_identity(faction)
+
+    def configure_ratings(self, own=PLAY_RATING, opponent=None):
+        """Pre-match ratings to condition on; None is unrated (the default opponent)."""
+        self.ratings = rating_inputs(own, opponent)
 
     @property
     def next_deadline_native(self):
@@ -96,6 +101,7 @@ class EventActor:
             home_position=self.home_position, source_ticks_per_second=self.rate)
         encoded['event_rate'] = self.rate
         encoded['enemy_identity'] = self.enemy_identity
+        encoded['ratings'] = self.ratings
         if self.policy.config['placement_mode'] == 'full_mask':
             if not hasattr(self, 'placement_query'):
                 raise ValueError('Placement-aware event actor needs a placement-capable environment')

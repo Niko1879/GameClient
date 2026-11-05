@@ -28,6 +28,7 @@
 #include "GameLogic/AIStateMachine.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/SupplyTruckAIUpdate.h"
+#include "GameLogic/Module/SupplyWarehouseDockUpdate.h"
 #include "GameLogic/Module/StealthUpdate.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/ProductionUpdate.h"
@@ -704,6 +705,16 @@ Coord3D objectVelocity(const Object *object)
     return physics ? *physics->getVelocity() : Coord3D{0, 0, 0};
 }
 
+// Boxes left in a supply dock, pile or warehouse; 0 for every other object.
+// Seen depletion is public: a sighting keeps the count from its last view.
+int supplyBoxes(const Object *object)
+{
+    if (!object->isKindOf(KINDOF_SUPPLY_SOURCE)) return 0;
+    static const NameKeyType key = NAMEKEY("SupplyWarehouseDockUpdate");
+    const auto *warehouse = static_cast<const SupplyWarehouseDockUpdate *>(object->findUpdateModule(key));
+    return warehouse ? warehouse->getBoxesStored() : 0;
+}
+
 // Frames until the current weapon can fire again; 0 when ready or unarmed.
 unsigned weaponCooldownTicks(const Object *object, unsigned frame)
 {
@@ -725,7 +736,7 @@ Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookup
     Player *owner = object->getControllingPlayer();
     BodyModuleInterface *body = object->getBodyModule();
     ExportTimer base(EXPORT_ENTITY_BASE);
-    if (!j.is_object() || j.value("own", !own) != own) j = reservedObject(own ? 38 : 13);
+    if (!j.is_object() || j.value("own", !own) != own) j = reservedObject(own ? 39 : 14);
     j["id"] = static_cast<unsigned>(object->getID());
     setString(j["type"], object->getTemplate()->getName().str());
     j["owner"] = owner ? static_cast<int>(owner->getPlayerIndex()) : -1;
@@ -740,6 +751,7 @@ Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookup
     j["velocity_y"] = velocity.y;
     j["facing"] = object->getOrientation();
     j["veterancy"] = static_cast<int>(object->getVeterancyLevel());
+    j["supply_boxes"] = supplyBoxes(object);
     base.stop();
     if (own) {
         // No game tick or INI override occurs during this read-only snapshot.
@@ -1065,7 +1077,7 @@ Json observation(Player *player, unsigned frame, Json result = Json())
     result["own_entities"] = std::move(own);
     result["known_nonowned_entities"] = std::move(known);
     result["visibility_grid"] = std::move(visibility);
-    result["observation_policy_version"] = 8;
+    result["observation_policy_version"] = 9;
     result["last_submission"] = commandContext(submissions, player, frame, std::move(result["last_submission"]));
     result["last_validation"] = commandContext(validations, player, frame, std::move(result["last_validation"]));
     return result;
@@ -1361,7 +1373,7 @@ Json observationPolicy()
     for (int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
         if (ThePlayerList->getNthPlayer(i)->isPlayableSide()) playable.push_back(i);
     Json result = reservedObject(8);
-    result["version"] = 8;
+    result["version"] = 9;
     result["excluded_templates"] = std::move(excluded);
     result["visible_only_templates"] = std::move(visibleOnly);
     // These templates are omitted unless a playable side controls the object.

@@ -32,7 +32,7 @@ def task(kind='idle', **changes):
 
 def entity(identifier, name, own, position, visible=True, **changes):
     row = {'id': identifier, 'type': name, 'own': own, 'owner': 2 if own else 3, 'position': position,
-           'health': 100, 'max_health': 100, 'visible': visible, 'last_seen_frame': 1}
+           'health': 100, 'max_health': 100, 'visible': visible, 'last_seen_frame': 1, 'supply_boxes': 0}
     if own:
         mobile = name != 'ChinaCommandCenter'
         row.update(construction_percent=-1, production_queue=[], task=task(), radius=10,
