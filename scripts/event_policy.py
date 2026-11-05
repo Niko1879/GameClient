@@ -68,7 +68,10 @@ class EventActor:
         self.home_position = None
         self.rate = 60
         self.enemy_identity = (0, 0)
-        self.ratings = rating_inputs(PLAY_RATING, None)
+        # Training is ranked matches only, so both sides are always rated: an
+        # unrated opponent would be an input the model never saw. Default to an
+        # evenly matched rated game.
+        self.ratings = rating_inputs(PLAY_RATING, PLAY_RATING)
         self.counters = Counter()
         self.last = {}
 
@@ -80,8 +83,11 @@ class EventActor:
         """The opponent's native faction name, as a lobby shows it; None or a random pick is unknown."""
         self.enemy_identity = self.policy.encoder.identity.player_identity(faction)
 
-    def configure_ratings(self, own=PLAY_RATING, opponent=None):
-        """Pre-match ratings to condition on; None is unrated (the default opponent)."""
+    def configure_ratings(self, own=PLAY_RATING, opponent=PLAY_RATING):
+        """Pre-match ratings to condition on (default: an evenly matched rated game).
+
+        None marks a side unrated; ranked-only training never shows that, so
+        pass it only for a model trained with unrated matches."""
         self.ratings = rating_inputs(own, opponent)
 
     @property

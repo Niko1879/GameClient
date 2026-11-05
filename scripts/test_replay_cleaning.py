@@ -65,6 +65,18 @@ class CleaningTest(unittest.TestCase):
                          [{'seasonal': 935, 'overall': 921}, {'seasonal': 913, 'overall': 886}])
         self.assertEqual(listing_ratings('94 China mGic^ VS GLA Toxin YOUSIF Twilight Flame 1v1 6:50',
                                          ['China', 'GLA Toxin']), [{}, {}])
+        # Stats tracking disabled: no ladder figures can be read, so the side is unrated.
+        self.assertIsNone(listing_ratings('53 Stats tracking was disabled for this match. It does not count '
+                                          'towards player stats or leagues. GLA Stealth BigBoss VS China Medonho '
+                                          '[RANK] TD Classic NoCars ZH v1 1v1 9:12', ['GLA Stealth', 'China']))
+
+    def test_only_rated_ladder_matches_are_selected_by_default(self):
+        import replay_cleaning
+        self.assertIn('unrated', replay_cleaning.DEFAULTS['checks'].split(','))
+        game = row(play([(1, 'MSG_DO_MOVETO', [])]*11))
+        self.assertEqual(player_flags(game, game['players'][0], OPTS, NAMES), [])
+        del game['players'][0]['rating']
+        self.assertEqual(player_flags(game, game['players'][0], OPTS, NAMES), ['unrated'])
 
 
 if __name__ == '__main__':

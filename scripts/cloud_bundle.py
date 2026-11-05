@@ -9,7 +9,10 @@ Gameplay checks stay local: the native engine is Windows-only.
 
   python -B scripts/cloud_bundle.py --output D:/bundles/v7-all --validation 1000
   python -B scripts/cloud_bundle.py --output ... --training 15000 --validation 1000
-  python -B scripts/cloud_bundle.py --output ... --widths 50m     # 50.1M-parameter learner
+  python -B scripts/cloud_bundle.py --output ... --widths wide    # wider trunk (94.7M parameters on 5 Nov)
+
+bundle.json records the learner's parameter count, which changes as inputs and
+heads are added; the preset names deliberately carry no size.
 """
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ fi
 cd code && TEST_TORCH_DEVICE=cuda ../.venv/bin/python -m unittest \\
   test_event_policy test_event_training_batches test_scheduled_capture test_policy \\
   test_unit_tasks test_command_actions test_build_placement test_resume_construction \\
-  test_event_dataset test_compiled_learner test_enemy_and_clock
+  test_event_dataset test_compiled_learner test_enemy_and_clock test_prepared_training test_learner_bench
 """
 
 TRAIN = """#!/usr/bin/env bash
@@ -53,13 +56,16 @@ TRAIN = """#!/usr/bin/env bash
 # resource limits. Extra arguments are appended, e.g. --resume run/latest.npz.
 # Resume needs identical settings: keep PRECISION, COMPILE and READERS unchanged.
 # Defaults from the RTX 5070 Ti benchmark (scripts/cloud_training.md): BF16 with
-# the compiled encoder was fastest; 4 readers supply ~20k rows/s on a modern CPU.
+# the compiled encoder was fastest. 8 readers were the steadiest on a 5090 + 9950X (5 Nov).
 set -euo pipefail
 cd "$(dirname "$0")"
 GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-READERS=${READERS:-$(( $(nproc) > 4 ? 4 : $(nproc) - 1 ))}
+READERS=${READERS:-$(( $(nproc) >= 12 ? 8 : ($(nproc) > 4 ? 4 : $(nproc) - 1) ))}
 PRECISION=${PRECISION:-bf16}
-COMPILE=${COMPILE:-0}  # --compile works since the 4 Nov Inductor stride fix; speed on the v9 model not yet measured
+COMPILE=${COMPILE:-1}  # v9, 5090 + 9950X (5 Nov): +16% over eager; the first ~250 updates recompile
+# Validation rounds per epoch; PATIENCE counts rounds, so scale it with VALIDATIONS.
+VALIDATIONS=${VALIDATIONS:-1}
+PATIENCE=${PATIENCE:-5}
 # Readers hand updates over in shared memory (~4 slots of >= 16 MiB each).
 SHM_MB=$(df -m /dev/shm | awk 'NR==2 {print $4}')
 if [ "$SHM_MB" -lt $(( READERS * 100 )) ]; then
@@ -69,7 +75,8 @@ fi
 EXTRA=()
 if [ "$COMPILE" = 1 ]; then EXTRA+=(--compile); fi
 exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json --output run \\
-  --device cuda --epochs 20 --early-stopping-patience 5 --min-delta 0.005 --seed 123 --threads 1 \\
+  --device cuda --epochs 20 --early-stopping-patience "$PATIENCE" --validations-per-epoch "$VALIDATIONS" \\
+  --min-delta 0.005 --seed 123 --threads 1 \\
   --batch-size 256 --buffer-mib 64 --pair-budget 8000000 --checkpoint-seconds 600 \\
   --lr-decay 0.3 --min-lr 0.00001 --precision "$PRECISION" "${EXTRA[@]}" \\
   --reader-processes "$READERS" --prefetch-batches 2 \\
@@ -77,10 +84,11 @@ exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json 
   --max-gpu-mib $(( GPU_MIB * 9 / 10 )) --stop-file run/stop "$@"
 """
 
-# Learner widths measured on the RTX 5070 Ti. Model-only: the feature key and
-# shards are unchanged. '10m' is replay-runtime/policy.json's default.
-WIDTHS = {'10m': {},
-          '50m': dict(hidden=3456, entity_hidden=512, map_hidden=256, scalar_hidden=512)}
+# Model-only widths: the feature key and shards are unchanged. 'default' is
+# replay-runtime/policy.json's own (28.5M parameters on 5 Nov; 10.4M when the
+# presets were first measured, 28 Oct); 'wide' was 50.1M then and is 94.7M now.
+WIDTHS = {'default': {},
+          'wide': dict(hidden=3456, entity_hidden=512, map_hidden=256, scalar_hidden=512)}
 
 
 def link_or_copy(source, destination):
@@ -99,8 +107,8 @@ def main():
     parser.add_argument('--validation', type=int, default=1000)
     parser.add_argument('--seed', type=int, default=123)
     parser.add_argument('--validation-from', help='Reuse the validation matches of an earlier dataset.json')
-    parser.add_argument('--widths', default='10m',
-                        help="Learner size: '10m', '50m' or a JSON object of model-only widths")
+    parser.add_argument('--widths', default='default',
+                        help="Learner size: 'default', 'wide' or a JSON object of model-only widths")
     args = parser.parse_args()
     from engine_runtime import disable_power_throttling
     disable_power_throttling()
@@ -117,6 +125,8 @@ def main():
     started = time.time()
     doc, key = experiment.selection(args)
     doc['config'] = {**doc['config'], **widths}
+    from generals_policy import NeuralPolicy
+    parameters = sum(value.data.size for value in NeuralPolicy(doc['config'], args.seed).parameters.values())
     linked = {'linked': 0, 'copied': 0}
     for entry in doc['entries']:
         source = experiment.DATA/entry['path']
@@ -139,6 +149,7 @@ def main():
                'validation': sum(e['split'] == 'validation' for e in doc['entries']),
                'enemy_unknown': sum(e['enemy_identity'] == [0, 0] for e in doc['entries']),
                'shard_bytes': sum(p.stat().st_size for p in shards), **linked, 'widths': widths,
+               'parameters': parameters,
                'python': PYTHON, 'torch': TORCH, 'numpy': NUMPY, 'seconds': time.time()-started}
     experiment.save(output/'bundle.json', summary)
     print(json.dumps(summary, indent=2))

@@ -556,7 +556,8 @@ def main():
         metadata = dict(sources=[entry['index']['source'] for entry in dataset.entries],
                         event_dataset_sha256=dataset.digest, event_settings=settings,
                         event_match_partitions={e['match_key']:e['split'] for e in dataset.entries},
-                        event_cursor=dict(epoch=0, position=list(cursor)), event_epoch_counts=dict(totals))
+                        event_cursor=dict(epoch=0, position=list(cursor), validations=0),
+                        event_round_counts=dict(totals))
         tracemalloc.start()
         with tempfile.TemporaryDirectory(dir=args.output) as temporary:
             path = Path(temporary)/'checkpoint.npz'

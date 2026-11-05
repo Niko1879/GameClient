@@ -100,10 +100,8 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     batch, count = plan['batch'], plan['command_count']
     placement = config['placement_mode'] == 'full_mask'
 
-    def draw(name, logits, start=None, stop=None):
+    def draw(name, logits):
         mask, choices = inputs[name+'_mask'], inputs[name+'_choices']
-        if start is not None:
-            mask, choices = mask[start:stop], choices[start:stop]
         return categorical(logits, mask, choices, details=not loss_only,
                            predict=not loss_only or name in ('decision', 'event_delay'))
 
@@ -140,11 +138,9 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     # A censored teacher delay is unknown: later arguments do not see the placeholder.
     ar = ar+(x @ p['delay_embed_out_w']+p['delay_embed_out_b'])*inputs['delay_known'][:, None]
 
-    def record(name, values, *, start=None, stop=None):
+    def record(name, values):
         lp, ent, prediction = values
         global_rows, ix = plan['categories'][name], inputs[name+'_global']
-        if start is not None:
-            global_rows, ix = global_rows[start:stop], ix[start:stop]
         previous = outputs['by_head'].get(name, torch.zeros(batch, dtype=model.dtype, device=model.device))
         outputs['by_head'][name] = previous.index_add(0, ix, lp)
         np.add.at(outputs['head_counts'].setdefault(name, np.zeros(batch, dtype=int)), global_rows, 1)
@@ -163,24 +159,25 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     steps = ar[command][:, None]+torch.cat([torch.zeros_like(steps[:, :1]), steps], dim=1)
     if plan['unit_tokens']:
         queries = F.relu(steps @ p['unit_in_w']+p['unit_in_b']+func[:, None]) @ p['unit_query_w']+p['unit_query_b']
-        size = queries.shape[-1]
-        hidden, cell = queries.new_zeros((count, size)), queries.new_zeros((count, size))
-        outputs_by_step = []
         # The step count comes from the host-side plan: reading the staged
         # tensor here would synchronise with the GPU in every microbatch.
-        for step in range(max(plan['values']['unit_prefixes'][0])+1):
-            gates = queries[:, step] @ p['unit_lstm_input_w']+hidden @ p['unit_lstm_hidden_w']+p['unit_lstm_b']
-            cell = torch.sigmoid(gates[:, size:2*size])*cell+torch.sigmoid(gates[:, :size])*torch.tanh(gates[:, 2*size:3*size])
-            hidden = torch.sigmoid(gates[:, 3*size:])*torch.tanh(cell)
-            outputs_by_step.append(hidden)
-        lstm_outputs = torch.stack(outputs_by_step, dim=1)
-    for start in range(0, plan['unit_tokens'], 256):
-        stop = start+256
-        rows, prefixes = inputs['unit_rows'][start:stop], inputs['unit_prefixes'][start:stop]
-        query = lstm_outputs[rows, prefixes]
-        scores = torch.bmm(keys[rows], query.unsqueeze(-1)).squeeze(-1)
-        unit_logits = torch.cat([scores, (query @ p['unit_end_key']).unsqueeze(-1)], dim=1)
-        record('unit', draw('unit', unit_logits, start, stop), start=start, stop=stop)
+        length = max(plan['values']['unit_prefixes'][0])+1
+        # One fused LSTM over every selection step (cuDNN/MIOpen on a GPU)
+        # instead of a dozen kernels per step. The gate layout is PyTorch's
+        # (input, forget, cell, output); the single bias goes in b_ih. cuDNN
+        # flattens the weights with views, so they must be contiguous.
+        zeros = queries.new_zeros((1, count, queries.shape[-1]))
+        bias = p['unit_lstm_b']
+        weights = [p['unit_lstm_input_w'].T.contiguous(), p['unit_lstm_hidden_w'].T.contiguous()]
+        lstm_outputs = torch.lstm(queries[:, :length].contiguous(), (zeros, zeros),
+                                  [*weights, bias, torch.zeros_like(bias)],
+                                  True, 1, 0.0, torch.is_grad_enabled(), False, True)[0]
+        # Every step scored against its command's entities in one product: the
+        # same dot products as gathering a key block per token, without the
+        # (tokens, entities, width) gather and its scatter in the backward pass.
+        logits = torch.cat([torch.bmm(lstm_outputs, keys.transpose(1, 2)),
+                            (lstm_outputs @ p['unit_end_key']).unsqueeze(-1)], dim=2)
+        record('unit', draw('unit', logits[inputs['unit_rows'], inputs['unit_prefixes']]))
     context = steps[inputs['command_range'], inputs['selected_lengths']]
 
     if len(plan['science_rows']):

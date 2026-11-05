@@ -68,12 +68,11 @@ def choose(candidates,training,validation,seed,protected_keys=(),protected_shas=
 
 def selection(args):
     """(dataset document, feature key) for args.training/validation/seed; shards stay in training-data/."""
-    from replay_catalog import connect,document_bytes
+    from replay_catalog import connect
     from event_store import feature_identity
     from event_dataset import EventDataset
     from generals_policy import NeuralPolicy
     policy=load(ROOT/'replay-runtime/policy.json')
-    from enemy_side import enemy_faction
     model=NeuralPolicy(policy,parameters=False)
     key=feature_identity(model)
     db=connect(CATALOG);db.row_factory=__import__('sqlite3').Row
@@ -101,31 +100,38 @@ def selection(args):
             reused={e['match_key'] for e in load(args.validation_from)['entries'] if e['split']=='validation'}
             if len(reused)!=args.validation:raise ValueError('Reused validation set has a different size')
         selected=choose(candidates,args.training,args.validation,args.seed,protected,protected_shas,reused)
-        entries=[];profile_cache={};deployment=None
-        # Model rating inputs (generals_policy.rating_inputs), joined per match from the raw-replay scan.
-        from replay_cleaning import player_ratings
-        ratings=player_ratings()
-        for ordinal,row in enumerate(selected,1):
-            if STOP.exists():raise InterruptedError('Experiment stop requested')
-            if row['profile_id'] not in profile_cache:
-                sha=db.execute('SELECT document_sha256 FROM prepared_profile WHERE profile_id=?',(row['profile_id'],)).fetchone()[0]
-                profile_cache[row['profile_id']]=json.loads(document_bytes(db,sha))
-            profile=profile_cache[row['profile_id']]
-            if deployment is None:deployment=profile['deployment']
-            if profile['deployment']!=deployment:raise ValueError('Selected shards have different live deployment identities')
-            entry=json.loads(document_bytes(db,row['entry_document_sha256']))
-            entry.update(path=Path(row['storage_path']).name,split=row['split'])
-            if entry['index']['source']['replay_sha256']!=row['replay_sha256']:
-                raise ValueError('Catalogue entry differs from original replay identity')
-            entry['enemy_identity']=list(model.encoder.identity.player_identity(enemy_faction(entry['index']['source']['original_replay'])))
-            entry['ratings']=ratings.get(row['match_key'],{})
-            entries.append(entry)
-        doc=dict(schema=1,kind='generals_event_dataset',complete=True,config=policy,deployment=deployment,
-            capability_catalog_sha256=next(iter(profile_cache.values()))['capability_catalog_sha256'],entries=entries,
-            selection=dict(seed=args.seed,training=args.training,validation=args.validation,
-                split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning))
+        doc=document(db,selected,policy,model)
+        doc['selection']=dict(seed=args.seed,training=args.training,validation=args.validation,
+            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning)
         return doc,key
     finally:db.close()
+
+
+def document(db,selected,policy,model):
+    """Dataset document for selected prepared_shard rows (each with its 'split'); primary-key reads only."""
+    from replay_catalog import document_bytes
+    from enemy_side import enemy_faction
+    entries=[];profile_cache={};deployment=None
+    # Model rating inputs (generals_policy.rating_inputs), joined per match from the raw-replay scan.
+    from replay_cleaning import player_ratings
+    ratings=player_ratings()
+    for row in selected:
+        if STOP.exists():raise InterruptedError('Experiment stop requested')
+        if row['profile_id'] not in profile_cache:
+            sha=db.execute('SELECT document_sha256 FROM prepared_profile WHERE profile_id=?',(row['profile_id'],)).fetchone()[0]
+            profile_cache[row['profile_id']]=json.loads(document_bytes(db,sha))
+        profile=profile_cache[row['profile_id']]
+        if deployment is None:deployment=profile['deployment']
+        if profile['deployment']!=deployment:raise ValueError('Selected shards have different live deployment identities')
+        entry=json.loads(document_bytes(db,row['entry_document_sha256']))
+        entry.update(path=Path(row['storage_path']).name,split=row['split'])
+        if entry['index']['source']['replay_sha256']!=row['replay_sha256']:
+            raise ValueError('Catalogue entry differs from original replay identity')
+        entry['enemy_identity']=list(model.encoder.identity.player_identity(enemy_faction(entry['index']['source']['original_replay'])))
+        entry['ratings']=ratings.get(row['match_key'],{})
+        entries.append(entry)
+    return dict(schema=1,kind='generals_event_dataset',complete=True,config=policy,deployment=deployment,
+        capability_catalog_sha256=next(iter(profile_cache.values()))['capability_catalog_sha256'],entries=entries)
 
 
 def freeze(args):

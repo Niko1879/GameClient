@@ -133,6 +133,24 @@ class EventTests(unittest.TestCase):
         expected = self.policy.encoder.encode(self.obs, self.terrain, 3, previous_frame=2)
         np.testing.assert_array_equal(chosen[-1]['encoded']['scalars'], expected['scalars'])
 
+    def test_actor_conditions_on_a_rated_opponent_by_default(self):
+        from generals_policy import PLAY_RATING, rating_inputs
+        actor = EventActor(self.policy)
+        rated = rating_inputs(PLAY_RATING, PLAY_RATING)
+        # Both 'rated' flags set: ranked-only training never shows an unrated side.
+        self.assertEqual(rated[1::2].tolist(), [1, 1])
+        np.testing.assert_array_equal(actor.ratings, rated)
+        actor.configure_ratings(1500, None)
+        np.testing.assert_array_equal(actor.ratings, rating_inputs(1500, None))
+        actor.configure_ratings()
+        np.testing.assert_array_equal(actor.ratings, rated)
+        actor.reset()
+        np.testing.assert_array_equal(actor.ratings, rated)
+        trace = ([], {'kind': 'wait', 'delay': 7}, None, Tensor(0), Tensor(0), Tensor(0))
+        with patch.object(self.policy, 'decide', return_value=trace) as decide:
+            actor.act(self.obs, self.terrain, 0)
+        np.testing.assert_array_equal(decide.call_args[0][0]['ratings'], rated)
+
     def test_uncapped_actor_keeps_learned_delay_after_acceptance_or_rejection(self):
         for delay in (1, 90):
             for accepted in (False, True):
@@ -270,7 +288,7 @@ class EventTests(unittest.TestCase):
             stopped = train(SimpleNamespace(**settings, output=str(root/'stopped'), stop_file=str(stop_file)))
             self.assertEqual(stopped['status'], 'interrupted')
             self.assertEqual(stopped['optimizer_updates'], 0)
-            self.assertEqual(stopped['cursor'], {'epoch':0, 'position':[0,0]})
+            self.assertEqual(stopped['cursor'], {'epoch':0, 'position':[0,0], 'validations':0})
             stop_file.unlink()
             continued = train(SimpleNamespace(**{**settings, 'resume': stopped['checkpoint']},
                 output=str(root/'stopped'), stop_file=str(stop_file)))

@@ -10,9 +10,12 @@ cutoff never needs a rescan. Checks (all thresholds are flags of `report`):
   (which player self-destructed, i.e. surrendered/quit, or none recorded).
 - opening_dozers: a China player queued more than --max-opening-dozers dozers
   in the first --opening-seconds (cancelled queues are netted out).
-- low_rating / unrated: the China player's pre-match Overall rating (from the
-  sidecar's Matches listing text) is below --min-china-rating, or absent.
-  Both are reported, not applied, by default.
+- unrated: the China player has no pre-match Overall rating in the sidecar's
+  Matches listing text, i.e. the match was not a rated ladder game (custom
+  lobbies, 4fun settings such as $1M starting cash, stats tracking disabled).
+  Applied by default (user decision, 5 Nov 2026: ranked matches only, where
+  both players are trying to win).
+- low_rating: that rating is below --min-china-rating (default 0: reported only).
 - extra_trucks: against a non-GLA opponent, a China player queued more than
   --max-trucks-per-center supply trucks from one supply center in the first
   --truck-minutes (later queues are usually replacements for dead trucks).
@@ -340,7 +343,7 @@ def verified_revisions(path, names, minimum=5):
             if sum(c.values()) >= minimum and c.most_common(1)[0][0] == dozer}
 
 
-DEFAULTS = dict(checks='afk,early_end,opening_dozers', afk_max_orders=10, early_end_minutes=2.0,
+DEFAULTS = dict(checks='afk,early_end,opening_dozers,unrated', afk_max_orders=10, early_end_minutes=2.0,
                 opening_seconds=60.0, max_opening_dozers=3, truck_minutes=6.0, max_trucks_per_center=1,
                 min_china_rating=0)
 

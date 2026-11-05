@@ -68,16 +68,19 @@ def phase(row):
 
 def event_losses(model, rows, output):
     """Equal decision examples; token averages keep large selections bounded."""
-    loss = -output['by_head']['decision']
     weights = model.config.get('argument_loss_weights', {})
-    for name, logp in output['by_head'].items():
-        if name == 'decision':
-            continue
+    factors = {}
+    for name in output['by_head']:
         if name == 'delay':
-            factors = [model.config.get('delay_loss_weight', .2) if 'delay' in row['target'] else 0 for row in rows]
-        else:
-            factors = weights.get(name, 1)/np.maximum(output['head_counts'][name], 1)
-        loss = loss-logp*model.array(factors)
+            factors[name] = [model.config.get('delay_loss_weight', .2) if 'delay' in row['target'] else 0 for row in rows]
+        elif name != 'decision':
+            factors[name] = weights.get(name, 1)/np.maximum(output['head_counts'][name], 1)
+    # One staged upload: a pageable copy per head waits for the GPU each time.
+    staged = model.stager.stage({name: (value, 'float') for name, value in factors.items()}) if factors else {}
+    loss = -output['by_head']['decision']
+    for name, logp in output['by_head'].items():
+        if name != 'decision':
+            loss = loss-logp*staged[name]
     return loss
 
 
@@ -96,6 +99,8 @@ class EventLearner:
         torch.set_float32_matmul_precision('high' if precision == 'tf32' else 'highest')
         if device == 'cuda':
             torch.backends.cudnn.conv.fp32_precision = 'tf32' if precision == 'tf32' else 'ieee'
+            # The unit head's fused LSTM runs through cuDNN, whose RNN default is TF32.
+            torch.backends.cudnn.rnn.fp32_precision = 'tf32' if precision == 'tf32' else 'ieee'
         self.torch, self.reference = torch, reference
         self.model = TorchPolicyV3(reference, device=device, dtype=torch.float32)
         if compile_encoder:
@@ -333,11 +338,19 @@ def restore_best_checkpoint(resume,best,stopper,metadata):
         state=saved.get('event_early_stopping',{})
         if (saved.get('event_dataset_sha256')==metadata['event_dataset_sha256']
                 and state.get('best_epoch')==stopper.best_epoch and state.get('best_score')==stopper.best_score):return
-    # Recover a crash between publishing latest.npz and its best.npz copy.
-    cursor=metadata['event_cursor']
-    if cursor['epoch']==stopper.best_epoch and tuple(cursor['position'])==(0,0):
+    # Recover a crash between publishing latest.npz and its best.npz copy:
+    # latest is still the checkpoint written right after the best round.
+    rounds=metadata.get('event_history',[])
+    if len(rounds)==stopper.best_epoch and rounds[-1].get('cursor')==metadata['event_cursor']:
         copy_checkpoint(Path(resume),best)
     else:raise ValueError('Best checkpoint is missing/stale and cannot be recovered from this resume point')
+
+
+def validation_marks(dataset,seed,epoch,buffer_bytes,validations):
+    """Shuffle windows before whose first batch the epoch's mid-epoch validations run."""
+    if validations==1:return []
+    count=len(dataset.windows('train',seed=seed,epoch=epoch,buffer_bytes=buffer_bytes))
+    return sorted({math.ceil(k*count/validations) for k in range(1,validations)}-{0,count})
 
 
 def train(args):
@@ -362,9 +375,14 @@ def train(args):
                 'prefetch_batches': getattr(args, 'prefetch_batches', 1),
                 'reader_processes': getattr(args, 'reader_processes', 1),
                 'precision': getattr(args, 'precision', 'fp32'), 'compile': getattr(args, 'compile', False)}
+    # Validation rounds per epoch: the last at the epoch's end, the others at
+    # evenly spaced shuffle-window boundaries. Early stopping and the learning
+    # rate schedule count rounds, so patience is in rounds, not epochs.
+    validations = getattr(args, 'validations_per_epoch', 1)
+    settings['validations_per_epoch'] = validations
     patience,min_delta=getattr(args,'early_stopping_patience',0),getattr(args,'min_delta',0.0)
     if patience:settings['early_stopping']=dict(patience=patience,min_delta=min_delta)
-    # Reduce-on-plateau: every completed epoch without a validation improvement
+    # Reduce-on-plateau: every validation round without an improvement
     # multiplies the learning rate by lr_decay (1 disables), down to min_lr.
     lr_decay,min_lr=getattr(args,'lr_decay',1.0),getattr(args,'min_lr',0.0)
     if lr_decay!=1.0:settings['lr_schedule']=dict(decay=lr_decay,min_lr=min_lr)
@@ -372,14 +390,16 @@ def train(args):
     if (args.epochs<0 or (args.epochs==0 and patience==0)
             or min(args.checkpoint_seconds, args.buffer_mib, args.batch_size, args.threads, args.pair_budget) <= 0
             or not math.isfinite(args.checkpoint_seconds) or args.max_updates < 0 or args.seed < 0
-            or not 0 <= settings['prefetch_batches'] <= 2 or settings['reader_processes'] < 1):
+            or not 0 <= settings['prefetch_batches'] <= 2 or settings['reader_processes'] < 1
+            or type(validations) is not int or validations < 1):
         raise ValueError('Invalid run budget')
     if (not math.isfinite(args.lr) or args.lr <= 0 or args.min_free_ram_mib < 1
             or args.max_private_mib < 1 or not 0 < lr_decay <= 1 or not 0 <= min_lr <= args.lr
             or (lr_decay != 1.0 and not patience)):
         raise ValueError('Invalid optimizer/model/resource configuration')
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-    epoch, cursor, previous = 0, (0, 0), {}
+    # validations_done: this epoch's mid-epoch rounds already run.
+    epoch, cursor, validations_done, previous = 0, (0, 0), 0, {}
     if args.resume:
         reference, optimizer, document = NeuralPolicy.load(args.resume)
         previous = document['metadata']
@@ -387,6 +407,7 @@ def train(args):
             raise ValueError('Resume requires identical data, sampler, optimizer and runtime settings')
         epoch = previous['event_cursor']['epoch']
         cursor = tuple(previous['event_cursor']['position'])
+        validations_done = previous['event_cursor']['validations']
         stopper=EarlyStopping(patience,min_delta,previous.get('event_early_stopping'))
         restore_best_checkpoint(args.resume,best,stopper,previous)
     else:
@@ -420,13 +441,14 @@ def train(args):
     metadata['event_match_partitions'] = {e['match_key']: e['split'] for e in dataset.entries}
     metadata['event_resource_limits'] = guard
     if not previous:
-        metadata['event_cursor'] = {'epoch': 0, 'position': [0, 0]}
+        metadata['event_cursor'] = {'epoch': 0, 'position': [0, 0], 'validations': 0}
         learner.save(output/'initial.npz', metadata)
         with zipfile.ZipFile(output/'sources.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
             for name in names:
                 archive.write(sources/name, name)
     history = list(previous.get('event_history', []))
-    epoch_counts = Counter(previous.get('event_epoch_counts', {}))
+    # Training counts since the last validation round.
+    round_counts = Counter(previous.get('event_round_counts', {}))
     counts, start, checkpoint_time = Counter(), time.monotonic(), time.monotonic()
     setup_seconds = start-invocation_start
     stop_requested = False
@@ -439,17 +461,108 @@ def train(args):
     original_handler = signal.signal(signal.SIGINT, request_stop)
 
     def checkpoint():
-        metadata['event_cursor'] = {'epoch': epoch, 'position': list(cursor)}
+        metadata['event_cursor'] = {'epoch': epoch, 'position': list(cursor), 'validations': validations_done}
         metadata['event_history'] = history
-        metadata['event_epoch_counts'] = dict(epoch_counts)
+        metadata['event_round_counts'] = dict(round_counts)
         metadata['event_early_stopping'] = stopper.state()
         if latest.exists():
             os.replace(latest, output/'previous.npz')
         learner.save(latest, metadata)
 
+    def stopping():
+        return stop_requested or (stop_file and stop_file.exists())
+
+    def train_segment(mark):
+        """Train from the cursor until shuffle window `mark` (None: the epoch's end).
+
+        True when the epoch's data ran out; otherwise stopped at the mark, or
+        with the reason in status. The batch that reaches the mark is left for
+        the stream reopened after validation, as a resume would leave it.
+        """
+        nonlocal cursor, status, checkpoint_time
+        stream = prepared_batches(dataset, 'train', spec=spec, pair_budget=args.pair_budget, reader=reader,
+                seed=args.seed, epoch=epoch, batch_size=args.batch_size,
+                buffer_bytes=settings['buffer_bytes'], cursor=cursor)
+        try:
+            for update_inputs, following in stream:
+                # following names the batch's own shuffle window.
+                if mark is not None and following[0] >= mark:
+                    return False
+                if stopping():
+                    status = 'interrupted'
+                    return False
+                resources = snapshot(output, learner.model)
+                if not resource_log or time.monotonic()-start-resource_log[-1]['seconds'] >= 10 or not within_budget(resources, **guard):
+                    resource_log.append({'seconds': time.monotonic()-start, **resources})
+                if not within_budget(resources, **guard):
+                    status = 'resource_limit'
+                    return False
+                update = learner.run(update_inputs, train=True)
+                counts.update(update); round_counts.update(update)
+                cursor = following
+                if stop_requested:
+                    status = 'interrupted'
+                    return False
+                if time.monotonic()-checkpoint_time >= args.checkpoint_seconds:
+                    checkpoint(); checkpoint_time = time.monotonic()
+                if args.max_updates and learner.step_count >= args.max_updates:
+                    status = 'update_limit'
+                    return False
+            return True
+        finally:
+            stream.close()
+
+    def validation_round(fraction):
+        """Validate, record the round and adjust the schedule; None when interrupted, else improved."""
+        nonlocal status, round_counts, resumed_round
+        if learner.model.device.type == 'cuda':
+            torch.cuda.synchronize()
+        train_seconds = time.monotonic()-round_start
+        validation_start = time.monotonic()
+        validation = Counter()
+        stream = prepared_batches(dataset, 'validation', spec=spec, pair_budget=args.pair_budget,
+                reader=reader, seed=args.seed, epoch=0, batch_size=args.batch_size,
+                buffer_bytes=settings['buffer_bytes'])
+        try:
+            for update_inputs, _ in stream:
+                resources = snapshot(output, learner.model)
+                if not within_budget(resources, **guard) or stopping():
+                    status = 'interrupted' if stopping() else 'resource_limit'
+                    resource_log.append({'seconds': time.monotonic()-start, **resources})
+                    return None
+                validation.update(learner.run(update_inputs, train=False))
+        finally:
+            stream.close()
+        if not validation['decisions'] and patience:
+            raise ValueError('Validation split contains no supervised decisions')
+        history.append({'epoch': epoch+1, 'round': len(history)+1, 'epoch_fraction': fraction,
+                        'train': summarize(round_counts), 'validation': summarize(validation),
+                        'seconds': time.monotonic()-round_start, 'train_seconds': train_seconds,
+                        'validation_seconds': time.monotonic()-validation_start,
+                        'timing_scope': 'remaining_round_after_resume' if resumed_round else 'full_round',
+                        'lr': learner.lr})
+        improved = (stopper.observe(len(history), history[-1]['validation']['mean_nll'])
+                    if validation['decisions'] else False)
+        if not improved and lr_decay!=1.0 and not stopper.stopped:
+            learner.set_lr(max(min_lr,learner.lr*lr_decay))
+            history[-1]['next_lr'] = learner.lr
+        round_counts, resumed_round = Counter(), False
+        return improved
+
+    def publish(improved):
+        """Checkpoint right after a round; that cursor identifies the round for best-copy recovery."""
+        nonlocal checkpoint_time, round_start
+        history[-1]['cursor'] = {'epoch': epoch, 'position': list(cursor), 'validations': validations_done}
+        saving = time.monotonic()
+        checkpoint(); checkpoint_time = time.monotonic()
+        if improved:copy_checkpoint(latest,best)
+        history[-1]['checkpoint_seconds'] = time.monotonic()-saving
+        print(json.dumps(history[-1]), flush=True)
+        round_start = time.monotonic()
+
     status = 'completed'
     resource_log = []
-    stream = None
+    round_start, resumed_round = time.monotonic(), bool(round_counts)
     reader = (PreparedReader(dataset, spec, args.pair_budget, settings['prefetch_batches'], settings['reader_processes'])
               if settings['prefetch_batches'] else None)
     try:
@@ -460,77 +573,25 @@ def train(args):
             if args.max_updates and learner.step_count >= args.max_updates:
                 status = 'update_limit'
                 break
-            epoch_start = time.monotonic()
-            partial_epoch = bool(epoch_counts)
-            stream = prepared_batches(dataset, 'train', spec=spec, pair_budget=args.pair_budget, reader=reader,
-                    seed=args.seed, epoch=epoch, batch_size=args.batch_size,
-                    buffer_bytes=settings['buffer_bytes'], cursor=cursor)
-            for update_inputs, following in stream:
-                if stop_requested or (stop_file and stop_file.exists()):
-                    status = 'interrupted'
-                    break
-                resources = snapshot(output, learner.model)
-                if not resource_log or time.monotonic()-start-resource_log[-1]['seconds'] >= 10 or not within_budget(resources, **guard):
-                    resource_log.append({'seconds': time.monotonic()-start, **resources})
-                if not within_budget(resources, **guard):
-                    status = 'resource_limit'
-                    break
-                update = learner.run(update_inputs, train=True)
-                counts.update(update); epoch_counts.update(update)
-                cursor = following
-                if stop_requested:
-                    status = 'interrupted'
-                    break
-                if time.monotonic()-checkpoint_time >= args.checkpoint_seconds:
-                    checkpoint(); checkpoint_time = time.monotonic()
-                if args.max_updates and learner.step_count >= args.max_updates:
-                    status = 'update_limit'
-                    break
-            else:
-                stream.close()
-                if learner.model.device.type == 'cuda':
-                    torch.cuda.synchronize()
-                train_seconds = time.monotonic()-epoch_start
-                validation_start = time.monotonic()
-                validation = Counter()
-                stream = prepared_batches(dataset, 'validation', spec=spec, pair_budget=args.pair_budget,
-                        reader=reader, seed=args.seed, epoch=0, batch_size=args.batch_size,
-                        buffer_bytes=settings['buffer_bytes'])
-                for update_inputs, _ in stream:
-                    resources = snapshot(output, learner.model)
-                    stopping = stop_requested or (stop_file and stop_file.exists())
-                    if not within_budget(resources, **guard) or stopping:
-                        status = 'interrupted' if stopping else 'resource_limit'
-                        resource_log.append({'seconds': time.monotonic()-start, **resources})
-                        break
-                    validation.update(learner.run(update_inputs, train=False))
-                stream.close()
-                if status != 'completed':
-                    break
-                if not validation['decisions'] and patience:
-                    raise ValueError('Validation split contains no supervised decisions')
-                history.append({'epoch': epoch+1, 'train': summarize(epoch_counts),
-                                'validation': summarize(validation), 'seconds': time.monotonic()-epoch_start,
-                                'train_seconds': train_seconds, 'validation_seconds': time.monotonic()-validation_start,
-                                'timing_scope': 'remaining_epoch_after_resume' if partial_epoch else 'full_epoch',
-                                'lr': learner.lr})
-                improved=(stopper.observe(epoch+1,history[-1]['validation']['mean_nll'])
-                          if validation['decisions'] else False)
-                if not improved and lr_decay!=1.0 and not stopper.stopped:
-                    learner.set_lr(max(min_lr,learner.lr*lr_decay))
-                    history[-1]['next_lr'] = learner.lr
-                epoch += 1; cursor = (0, 0)
-                epoch_counts = Counter()
-                saving = time.monotonic()
-                checkpoint()
-                if improved:copy_checkpoint(latest,best)
-                history[-1]['checkpoint_seconds'] = time.monotonic()-saving
-                print(json.dumps(history[-1]), flush=True)
-                continue
-            break
+            marks = validation_marks(dataset, args.seed, epoch, settings['buffer_bytes'], validations)
+            exhausted = False
+            # Mid-epoch rounds: train to each mark, then validate there.
+            while status == 'completed' and not exhausted and not stopper.stopped:
+                mark = marks[validations_done] if validations_done < len(marks) else None
+                exhausted = train_segment(mark)
+                if status == 'completed' and not exhausted:
+                    improved = validation_round((validations_done+1)/validations)
+                    if improved is not None:
+                        validations_done += 1
+                        publish(improved)
+            if status != 'completed' or not exhausted:
+                break
+            improved = validation_round(1.0)
+            if improved is None:
+                break
+            epoch += 1; cursor = (0, 0); validations_done = 0
+            publish(improved)
     finally:
-        if stream is not None:
-            stream.close()
         if reader is not None:
             reader.close()
         signal.signal(signal.SIGINT, original_handler)
@@ -568,6 +629,8 @@ def main():
     run.add_argument('--early-stopping-patience', type=int, default=0,
                      help='Stop after this many epochs without lower validation NLL; 0 disables')
     run.add_argument('--min-delta', type=float, default=0.0)
+    run.add_argument('--validations-per-epoch', type=int, default=1,
+                     help='Validation rounds per epoch, evenly spaced; patience and LR decay count rounds')
     run.add_argument('--max-updates', type=int, default=0)
     run.add_argument('--seed', type=int, default=123)
     run.add_argument('--lr', type=float, default=3e-4)
