@@ -368,6 +368,9 @@ void RecorderClass::init() {
 	m_wasDesync = FALSE;
 	m_doingAnalysis = FALSE;
 	m_playbackFrameCount = 0;
+	m_playbackReachedEOF = FALSE;
+	m_lastPlaybackCommandFrame = 0;
+	m_recordedCRCComparisons = 0;
 
 	OptionPreferences optionPref;
 	m_archiveReplays = optionPref.getArchiveReplaysEnabled();
@@ -987,7 +990,9 @@ void RecorderClass::handleCRCMessage(UnsignedInt newCRC, Int playerIndex, Bool f
 	const Bool isLocalPlayer = !p || ThePlayerList->getSlotIndex(playerIndex) == localPlayerIndex;
 	if (isLocalPlayer)
 	{
+		const Bool crcAvailable = m_crcInfo.GetQueueSize() > 0;
 		UnsignedInt playbackCRC = m_crcInfo.readCRC();
+		if (crcAvailable && TheGameLogic->getFrame() > 0) ++m_recordedCRCComparisons;
 		//DEBUG_LOG(("RecorderClass::handleCRCMessage() - Comparing CRCs of InGame:%8.8X Replay:%8.8X Frame:%d from Player %d",
 		//	playbackCRC, newCRC, TheGameLogic->getFrame()-m_crcInfo.GetQueueSize()-1, playerIndex));
 		if (TheGameLogic->getFrame() > 0 && newCRC != playbackCRC && !m_crcInfo.sawCRCMismatch())
@@ -1132,6 +1137,9 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 		}
 	}
 
+	m_playbackReachedEOF = FALSE;
+	m_lastPlaybackCommandFrame = 0;
+	m_recordedCRCComparisons = 0;
 	ReplayHeader header;
 	Bool success = readReplayHeader( header, filename, TRUE );
 	if (!success)
@@ -1322,6 +1330,7 @@ void RecorderClass::readNextFrame()
 	Int bytesRead = m_file->read(&m_nextFrame, sizeof(m_nextFrame));
 	if (bytesRead == sizeof(m_nextFrame))
 	{
+		m_lastPlaybackCommandFrame = m_nextFrame;
 		// TheSuperHackers @bugfix Check whether the next frame value is within a reasonable range
 		// to avoid prolonging playback due to potentially corrupted data.
 		const bool isInValidRange = m_nextFrame >= curFrame && m_nextFrame < curFrame + 3600 * LOGICFRAMES_PER_SECOND;
@@ -1338,6 +1347,7 @@ void RecorderClass::readNextFrame()
 	}
 	else
 	{
+		m_playbackReachedEOF = bytesRead == 0;
 		DEBUG_LOG(("RecorderClass::readNextFrame - read failed on frame %d", TheGameLogic->getFrame()));
 		m_nextFrame = -1;
 		stopPlayback();

@@ -23,6 +23,11 @@
 #include "Common/GameEngine.h"
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+#include "Common/TrainingExporter.h"
+#include "GameClient/MapUtil.h"
+#define GENERALS_AI_TRAINING_EXPORT 1
+#endif
 #include "Common/WorkerProcess.h"
 #include "GameLogic/GameLogic.h"
 #include "GameClient/GameClient.h"
@@ -81,6 +86,9 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 		printf("Simulating Replay \"%s\"\n", filename.str());
 		fflush(stdout);
 		DWORD startTimeMillis = GetTickCount();
+#ifdef GENERALS_AI_TRAINING_EXPORT
+		if (!TrainingExporterBegin(filename)) { numErrors++; continue; }
+#endif
 		if (TheRecorder->simulateReplay(filename))
 		{
 			UnsignedInt totalTimeSec = TheRecorder->getPlaybackFrameCount() / LOGICFRAMES_PER_SECOND;
@@ -108,10 +116,30 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 			printf("Elapsed Time: %02d:%02d Game Time: %02d:%02d/%02d:%02d\n",
 					realTimeSec/60, realTimeSec%60, gameTimeSec/60, gameTimeSec%60, totalTimeSec/60, totalTimeSec%60);
 			fflush(stdout);
+#ifdef GENERALS_AI_TRAINING_EXPORT
+			// GeneralsAI: playback evidence for compatibility probes and the exporter.
+			const Bool completed = !TheRecorder->isPlaybackInProgress()
+				&& TheRecorder->reachedPlaybackEOF()
+				&& TheGameLogic->getFrame() >= TheRecorder->getLastPlaybackCommandFrame();
+			const MapMetaData *map = TheMapCache ? TheMapCache->findMap(TheGlobalData->m_mapName) : nullptr;
+			printf("ReplayValidation {\"completed\":%s,\"crc_mismatch\":%s,"
+				"\"crc_comparisons\":%u,\"final_frame\":%u,\"last_command_frame\":%u,"
+				"\"stream_eof\":%s,\"ticks_per_second\":%d,\"engine_ini_crc\":\"%08X\","
+				"\"loaded_map_crc\":\"%08X\"}\n",
+				completed ? "true" : "false", TheRecorder->sawCRCMismatch() ? "true" : "false",
+				TheRecorder->getRecordedCRCComparisons(), TheGameLogic->getFrame(),
+				TheRecorder->getLastPlaybackCommandFrame(), TheRecorder->reachedPlaybackEOF() ? "true" : "false",
+				static_cast<int>(LOGICFRAMES_PER_SECOND), TheGlobalData->m_iniCRC, map ? map->m_CRC : 0);
+			fflush(stdout);
+			if (!TrainingExporterFinish(completed, TheRecorder->sawCRCMismatch())) numErrors++;
+#endif
 		}
 		else
 		{
 			printf("Cannot open replay\n");
+#ifdef GENERALS_AI_TRAINING_EXPORT
+			TrainingExporterFinish(FALSE, FALSE);
+#endif
 			numErrors++;
 		}
 	}
@@ -129,6 +157,13 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 
 int ReplaySimulation::simulateReplaysInWorkerProcesses(const std::vector<AsciiString> &filenames, int maxProcesses)
 {
+#ifdef GENERALS_AI_TRAINING_EXPORT
+	if (TrainingExporterIsEnabled())
+	{
+		printf("Training export requires sequential replay mode (omit -jobs).\n");
+		return 1;
+	}
+#endif
 	DWORD totalStartTimeMillis = GetTickCount();
 
 	WideChar exePath[1024];

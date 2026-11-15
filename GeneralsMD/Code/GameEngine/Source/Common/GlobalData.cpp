@@ -1048,8 +1048,34 @@ GlobalData::GlobalData()
 
 	// Set user data directory based on registry settings instead of INI parameters.
 	// This allows us to localize the leaf name.
-	m_userDataDir = BuildUserDataPathFromRegistry();
-	CreateDirectory(m_userDataDir.str(), nullptr);
+	// GeneralsAI: training workers need independent writable profiles without changing the
+	// installed profile/registry. The override is process-local and opt-in; the runner
+	// creates the absolute directory before starting this executable.
+	char trainingProfile[MAX_PATH + 1] = { 0 };
+	const DWORD trainingProfileLength = GetEnvironmentVariableA(
+		"GENERALS_AI_USER_DATA", trainingProfile, sizeof(trainingProfile));
+	if (!trainingProfileLength)
+	{
+		m_userDataDir = BuildUserDataPathFromRegistry();
+		CreateDirectory(m_userDataDir.str(), nullptr);
+	}
+	else
+	{
+		char fullProfile[MAX_PATH + 1] = { 0 };
+		const DWORD fullLength = trainingProfileLength < sizeof(trainingProfile)
+			? GetFullPathNameA(trainingProfile, sizeof(fullProfile), fullProfile, nullptr) : 0;
+		const DWORD attributes = fullLength && fullLength < sizeof(fullProfile)
+			? GetFileAttributesA(fullProfile) : ((DWORD)-1);
+		if (attributes == ((DWORD)-1) || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+		{
+			fprintf(stderr, "Invalid GENERALS_AI_USER_DATA directory.\n");
+			fflush(stderr);
+			exit(1);
+		}
+		m_userDataDir = fullProfile;
+		if (!m_userDataDir.endsWith("\\"))
+			m_userDataDir.concat('\\');
+	}
 
 	//-allAdvice feature
 	//m_allAdvice = FALSE;

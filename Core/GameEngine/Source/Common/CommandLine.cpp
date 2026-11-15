@@ -35,6 +35,10 @@
 #include "GameClient/TerrainVisual.h" // for TERRAIN_LOD_MIN definition
 #include "GameClient/GameText.h"
 #include "GameNetwork/NetworkDefs.h"
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+#include "Common/TrainingExporter.h"
+#define GENERALS_AI_TRAINING_EXPORT 1
+#endif
 
 
 
@@ -422,6 +426,66 @@ Int parseHeadless(char *args[], int num)
 
 	return 1;
 }
+
+#ifdef GENERALS_AI_TRAINING_EXPORT
+// GeneralsAI training export (binary format, fast placement, every cadence row observed).
+Int parseExportTraining(char *args[], int num)
+{
+	if (num < 2 || args[1][0] == '-')
+	{
+		printf("-exportTraining requires an output directory\n");
+		exit(1);
+	}
+	TrainingExporterConfigure(args[1]);
+	return 2;
+}
+
+Int parseTrainingInterval(char *args[], int num)
+{
+	char *end = nullptr;
+	const long milliseconds = num > 1 ? strtol(args[1], &end, 10) : 0;
+	if (num < 2 || !end || *end || milliseconds < 1 || milliseconds > 10000)
+	{
+		printf("-trainingInterval requires milliseconds in 1..10000\n");
+		exit(1);
+	}
+	TrainingExporterSetInterval(static_cast<Int>(milliseconds));
+	return 2;
+}
+
+// The retail exporter supports one format and placement mode; accept the
+// pipeline's explicit choice and refuse anything else.
+Int parseTrainingFormat(char *args[], int num)
+{
+	if (num < 2 || strcmp(args[1], "binary"))
+	{
+		printf("-trainingFormat: this engine exports binary only\n");
+		exit(1);
+	}
+	return 2;
+}
+
+Int parseTrainingPlacement(char *args[], int num)
+{
+	if (num < 2 || strcmp(args[1], "fast"))
+	{
+		printf("-trainingPlacement: this engine supports fast placement only\n");
+		exit(1);
+	}
+	return 2;
+}
+
+Int parseTrainingQuietCapture(char *args[], int num)
+{
+	if (num < 2 || (strcmp(args[1], "all") && strcmp(args[1], "scheduled")))
+	{
+		printf("-trainingQuietCapture requires all or scheduled\n");
+		exit(1);
+	}
+	TrainingExporterSetScheduledQuietCapture(strcmp(args[1], "scheduled") == 0);
+	return 2;
+}
+#endif
 
 Int parseReplay(char *args[], int num)
 {
@@ -1175,6 +1239,13 @@ static CommandLineParam paramsForStartup[] =
 	// You can pass this multiple times to play back multiple replays.
 	// You can also include wildcards. The file must be in the replay folder or in a subfolder.
 	{ "-replay", parseReplay },
+#ifdef GENERALS_AI_TRAINING_EXPORT
+	{ "-exportTraining", parseExportTraining },
+	{ "-trainingInterval", parseTrainingInterval },
+	{ "-trainingFormat", parseTrainingFormat },
+	{ "-trainingPlacement", parseTrainingPlacement },
+	{ "-trainingQuietCapture", parseTrainingQuietCapture },
+#endif
 
 	// TheSuperHackers @feature helmutbuhler 23/05/2025
 	// Simulate each replay in a separate process and use 1..N processes at the same time.

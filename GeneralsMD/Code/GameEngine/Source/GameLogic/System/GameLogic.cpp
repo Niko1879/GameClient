@@ -46,6 +46,7 @@
 #include "Common/OSDisplay.h"
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
+#include "Common/TrainingExporter.h"
 #include "Common/PlayerList.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Radar.h"
@@ -3812,6 +3813,8 @@ void GameLogic::update()
 
 	// process client commands
 	{
+		// GeneralsAI: observation boundary, before this tick's command batch.
+		TrainingExporterCapturePreCommands();
 		processCommandList( TheCommandList );
 	}
 
@@ -4100,6 +4103,8 @@ void GameLogic::destroyObject( Object *obj )
 	// if already flagged for destruction, ignore
 	if (!obj || obj->isDestroyed())
 		return;
+
+	TrainingObserveObjectRemoval(obj);
 
 	// run the object onDestroy event if provided
 	for (BehaviorModule** m = obj->getBehaviorModules(); *m; ++m)

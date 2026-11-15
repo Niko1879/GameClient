@@ -116,6 +116,8 @@ class StealthUpdate : public UpdateModule
 public:
 
 	StealthUpdate( Thing *thing, const ModuleData* moduleData );
+	// GeneralsAI training export: read-only look for an explicit viewer, independent of local rendering state.
+	StealthLookType getStealthLookForPlayer(const Player *player) { return calcStealthedStatusForPlayer(getObject(), player); }
 	// virtual destructor prototype provided by memory pool declaration
 
 

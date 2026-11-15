@@ -93,6 +93,10 @@ set(GAMEENGINE_SRC
 #    Include/Common/RAMFile.h
 #    Include/Common/RandomValue.h
     Include/Common/Recorder.h
+    Include/Common/TrainingBinary.h
+    Include/Common/TrainingCommands.h
+    Include/Common/TrainingExporter.h
+    Include/Common/TrainingJson.h
 #    Include/Common/ReplaySimulation.h
     Include/Common/Registry.h
     Include/Common/ResourceGatheringManager.h
@@ -606,6 +610,10 @@ set(GAMEENGINE_SRC
 #    Source/Common/PerfTimer.cpp
 #    Source/Common/RandomValue.cpp
     Source/Common/Recorder.cpp
+    Source/Common/TrainingBinary.cpp
+    Source/Common/TrainingCommands.cpp
+    Source/Common/TrainingExporter.cpp
+    Source/Common/TrainingJson.cpp
 #    Source/Common/ReplaySimulation.cpp
 #    Source/Common/RTS/AcademyStats.cpp
     Source/Common/RTS/ActionManager.cpp

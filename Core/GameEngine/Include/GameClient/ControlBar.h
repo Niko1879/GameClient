@@ -854,6 +854,11 @@ protected:
 
 	// the following methods are for updating the currently showing context
 	CommandAvailability getCommandAvailability( const CommandButton *command, Object *obj, GameWindow *win, GameWindow *applyToWin = nullptr, Bool forceDisabledEvaluation = FALSE ) const;
+public:
+	// GeneralsAI training export: window-free button state, for actors that are not the local player.
+	CommandAvailability evaluateCommandAvailability( const CommandButton *command, Object *obj ) const
+	{ return getCommandAvailability( command, obj, nullptr, nullptr, FALSE ); }
+protected:
 	void updateContextMultiSelect();
 	void updateContextPurchaseScience();
 	void updateContextCommand();

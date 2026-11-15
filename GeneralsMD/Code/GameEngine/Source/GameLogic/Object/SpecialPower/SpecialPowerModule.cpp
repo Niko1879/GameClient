@@ -40,6 +40,7 @@
 #include "Common/SpecialPower.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
+#include "Common/TrainingExporter.h"
 #include "Common/Xfer.h"
 
 #include "GameLogic/GameLogic.h"
@@ -679,6 +680,9 @@ void SpecialPowerModule::aboutToDoSpecialPower( const Coord3D *location )
 		TheAudio->addAudioEvent( &soundAtLocation );
 
 	}
+
+	// Training export: record the launch sounds' audience for each player's observation (no simulation effect).
+	TrainingObserveSpecialPower( getObject(), modData->m_specialPowerTemplate, location );
 
 }
 

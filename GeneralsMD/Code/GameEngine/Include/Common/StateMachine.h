@@ -299,6 +299,7 @@ public:
 	void setGoalObject( const Object *obj );
 	Object *getGoalObject();
 	const Object *getGoalObject() const;
+	ObjectID getGoalObjectID() const { return m_goalObjectID; }	///< GeneralsAI training export
 	void setGoalPosition( const Coord3D *pos );
 	const Coord3D *getGoalPosition() const { return &m_goalPosition; }
 	Bool isGoalObjectDestroyed() const;  ///< Returns true if we had a goal object, but it has been destroyed.

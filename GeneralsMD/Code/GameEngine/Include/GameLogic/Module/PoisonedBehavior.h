@@ -79,6 +79,9 @@ public:
 	// Disabled conditions to process (we should still poison disabled things)
 	virtual DisabledMaskType getDisabledTypesToProcess() const override { return DISABLEDMASK_ALL; }
 
+	// Training export (15 Nov 2026): the visible poisoned state (green tint), read only.
+	Bool isPoisoned() const { return m_poisonDamageFrame != 0; }
+
 protected:
 
 	void startPoisonedEffects( const DamageInfo *damageInfo );

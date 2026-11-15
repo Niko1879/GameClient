@@ -49,6 +49,10 @@
 #include "Common/Upgrade.h"
 #include "Common/StatsCollector.h"
 #include "Common/Radar.h"
+#if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
+#include "Common/TrainingExporter.h"
+#define GENERALS_AI_TRAINING_EXPORT 1
+#endif
 
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/GameLogic.h"
@@ -404,6 +408,15 @@ void GameLogic::logicMessageDispatcher( GameMessage *msg, void *userData )
 			}
 		}
 	}
+
+#ifdef GENERALS_AI_TRAINING_EXPORT
+	// GeneralsAI: observer-only command context, with the dispatcher's real selection.
+#if RETAIL_COMPATIBLE_AIGROUP
+	if (isInGame()) TrainingObserveCommand(msg, currentlySelectedGroup);
+#else
+	if (isInGame()) TrainingObserveCommand(msg, currentlySelectedGroup.Peek());
+#endif
+#endif
 
 #ifdef DEBUG_LOGGING
 	AsciiString commandName;
@@ -1903,12 +1916,22 @@ bool GameLogic::onDozerConstruct(MAYBE_UNUSED GameMessage *msg, AIGroupPtr &curr
 	angle = msg->getArgument( 2 )->real;
 
 	if( place == nullptr || constructorObject == nullptr )
+	{
+#ifdef GENERALS_AI_TRAINING_EXPORT
+		TrainingExporterBuildResult(msg, nullptr);
+#endif
 		return false;  //These are not crashes, as the object may have died before this message came in
+	}
 
 	if( msg->getType() == GameMessage::MSG_DOZER_CONSTRUCT )
 	{
-		TheBuildAssistant->buildObjectNow( constructorObject, place, &loc, angle,
+		Object *created = TheBuildAssistant->buildObjectNow( constructorObject, place, &loc, angle,
 																				constructorObject->getControllingPlayer() );
+#ifdef GENERALS_AI_TRAINING_EXPORT
+		TrainingExporterBuildResult(msg, created);
+#else
+		(void)created;
+#endif
 	}
 	else
 	{

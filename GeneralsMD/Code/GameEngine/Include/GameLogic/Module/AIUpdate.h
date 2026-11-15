@@ -534,6 +534,7 @@ public:
 
 	void setCurrentVictim( const Object *nemesis );			///<  Current victim.
 	Object *getCurrentVictim() const;
+	ObjectID getCurrentVictimID() const { return m_currentVictimID; }	///< GeneralsAI training export
 	virtual void notifyVictimIsDead() { }
 
 	// if we are attacking a position (and NOT an object), return it. otherwise return null.
@@ -644,6 +645,13 @@ public:
 
 	// this is intended for use ONLY by W3dWaypointBuffer and AIFollowPathState.
 	const Coord3D* friend_getGoalPathPosition( Int index ) const { return getStateMachine()->getGoalPathPosition( index ); }
+
+	// GeneralsAI training export: read-only goal accessors.
+	ObjectID getGoalObjectID() const { return getStateMachine()->getGoalObjectID(); }
+	const Coord3D* getGoalPathEnd() const {
+		const Int count = getStateMachine()->getGoalPathSize();
+		return count > 0 ? getStateMachine()->getGoalPathPosition(count-1) : nullptr;
+	}
 
 	// this is intended for use ONLY by W3dWaypointBuffer.
 	Int friend_getWaypointGoalPathSize() const;
