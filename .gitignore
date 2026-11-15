@@ -99,3 +99,7 @@ __pycache__/
 /build/
 /.venv-torch/
 /.venv-torch-rocm/
+
+# Local notes (agent and user) and things set aside during cleanups.
+/notes/
+/.archive/
