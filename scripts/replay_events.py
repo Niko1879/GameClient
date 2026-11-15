@@ -9,7 +9,7 @@ from __future__ import annotations
 from itertools import chain
 
 from generals_policy import KINDS, Unrepresentable, initial_home
-from generals_identity import in_production_scope
+from generals_identity import in_production_scope, production_twin
 
 
 def outside_production_scope(config, row, action):
@@ -18,12 +18,12 @@ def outside_production_scope(config, row, action):
     template = action.get('template')
     if not isinstance(template, str):
         return False
-    if not in_production_scope(config, template):
+    if not in_production_scope(config, production_twin(config, template)):
         return True
     actor = action.get('builder', action.get('producer'))
     entity = next((e for e in row.get('observation', {}).get('own_entities', ()) if e['id'] == actor), None)
     # Missing actors retain the existing structural-rejection path.
-    return entity is not None and not in_production_scope(config, entity['type'])
+    return entity is not None and not in_production_scope(config, production_twin(config, entity['type']))
 
 
 def decisions(rows, config, counts, validate=None, observe=None):
@@ -202,9 +202,20 @@ class EventValidator:
         return True
 
 
-def encoded_events(policy, game, counts):
-    """Encode selected candidates before committing their causal actor history."""
-    iterator = iter(game['rows'])
+def _template_tap(rows, table):
+    """Every captured observation's new template stats into the game's TemplateTable, selected or not."""
+    for row in rows:
+        observation = row.get('observation')
+        if table is not None and observation is not None and 'template_stats' in observation:
+            table.add(observation['template_stats'])
+        yield row
+
+
+def encoded_events(policy, game, counts, table=None):
+    """Encode selected candidates before committing their causal actor history.
+
+    `table` (generals_policy.TemplateTable), when given, collects the game's weapon/armour stats."""
+    iterator = _template_tap(iter(game['rows']), table)
     first = next(iterator, None)
     if first is None:
         return

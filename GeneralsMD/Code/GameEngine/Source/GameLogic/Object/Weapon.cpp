@@ -40,6 +40,7 @@
 
 #include "Common/crc.h"
 #include "Common/CRCDebug.h"
+#include "Common/ReplayLogic.h"
 #include "Common/GameAudio.h"
 #include "Common/GameState.h"
 #include "Common/INI.h"
@@ -631,7 +632,8 @@ Real WeaponTemplate::estimateWeaponTemplateDamage(
 		const Bool hasOccupants = victimObj->getContain() && victimObj->getContain()->getContainCount() > 0;
 		const Bool hasSlaves = victimObj->getSpawnBehaviorInterface() && victimObj->getSpawnBehaviorInterface()->getSlaveCount() > 0;
 
-		if (!hasOccupants && !hasSlaves)
+		// Replays of releases before this fix only skip empty garrisons (Common/ReplayLogic.h).
+		if (replayLogic062026() ? (victimObj->getContain() && !hasOccupants) : (!hasOccupants && !hasSlaves))
 			return 0.0f;
 #endif
   }

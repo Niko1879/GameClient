@@ -1,6 +1,8 @@
+import collections
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import os
@@ -64,6 +66,7 @@ class EarlyStoppingTests(unittest.TestCase):
                                            float_dtype=np.float32,device_type='cpu')
                 self.fp16=False
             def set_lr(self,lr):self.lr=lr
+            def staged(self,stream):return stream
             def run(self,prepared,train):
                 if train:self.step_count+=1
                 return dict(loss_sum=1 if train else next(self.scores),decisions=1)
@@ -91,12 +94,62 @@ class EarlyStoppingTests(unittest.TestCase):
         self.assertEqual((best,latest),(2,5))
         self.assertEqual({h['lr'] for h in report['history']},{.0003})
 
-    def test_learning_rate_drops_after_each_non_improving_epoch_until_stopping(self):
-        report,best,latest=self.run_loop(lr_decay=.5,min_lr=.0001)
+    def test_learning_rate_with_patience_one_drops_after_each_non_improving_round_until_stopping(self):
+        report,best,latest=self.run_loop(lr_decay=.5,min_lr=.0001,lr_patience=1)
         self.assertEqual(report['status'],'early_stopped');self.assertEqual(report['early_stopping']['best_epoch'],2)
         # Epochs 3 and 4 do not improve; the third bad epoch stops without another decay.
         self.assertEqual([h['lr'] for h in report['history']],[.0003,.0003,.0003,.00015,.0001])
-        self.assertEqual(report['settings']['lr_schedule'],dict(decay=.5,min_lr=.0001))
+        self.assertEqual(report['settings']['lr_schedule'],dict(decay=.5,patience=1,cooldown=0,min_lr=.0001))
+
+    def test_one_bad_round_does_not_cut_the_learning_rate_by_default(self):
+        # Scores 3, 2, 2.1, 2, 2.3: round 3 alone is not a plateau; rounds 3 and 4 together are.
+        report,best,latest=self.run_loop(lr_decay=.5,min_lr=.0001)
+        self.assertEqual([h['lr'] for h in report['history']],[.0003,.0003,.0003,.0003,.00015])
+        self.assertEqual(['next_lr' in h for h in report['history']],[False,False,False,True,False])
+        self.assertEqual(report['history'][3]['lr_state'],dict(scale=.5,bad_rounds=0,cooling=0))
+
+    def test_warmup_ramps_the_rate_of_each_update(self):
+        report,best,latest=self.run_loop(lr_warmup_updates=4)
+        # One update per epoch: 1/4, 2/4, 3/4, then the full rate.
+        np.testing.assert_allclose([h['lr'] for h in report['history']],[.000075,.00015,.000225,.0003,.0003])
+        self.assertEqual(report['settings']['lr_schedule'],dict(warmup=4,min_lr=0.0))
+
+    def test_learning_rate_schedule_parts(self):
+        rate=trainer.LearningRate(1.0,warmup=10,schedule='cosine',horizon=100,min_lr=.1)
+        self.assertAlmostEqual(rate.at(0),.1);self.assertAlmostEqual(rate.at(4),.5*(.1+.9*.5*(1+math.cos(math.pi*.04))))
+        self.assertAlmostEqual(rate.at(50),.55);self.assertAlmostEqual(rate.at(100),.1);self.assertAlmostEqual(rate.at(5000),.1)
+        self.assertEqual(rate.settings(),dict(warmup=10,schedule='cosine',horizon=100,min_lr=.1))
+        self.assertIsNone(trainer.LearningRate(1.0).settings())
+        # Plateau: two bad rounds in a row cut; an improvement clears the count; cooldown rounds are not counted.
+        rate=trainer.LearningRate(1.0,decay=.5,patience=2,cooldown=1,min_lr=.2)
+        self.assertEqual([rate.observe(i) for i in (False,True,False,False)],[False,False,False,True])
+        self.assertEqual(rate.at(7),.5)
+        self.assertEqual([rate.observe(False) for _ in range(3)],[False,False,True])
+        self.assertEqual(rate.at(7),.25)
+        resumed=trainer.LearningRate(1.0,decay=.5,patience=2,cooldown=1,min_lr=.2,state=json.loads(json.dumps(rate.state())))
+        self.assertEqual((resumed.at(7),resumed.state()),(rate.at(7),rate.state()))
+        for _ in range(3):rate.observe(False)
+        self.assertEqual(rate.at(7),.2)  # The floor.
+        for options in (dict(schedule='cosine'),dict(decay=0),dict(patience=0),dict(min_lr=2),dict(warmup=-1),dict(schedule='step')):
+            with self.assertRaises(ValueError):trainer.LearningRate(1.0,**options)
+
+    def test_cosine_horizon_counts_updates_from_the_shard_index(self):
+        dataset=SimpleNamespace(windows=lambda split,**unused:[[(0,0,dict(rows=300)),(0,0,dict(rows=300))],[(0,0,dict(rows=10))]])
+        self.assertEqual(trainer.updates_per_epoch(dataset,123,256,1),4)
+
+    def test_batch_fill_measures_how_much_of_the_requested_batch_updates_get(self):
+        # One ~290-row window per update: the shape of v10's "batch 512" run.
+        small=SimpleNamespace(windows=lambda split,**unused:[[(0,0,dict(rows=290))]]*10)
+        self.assertAlmostEqual(trainer.batch_fill(small,123,512,1),290/512)
+        self.assertAlmostEqual(trainer.batch_fill(small,123,256,1),145/256)  # A full batch, then a 34-row remainder.
+        large=SimpleNamespace(windows=lambda split,**unused:[[(0,0,dict(rows=2560+30))]]*10)
+        self.assertGreater(trainer.batch_fill(large,123,256,1),.9)
+
+    def test_training_refuses_a_shuffle_window_too_small_for_the_batch(self):
+        with self.assertRaisesRegex(ValueError,'buffer-mib'):
+            with patch.object(trainer,'batch_fill',return_value=.57):self.run_loop(min_batch_fill=.9)
+        with patch.object(trainer,'batch_fill',return_value=.95):
+            self.assertEqual(self.run_loop(min_batch_fill=.9)[0]['status'],'early_stopped')
 
 
 class ValidationRoundTests(unittest.TestCase):
@@ -128,6 +181,7 @@ class ValidationRoundTests(unittest.TestCase):
                 self.model=SimpleNamespace(device=SimpleNamespace(type='cpu'),stager=SimpleNamespace(stats={}),
                                            float_dtype=np.float32,device_type='cpu')
             def set_lr(self,lr):self.lr=lr
+            def staged(self,stream):return stream
             def restore_rng(self,metadata):pass
             def restore_scaler(self,metadata):pass
             def run(self,prepared,train):
@@ -220,6 +274,33 @@ class SplitTests(unittest.TestCase):
         self.assertNotIn('pgo:1',{r['match_key'] for r in chosen})
         self.assertNotIn(rows[2]['replay_sha256'],{r['replay_sha256'] for r in chosen})
         self.assertEqual(len({r['replay_sha256'] for r in chosen}),20)
+
+    def test_stratified_validation_balances_length_and_keeps_rare_ratings(self):
+        rows=self.rows(20000)
+        # Long games and 1700+ matches are scarce, as in the corpus (11% and ~6%).
+        import random
+        def stratum(i):
+            draw=random.Random(i)
+            length,rating=draw.random(),draw.random()
+            return (('short' if length<.61 else 'medium' if length<.89 else 'long'),
+                    ('1700+' if rating<.06 else '<1100' if rating<.53 else '1100-1400'))
+        strata={r['match_key']:stratum(i) for i,r in enumerate(rows)}
+        chosen=runner.choose(rows,None,1500,123,strata=strata)
+        held=[r for r in chosen if r['split']=='validation']
+        cells=collections.Counter(strata[r['match_key']] for r in held)
+        self.assertEqual(len(held),1500)
+        for length in ('short','medium','long'):
+            self.assertEqual(sum(n for (l,_),n in cells.items() if l==length),500)
+            self.assertGreaterEqual(cells[(length,'1700+')],runner.VALIDATION_FLOOR)
+            # The common bands keep their relative sizes (about 1:1 here).
+            self.assertLess(abs(cells[(length,'<1100')]-cells[(length,'1100-1400')]),10)
+        self.assertEqual(chosen,runner.choose(list(reversed(rows)),None,1500,123,strata=strata))
+        self.assertEqual(len(chosen),20000)
+        self.assertFalse({r['match_key'] for r in held}&{r['match_key'] for r in chosen if r['split']=='train'})
+        # An earlier run's set still wins over the strata.
+        keep=sorted(r['match_key'] for r in held[:100])
+        reused=runner.choose(rows,None,100,7,validation_keys=keep,strata=strata)
+        self.assertEqual(sorted(r['match_key'] for r in reused if r['split']=='validation'),keep)
 
     def test_insufficient_unique_replays_fails_before_training(self):
         with self.assertRaises(ValueError):runner.choose(self.rows(10),10,1,123)

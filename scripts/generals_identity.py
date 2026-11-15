@@ -66,6 +66,31 @@ def _vanilla_china(name):
     return template_identity(name)[1:] == ('China', 'vanilla')
 
 
+# Three-faction China (user, 14 Nov 2026): Tank and Nuke generals' production is
+# learned and played as its vanilla twin, so the output vocabulary stays vanilla
+# China's. The general stays visible through entity types and the player identity.
+TWIN_PREFIXES = ('Tank_', 'Nuke_')
+TWIN_OVERRIDES = {'Tank_ChinaTankEmperor': 'ChinaTankOverlord'}
+
+
+@lru_cache(maxsize=None)
+def _twin(name):
+    twin = TWIN_OVERRIDES.get(name)
+    if twin is None:
+        prefix = next((p for p in TWIN_PREFIXES if name.startswith(p)), None)
+        if prefix is None:
+            return name
+        twin = name[len(prefix):]
+    return twin if _vanilla_china(twin) else name
+
+
+def production_twin(config, name):
+    """The vanilla China template a Tank/Nuke production template is learned as (identity otherwise)."""
+    if config.get('production_scope') != 'vanilla_china' or not isinstance(name, str):
+        return name
+    return _twin(name)
+
+
 def in_production_scope(config, name):
     """Production scope is independent of ownership and observable object types."""
     scope = config.get('production_scope')
@@ -89,11 +114,16 @@ def vanilla_china_production(config):
         raise ValueError('Vanilla-China production needs a nonempty native production menu')
     # Canonical command names may come from another faction's identical button,
     # so command scope follows in-scope menus and China's shortcut bar, not names.
+    # Tank and Nuke generals' buttons (their upgrades, abilities and powers) are learned under their
+    # own names: a producer counts by its vanilla twin (user, 15 Nov 2026: support their upgrades
+    # and abilities fully), and so do the generals' shortcut bars and science trees.
     offered = {name for owner, names in result['command_menus'].items()
-               if in_production_scope(result, owner) for name in names}
-    offered.update(result['command_shortcuts'].get('FactionChina', []))
+               if in_production_scope(result, production_twin(result, owner)) for name in names}
+    sides = ('FactionChina', 'FactionChinaTankGeneral', 'FactionChinaNukeGeneral')
+    for side in sides:
+        offered.update(result['command_shortcuts'].get(side, []))
     result['commands'] = sorted(set(result['commands']) & offered)
-    result['sciences'] = sorted(set(result['promotions'].get('FactionChina', [])))
+    result['sciences'] = sorted({name for side in sides for name in result['promotions'].get(side, [])})
     result['identity_hierarchy'] = hierarchy_config(result['types'], result['templates'])
     return result
 

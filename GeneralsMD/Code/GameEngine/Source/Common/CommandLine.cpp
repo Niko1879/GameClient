@@ -503,10 +503,9 @@ Int parseStatsUrl(char *args[], int num)
 
 Int parseReplayLogic(char *args[], int num)
 {
-	if (num < 2 || (strcmp(args[1], "current") && strcmp(args[1], "081326"))) {
-		printf("-replayLogic requires current or 081326\n"); exit(1);
+	if (num < 2 || !parseReplayLogicName(args[1], TheReplayLogic)) {
+		printf("-replayLogic requires current, 081326 or 062026\n"); exit(1);
 	}
-	TheReplayLogic = strcmp(args[1], "081326") == 0 ? REPLAY_LOGIC_081326 : REPLAY_LOGIC_CURRENT;
 	return 2;
 }
 

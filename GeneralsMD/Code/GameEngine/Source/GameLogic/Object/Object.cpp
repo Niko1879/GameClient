@@ -40,6 +40,7 @@
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
 #include "Common/Radar.h"
+#include "Common/ReplayLogic.h"
 #include "Common/SpecialPower.h"
 #include "Common/Team.h"
 #include "Common/ThingFactory.h"
@@ -756,7 +757,9 @@ void Object::friend_setContainedBy(Object* containedBy)
 	m_containedBy = containedBy;
 
 #if !RETAIL_COMPATIBLE_CRC
-	m_containedByFrame = containedBy ? TheGameLogic->getFrame() : 0;
+	// Replays of releases before this change only set the pointer (Common/ReplayLogic.h).
+	if (!replayLogic062026())
+		m_containedByFrame = containedBy ? TheGameLogic->getFrame() : 0;
 #endif
 }
 

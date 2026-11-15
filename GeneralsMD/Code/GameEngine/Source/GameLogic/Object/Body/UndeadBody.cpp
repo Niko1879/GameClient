@@ -29,6 +29,7 @@
 
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+#include "Common/ReplayLogic.h"
 #include "Common/Xfer.h"
 #include "GameLogic/Module/UndeadBody.h"
 
@@ -85,7 +86,8 @@ void UndeadBody::attemptDamage( DamageInfo *damageInfo )
 			&& damageInfo->in.m_amount >= getHealth()
 #else
 			// TheSuperHackers @bugfix Stubbjax 20/09/2025 Battle Buses now correctly apply damage modifiers when calculating lethal damage
-			&& estimateDamage(damageInfo->in) >= getHealth()
+			// Replays of releases before the community patch code changes use the raw amount (Common/ReplayLogic.h).
+			&& (replayLogic062026() ? damageInfo->in.m_amount : estimateDamage(damageInfo->in)) >= getHealth()
 #endif
 			&& IsHealthDamagingDamage(damageInfo->in.m_damageType)
 			)

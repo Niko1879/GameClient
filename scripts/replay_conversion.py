@@ -19,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT/'.cache/replay-converter'
 CATALOG = ROOT/'replays/catalog/replay-catalog.sqlite3'
 POLICY = ROOT/'replay-runtime/policy.json'
-ENGINE = ROOT/'replay-runtime/game/engine-38d28ef349dc3237.exe'
-ENGINE_SHA = '38d28ef349dc3237dbc669e865f03a4192ef07810f85f32a9f3e6e75a3bc9d9c'
+ENGINE = ROOT/'replay-runtime/game/engine-df0f74a981e087f1.exe'
+ENGINE_SHA = 'df0f74a981e087f110e0892ae5d8403b71f08d1495b53e129c242d8da5bbe387'
 ENGINE_HAS_REPLAY_SERVER = True
 DATA = ROOT/'training-data'
 RAW = ROOT/'replays/vanilla-china'
@@ -29,12 +29,30 @@ ACTIVE = ('running', 'exported', 'preparing')
 # Releases whose replays need a historical engine build (a revision adapter) this
 # pipeline lacks. They stay collected but are excluded from conversion, so they
 # are not recorded as replay failures. Remove an entry to queue them again.
-PARKED_RELEASES = {}
+PARKED_RELEASES = {
+}
 # Releases recorded before a simulation fix play back with that release's logic
 # (engine -replayLogic, GeneralsMD/.../Common/ReplayLogic.h). Part of the pipeline identity.
 REPLAY_LOGIC = {
     '3DF43954': '081326',  # 081326_QFE3, commit c929fa068; 6/6 test replays matched every CRC
+    # 062026 on the retail INI (FEAAE3F3 pack in revision-data); folded in from the retired side
+    # converter at the v6 re-pin (12 Nov 2026). It needs a fresh engine process per replay.
+    '48D67663': '062026',
 }
+
+
+# How one engine family plays its replays. The service converts with GENERALS_ONLINE;
+# other backends (retail_conversion.py) pass their own and carry a
+# different identity. logic: True picks REPLAY_LOGIC by release, False plays current logic,
+# a string fixes the -replayLogic; rules_root (default RULES) holds the INI packages;
+# releases lists the parked releases a side backend converts.
+GENERALS_ONLINE = dict(name='generalsonline', engine=ENGINE, ticks_per_second=60, quiet_capture='scheduled',
+                       native_ini_crc=None, logic=True)
+
+
+def stage_maps(header, profile):
+    from engine_runtime import isolation_profile
+    isolation_profile(ROOT/'replay-runtime/profile', profile, maps=[header['map']])
 
 
 def replay_logic(exe_crc):
@@ -120,7 +138,8 @@ def source_guard(identity):
     for name,sha in identity['source_pins'].items():
         if file_sha256(Path(__file__).with_name(name))!=sha:
             raise ValueError('Converter source changed; stop and restart: '+name)
-    if file_sha256(POLICY)!=identity['policy_sha256'] or file_sha256(ENGINE)!=identity['engine_sha256']:
+    engine=ROOT/identity.get('engine_path',ENGINE.relative_to(ROOT).as_posix())
+    if file_sha256(POLICY)!=identity['policy_sha256'] or file_sha256(engine)!=identity['engine_sha256']:
         raise ValueError('Converter policy/native inputs changed; stop and restart')
     for name,sha in identity['rules'].items():
         if file_sha256(ROOT/name)!=sha:raise ValueError('Replay rules changed: '+name)
@@ -145,12 +164,22 @@ def recover(db,pipeline):
     db.commit();return changed
 
 
-def refresh_collection(db,archive=RAW/'harvest.sqlite3'):
+# Crawler archives and the prefix that makes their file paths relative to RAW (13 Nov 2026: China Tank and
+# Nuke matches without a vanilla China player are crawled into replays/china-generals; their match IDs never
+# overlap the vanilla archive's, which already holds every match with a vanilla China player).
+ARCHIVES=((RAW/'harvest.sqlite3',''),(RAW.parent/'china-generals'/'harvest.sqlite3','../china-generals/'))
+
+
+def refresh_collection(db,archive=None,prefix=''):
     """Import only changed crawler rows; the crawler database stays read-only.
 
     Compare all small (id, updated) pairs rather than assuming timestamps or
     match IDs arrive monotonically. Old failed downloads can be repaired later.
+    Without `archive`, every crawler archive in ARCHIVES (an absent optional one is skipped).
     """
+    if archive is None:
+        return sum(refresh_collection(db,path,path_prefix) for path,path_prefix in ARCHIVES
+                   if not path_prefix or Path(path).exists())
     db.execute('''CREATE TABLE IF NOT EXISTS replay (
         match_key TEXT PRIMARY KEY,match_id INTEGER NOT NULL,raw_status TEXT NOT NULL,
         raw_path TEXT,raw_sha256 TEXT,raw_error TEXT,raw_updated TEXT,
@@ -170,7 +199,7 @@ def refresh_collection(db,archive=RAW/'harvest.sqlite3'):
                 raw_status=excluded.raw_status,raw_path=excluded.raw_path,raw_sha256=excluded.raw_sha256,
                 raw_error=excluded.raw_error,raw_updated=excluded.raw_updated,
                 listing_json=excluded.listing_json,synced_utc=excluded.synced_utc''',
-                [(f'pgo:{key}',key,status,path,sha,error,str(stamp) if stamp is not None else None,
+                [(f'pgo:{key}',key,status,prefix+path if path else path,sha,error,str(stamp) if stamp is not None else None,
                   candidate,str(time.time())) for key,candidate,status,path,sha,error,stamp in rows])
             db.commit()
         return len(changed)
@@ -364,14 +393,14 @@ def log_tail(path,lines=60):
     except OSError:return None
 
 
-def convert(job,identity,settings,runtime,profile,catalog,progress,session=None):
+def convert(job,identity,settings,runtime,profile,catalog,progress,session=None,backend=None):
+    backend=backend or GENERALS_ONLINE
     from harvest_china_replays import parse_replay
     from replay_training import export,file_sha256,ExportPlaybackError
     from replay_bootstrap import data_pack,verify_entry,KIND
     from replay_storage import manifest_path
     from event_ingest import prepare_batch,verify_prepared,retire_exports
     from replay_catalog import record_export,register_prepared,import_retirement
-    from engine_runtime import isolation_profile
     source_guard(identity)
     db=connect()
     try:
@@ -383,17 +412,24 @@ def convert(job,identity,settings,runtime,profile,catalog,progress,session=None)
         source=Path(job['source_path'])
         if file_sha256(source)!=job['replay_sha256']:raise ValueError('Original replay hash changed')
         header=parse_replay(source.read_bytes())
-        exclusion=release_exclusion(header['exe_crc'])
+        # A side backend serves releases the main converter parks for it.
+        exclusion=None if str(header['exe_crc']).upper() in backend.get('releases',()) else release_exclusion(header['exe_crc'])
         if exclusion:return dict(status='excluded',stage='excluded',message=exclusion)
-        if header['desync'] or any(header['player_disconnections']):
-            return dict(status='rejected',stage='rejected',message='Replay header flags desync/disconnection',
-                failure=dict(stage='header',reason='desync_or_disconnect',
+        # A desync can't be verified: playback checks only the recorder's CRCs, so the
+        # opponent's view after it is unknown. A disconnection flag only says a player
+        # dropped; playback still has to pass every CRC, and cleaning's afk/early_end
+        # filters judge whether enough game was played (8 Nov 2026: 18 of 20 such
+        # GenTool replays passed every CRC to the end).
+        if header['desync']:
+            return dict(status='rejected',stage='rejected',message='Replay header flags a desync',
+                failure=dict(stage='header',reason='desync',
                     evidence=dict(desync=header['desync'],player_disconnections=header['player_disconnections'])))
         sidecar=source.with_suffix('.json')
         metadata=json.loads(sidecar.read_text(encoding='utf-8-sig')) if sidecar.exists() else {}
         row=dict(replay=str(source),header=header,metadata=metadata)
-        pack=data_pack(row,RULES,False)
-        isolation_profile(ROOT/'replay-runtime/profile',profile,maps=[header['map']])
+        # A replay recorded on the engine's own INI needs no historical package.
+        pack=None if header['ini_crc']==backend['native_ini_crc'] else data_pack(row,backend.get('rules_root',RULES),False)
+        backend.get('stage_maps',stage_maps)(header,profile)
         owned=job_directory(job,identity);owned.mkdir(parents=True,exist_ok=True)
         trajectory=owned/'export'/header['exe_crc']/(source.name+'.training.bin')
         proof_path=manifest_path(trajectory)
@@ -405,12 +441,16 @@ def convert(job,identity,settings,runtime,profile,catalog,progress,session=None)
         else:
             if (owned/'export').exists():remove_owned(owned/'export')
             progress('exporting')
+            logic=(backend['logic'] if isinstance(backend['logic'],str)
+                   else replay_logic(header['exe_crc']) if backend['logic'] else 'current')
             try:
-                proof=export(SimpleNamespace(exe=runtime/ENGINE.name,replay=source,output=owned/'export',
+                proof=export(SimpleNamespace(exe=runtime/backend['engine'].name,replay=source,output=owned/'export',
                     user_data=profile,data_pack=pack,interval_ms=100,timeout=settings['timeout_seconds'],
-                    ticks_per_second=60,storage='binary',placement_mode='fast',audit_level=settings['audit_level'],
-                    quiet_capture='scheduled',capture_policy=POLICY,replay_logic=replay_logic(header['exe_crc']),
-                    engine_session=session))
+                    ticks_per_second=backend['ticks_per_second'],storage='binary',placement_mode='fast',
+                    audit_level=settings['audit_level'],quiet_capture=backend['quiet_capture'],capture_policy=POLICY,
+                    replay_logic=logic,
+                    # 062026 loads particle templates at engine start: a reused session can't switch to it.
+                    engine_session=None if logic=='062026' else session))
             except ExportPlaybackError as error:
                 # The job directory (and its engine log) is deleted below; keep the log tail.
                 evidence=dict(error.evidence,log_tail=log_tail(error.evidence['log']))
@@ -422,7 +462,8 @@ def convert(job,identity,settings,runtime,profile,catalog,progress,session=None)
                     failure=dict(stage='playback',reason=error.evidence.get('status') or 'unknown',evidence=evidence))
         entry=dict(trajectory=proof['trajectory'],sha256=proof['trajectory_sha256'],replay_sha256=job['replay_sha256'],
             match_key=job['match_key'],replay_exe_crc=header['exe_crc'],replay_ini_crc=header['ini_crc'],
-            engine_sha256=identity['engine_sha256'],backend='direct-capture',ticks_per_second=60,split=job['split'])
+            engine_sha256=identity['engine_sha256'],backend='direct-capture',
+            ticks_per_second=backend['ticks_per_second'],split=job['split'])
         verify_entry(entry)
         record_export(db,dict(status='exported',replay=str(source),entry=entry,validation=proof['native_validation']),
             match_key=job['match_key'],replay_sha256=job['replay_sha256'],engine_sha256=identity['engine_sha256'])
@@ -445,6 +486,34 @@ def convert(job,identity,settings,runtime,profile,catalog,progress,session=None)
         finish_files(job,manifest,identity)
         return dict(status='done',stage='prepared',reused=False)
     finally:db.close()
+
+
+def run_job(job,identity,settings,runtime,profile,catalog,session,emit,log_path,backend=None):
+    """One claimed job in a worker: its result, with an investigable failure when blocked."""
+    def progress(stage):emit(event='stage',sha=job['replay_sha256'],stage=stage)
+    with Path(log_path).open('w',encoding='utf-8') as log,redirect_stdout(log):
+        try:
+            return convert(job,identity,settings,runtime,profile,catalog,progress,
+                session if settings['reuse_engine'] else None,backend)
+        except (OSError,ValueError,RuntimeError) as error:
+            text=str(error)
+            resource=any(s in text.lower() for s in ('ram/disk','resource boundary','resource reserve','insufficient memory','not enough memory'))
+            result=dict(status='pending' if resource else 'blocked',stage='interrupted' if resource else 'blocked',message=text[:4000])
+            if not resource:
+                from replay_catalog import failure_reason
+                result['failure']=dict(stage='conversion',reason=failure_reason(text),
+                    evidence=dict(error=text[:4000],traceback=traceback.format_exc().splitlines()[-40:]))
+                # Valid raw data for this policy cannot be prepared; its
+                # original recording and failure remain in the catalogue.
+                # A reused engine that finished the game can still hold its
+                # export open (4 Nov: a locked .training.bin killed the service).
+                session.close()
+                # 7 Nov: a file still locked after the retries (another process held a
+                # retail export) killed a 12-worker run; one leftover folder must not.
+                try:remove_owned(job_directory(job,identity))
+                except PermissionError as locked:result['message']=(text+'; cleanup left '+str(locked))[:4000]
+                (DATA/('.conversion-'+job['replay_sha256']+'.json')).unlink(missing_ok=True)
+            return result
 
 
 def worker_main(slot,inbox,outbox,identity):
@@ -485,26 +554,7 @@ def worker_main(slot,inbox,outbox,identity):
             job,settings=request
             session.max_games=settings['engine_games']
             if not settings['reuse_engine']:session.close()
-            def progress(stage):emit(event='stage',sha=job['replay_sha256'],stage=stage)
-            with (directory/'worker.log').open('w',encoding='utf-8') as log,redirect_stdout(log):
-                try:
-                    result=convert(job,identity,settings,runtime,profile,catalog,progress,
-                        session if settings['reuse_engine'] else None)
-                except (OSError,ValueError,RuntimeError) as error:
-                    text=str(error)
-                    resource=any(s in text.lower() for s in ('ram/disk','resource boundary','resource reserve','insufficient memory','not enough memory'))
-                    result=dict(status='pending' if resource else 'blocked',stage='interrupted' if resource else 'blocked',message=text[:4000])
-                    if not resource:
-                        from replay_catalog import failure_reason
-                        result['failure']=dict(stage='conversion',reason=failure_reason(text),
-                            evidence=dict(error=text[:4000],traceback=traceback.format_exc().splitlines()[-40:]))
-                        # Valid raw data for this policy cannot be prepared; its
-                        # original recording and failure remain in the catalogue.
-                        # A reused engine that finished the game can still hold its
-                        # export open (4 Nov: a locked .training.bin killed the service).
-                        session.close()
-                        remove_owned(job_directory(job,identity))
-                        (DATA/('.conversion-'+job['replay_sha256']+'.json')).unlink(missing_ok=True)
+            result=run_job(job,identity,settings,runtime,profile,catalog,session,emit,directory/'worker.log')
             # A finished job leaves reference cycles worth up to ~80 MiB; collecting takes ~10 ms.
             gc.collect()
             emit(event='result',sha=job['replay_sha256'],result=result,engine=session.live(),private=snapshot(directory).get('private_bytes',0))

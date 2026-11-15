@@ -1,5 +1,7 @@
 """Event policy: autodiff primitives, encoder invariants, masks, sampling and Torch/NumPy agreement."""
+from collections import Counter
 import copy
+import math
 import os
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 from pathlib import Path
@@ -10,7 +12,7 @@ import numpy as np
 import torch
 
 from event_policy import EventActor
-from generals_policy import (ENTITY_COMMAND_SLOTS, ENTITY_FEATURES, KINDS, SUPPLY_BOX_SCALE, UNRATED, NeuralPolicy,
+from generals_policy import (ENTITY_COMMAND_SLOTS, ENTITY_FEATURES, KINDS, SUPPLY_BOX_SCALE, SUPPLY_COLUMN, UNRATED, NeuralPolicy,
                              map_planes, rating_inputs)
 from event_dataset import player_rating_inputs
 from nn_numpy import Tensor, categorical, conv2d, conv_transpose2d, scatter_sum, no_grad
@@ -195,19 +197,21 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(encoded['entity_command_states'][center, :2].tolist(), [[0, .4], [1, 1]])
         self.assertFalse(encoded['entity_commands'][center, 2:].any())
         self.assertFalse(encoded['entity_commands'][encoded['ids'][10]].any())
-        self.assertAlmostEqual(encoded['numeric'][enemy, ENTITY_FEATURES-1], np.log1p(300)/SUPPLY_BOX_SCALE)
-        self.assertEqual(encoded['numeric'][encoded['ids'][100], ENTITY_FEATURES-1], 0)
+        self.assertAlmostEqual(encoded['numeric'][enemy, SUPPLY_COLUMN], np.log1p(300)/SUPPLY_BOX_SCALE)
+        self.assertEqual(encoded['numeric'][encoded['ids'][100], SUPPLY_COLUMN], 0)
         obs['own_entities'][1]['command_cooldowns'] = [{'command': 'Command_Capture', 'ready_percent': 0}]*(ENTITY_COMMAND_SLOTS+1)
         with self.assertRaisesRegex(ValueError, 'command slots'):
             self.policy.encoder.encode(obs, self.terrain, 6)
 
     def test_ratings_are_per_player_with_unrated_flags(self):
-        np.testing.assert_allclose(rating_inputs(1700, None), [2, 1, 0, 0])
-        np.testing.assert_allclose(rating_inputs(500, 9000), [-2, 1, 5, 1])
+        # Per side: (scaled value, rated flag, estimated flag).
+        np.testing.assert_allclose(rating_inputs(1700, None), [2, 1, 0, 0, 0, 0])
+        np.testing.assert_allclose(rating_inputs(500, 9000), [-2, 1, 0, 5, 1, 0])
         self.assertFalse(UNRATED.any())
-        mirror = player_rating_inputs({'2': 1400, '3': None})
-        np.testing.assert_allclose(mirror['2'], [1, 1, 0, 0])
-        np.testing.assert_allclose(mirror['3'], [0, 0, 1, 1])
+        # Selection's form (replay_cleaning.player_ratings): estimated ratings get their own flag.
+        mirror = player_rating_inputs({'2': {'rating': 1400, 'estimated': False}, '3': {'rating': 2000, 'estimated': True}})
+        np.testing.assert_allclose(mirror['2'], [1, 1, 0, 3, 0, 1])
+        np.testing.assert_allclose(mirror['3'], [3, 0, 1, 1, 1, 0])
         decision = self.policy.decide({**self.encoded, 'ratings': rating_inputs(1730, None)}, deterministic=True)
         self.assertEqual(len(decision), 6)
 
@@ -251,20 +255,48 @@ class PolicyTests(unittest.TestCase):
 
 class AgreementTests(unittest.TestCase):
     """The deployed NumPy policy and the PyTorch learner compute the same likelihoods and gradients."""
-    def check(self, placement_mode):
+    def check(self, placement_mode, head_scale=None):
         config, obs, terrain = fixture(placement_mode)
         policy = NeuralPolicy(config, 5)
+        if head_scale:  # Extreme head logits, so LOGIT_CAP is what bounds them.
+            for name in ('verb_w', 'delay_w', 'angle_w', 'slot_w', 'command_query_w',
+                         'template_query_w', 'target_pointer_w', 'unit_query_w'):
+                policy.parameters[name].data *= head_scale
         # Ready and charging buttons, and a seen supply count, reach both implementations.
         obs['own_entities'][1].update(commands=['Command_UpgradeChinaRadar'],
                                       command_cooldowns=[{'command': 'Command_ArtilleryBarrage', 'ready_percent': 40.0}])
         obs['known_nonowned_entities'][0]['supply_boxes'] = 300
+        # A full queue: a unit in production, a queued upgrade and more units pending.
+        obs['own_entities'][1]['production_queue'] = [
+            {'remaining_quantity': 1, 'progress': 40, 'unit_type': 'ChinaVehicleDozer'},
+            {'remaining_quantity': 1, 'progress': 0, 'upgrade': 'Upgrade_ChinaRadar'},
+            {'remaining_quantity': 2, 'progress': 0, 'unit_type': 'ChinaVehicleDozer'}]
         if placement_mode == 'full_mask':
             obs['build_placements'] = [grid(np.ones((16, 16), bool), angle=angle, frame=6) for angle in range(16)]
+        # Armed units, armour and an upgraded unit's bonuses (re-export fix 4) reach both implementations.
+        from generals_policy import DAMAGE_TYPES, TemplateTable
+        obs['own_entities'][0].update(weapons=[0, 1, -1], armor=0, weapon_bonus=[1.25, 1.33, 1.5])
+        obs['own_entities'][1].update(weapons=[-1, -1, -1], armor=1, weapon_bonus=[1, 1, 1])
+        obs['known_nonowned_entities'][0].update(weapons=[1, -1, -1], armor=1)
+        table = TemplateTable(60)
+        table.add({'weapons': [
+            {'id': 0, 'range': 150.0, 'min_range': 0.0, 'damage': 40.0, 'radius': 5.0, 'min_delay_frames': 30,
+             'max_delay_frames': 50, 'clip_size': 3, 'clip_reload_frames': 120, 'anti_mask': 5, 'damage_type': 2},
+            {'id': 1, 'range': 300.0, 'min_range': 50.0, 'damage': 100.0, 'radius': 30.0, 'min_delay_frames': 90,
+             'max_delay_frames': 90, 'clip_size': 0, 'clip_reload_frames': 0, 'anti_mask': 2, 'damage_type': 7}],
+            'armors': [{'id': 0, 'damage_multipliers': list(np.linspace(0, 2, DAMAGE_TYPES))},
+                       {'id': 1, 'damage_multipliers': [.25]*DAMAGE_TYPES}]})
         rows = examples(policy, obs, terrain)
         for i, row in enumerate(rows):
             row['encoded']['ratings'] = rating_inputs(1500+100*i, None if i % 2 else 900)
+            row['encoded'].update(table.arrays())
         model = TorchPolicyV3(policy, dtype=torch.float64)
         encoded = [row['encoded'] for row in rows]
+        # The rating input is off by default: the learner then feeds every row as unrated.
+        from training_preparation import encode_values
+        self.assertFalse(encode_values(model, encoded)[0]['ratings'][0].any())
+        policy.config['rating_input'] = True
+        self.assertTrue(encode_values(model, encoded)[0]['ratings'][0].any())
         output = model.teacher_heads(encoded, [row['target'] for row in rows], *model.events(encoded))
         expected = []
         for parameter in policy.parameters.values():
@@ -274,6 +306,13 @@ class AgreementTests(unittest.TestCase):
             expected.append(float(logp.data))
             logp.backward()
         np.testing.assert_allclose(output['logp'].detach().numpy(), expected, atol=1e-9, rtol=1e-9)
+        if head_scale:
+            from generals_policy import LOGIT_CAP
+            terms = {name: (values.detach().numpy(), output['head_counts'][name])
+                     for name, values in output['by_head'].items()}
+            worst = min(float(np.min(v[c > 0]/c[c > 0])) for v, c in terms.values() if (c > 0).any())
+            self.assertLess(worst, -.8*LOGIT_CAP)  # The scaling reached the cap...
+            self.assertGreaterEqual(worst, -(LOGIT_CAP+math.log(config['position_bins']**2)))  # ...which bounds it.
         output['logp'].sum().backward()
         for name, parameter in model.weights.items():
             reference = policy.parameters[name].grad
@@ -281,11 +320,153 @@ class AgreementTests(unittest.TestCase):
             reference = np.zeros_like(actual) if reference is None else reference
             np.testing.assert_allclose(actual, reference, atol=3e-9, rtol=3e-8, err_msg=name)
 
+    def test_target_smoothing_is_the_expected_exact_log_probability(self):
+        """Smoothed delay/cell/offset terms equal sum_w q_w log p(w), scored by exact-target passes."""
+        from training_preparation import soft_targets
+        config, obs, terrain = fixture('fast')
+        policy = NeuralPolicy(config, 5)
+        rows = examples(policy, obs, terrain)
+        model = TorchPolicyV3(policy, dtype=torch.float64)
+        plain = dict(model.config)
+        encoded = [row['encoded'] for row in rows]
+        trunk = model.events(encoded)
+
+        def heads(targets, smoothing=None):
+            model.config = plain if smoothing is None else dict(plain, target_smoothing=smoothing)
+            with torch.no_grad():
+                return model.teacher_heads(encoded, targets, *trunk)
+
+        targets = [row['target'] for row in rows]
+        smoothing = {'delay': 1.0, 'angle': 1.0, 'position': {'default': .6}}
+        smoothed, exact = heads(targets, smoothing), heads(targets)
+        self.assertEqual(set(smoothed['exact_by_head']), {'delay', 'cell', 'offset', 'angle'})
+        for name, value in smoothed['exact_by_head'].items():  # Exact terms are untouched by smoothing.
+            np.testing.assert_allclose(value.numpy(), exact['by_head'][name].numpy(), atol=1e-12, err_msg=name)
+        # Delay: rescore every tick as the teacher's and weight the exact log-probabilities.
+        ticks = model.config['delay_ticks']
+        by_tick = np.stack([heads([dict(t, delay=index) for t in targets])['by_head']['delay'].numpy()
+                            for index in range(len(ticks))], axis=1)
+        choices = [t.get('delay', 0) for t in targets]  # Target delays are indices into delay_ticks.
+        q = soft_targets(np.ones((len(targets), len(ticks)), bool), choices, 1.0, ticks)
+        np.testing.assert_allclose(smoothed['by_head']['delay'].numpy(), (q*by_tick).sum(axis=1), atol=1e-9)
+        # Position: one row, every pixel of its window rescored as the teacher pixel.
+        n, fine = model.config['map_side'], model.config['position_bins']//model.config['map_side']
+        row = next(i for i, t in enumerate(targets) if 'x' in t and t['kind'] != 'build')
+        total, weights = 0.0, []
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                x, y = targets[row]['x']+dx, targets[row]['y']+dy
+                w = np.exp(-.5*(dx*dx+dy*dy)/.36)
+                if not (0 <= x < 256 and 0 <= y < 256) or w < 1e-4:
+                    continue
+                moved = dict(targets[row], x=x, y=y, cell=(y//fine)*n+x//fine, offset=(y % fine)*fine+x % fine)
+                out = heads([moved if i == row else t for i, t in enumerate(targets)])['by_head']
+                total += w*float(out['cell'][row]+out['offset'][row])
+                weights.append(w)
+        expected = total/sum(weights)
+        actual = float(smoothed['by_head']['cell'][row]+smoothed['by_head']['offset'][row])
+        self.assertAlmostEqual(actual, expected, places=9)
+        self.assertLess(actual, float(exact['by_head']['cell'][row]+exact['by_head']['offset'][row])+5)
+
+    def test_distance_scaled_position_width_is_the_fixed_width_for_that_order(self):
+        """clamp(k*d, min, max), d from the selected units' centre, scores each order like that fixed width."""
+        from training_preparation import order_distance, position_width, validate_smoothing
+        config, obs, terrain = fixture('fast')
+        policy = NeuralPolicy(config, 5)
+        rows = examples(policy, obs, terrain)
+        model = TorchPolicyV3(policy, dtype=torch.float64)
+        plain = dict(model.config)
+        encoded = [row['encoded'] for row in rows]
+        targets = [row['target'] for row in rows]
+        trunk = model.events(encoded)
+
+        def position_terms(width):
+            model.config = dict(plain, target_smoothing={'position': {'default': width}})
+            with torch.no_grad():
+                out = model.teacher_heads(encoded, targets, *trunk)['by_head']
+            return (out['cell']+out['offset']).numpy()
+
+        scaled = {'per_pixel': .25, 'min': .5, 'max': 1.5}
+        validate_smoothing({'position': {'default': scaled, 'rally': 2}})
+        for bad in ({'per_pixel': .25, 'min': 2, 'max': 1}, {'per_pixel': .25, 'min': .5}, {'per_pixel': -1, 'min': 0, 'max': 1}):
+            with self.assertRaises(ValueError):
+                validate_smoothing({'position': {'default': bad}})
+        self.assertEqual((position_width(scaled, None), position_width(scaled, 1), position_width(scaled, 4),
+                          position_width(scaled, 100), position_width(.7, 100)), (.5, .5, 1., 1.5, .7))
+        spatial = [i for i, t in enumerate(targets) if 'x' in t]  # Fast placement smooths builds too.
+        bins = plain['position_bins']
+        widths = []
+        for i in spatial:
+            centre = np.asarray(encoded[i]['numeric'])[targets[i]['selection'], :2].mean(axis=0)*bins
+            distance = order_distance(encoded[i], targets[i]['selection'], targets[i], bins)
+            self.assertAlmostEqual(distance, float(np.hypot(targets[i]['x']+.5-centre[0], targets[i]['y']+.5-centre[1])))
+            widths.append(position_width(scaled, distance))
+        self.assertGreater(len(set(widths)), 1, 'the fixture should give orders different widths')
+        actual = position_terms(scaled)  # Indexed by batch row.
+        for i, width in zip(spatial, widths):
+            self.assertAlmostEqual(float(actual[i]), float(position_terms(width)[i]), places=10)
+        self.assertEqual(order_distance(encoded[spatial[0]], [], targets[spatial[0]], bins), None)
+
+    def test_distance_to_click_is_the_predicted_distribution_scored_pixel_by_pixel(self):
+        """position_errors' expected and mode distances equal a brute-force pass over every pixel."""
+        from train_events import order_length_band, position_report, position_summary
+        config, obs, terrain = fixture('fast')
+        policy = NeuralPolicy(config, 5)
+        rows = examples(policy, obs, terrain)
+        model = TorchPolicyV3(policy, dtype=torch.float64)
+        encoded = [row['encoded'] for row in rows]
+        targets = [row['target'] for row in rows]
+        trunk = model.events(encoded)
+        with torch.no_grad():
+            output = model.teacher_heads(encoded, targets, *trunk, position_metrics=True)
+        expected, mode = (value.numpy() for value in output['position_errors'])
+        spatial = [i for i, t in enumerate(targets) if 'x' in t]
+        self.assertEqual(len(expected), len(spatial))
+        bins, side = model.config['position_bins'], model.config['map_side']
+        fine = bins//side
+        for j, row in enumerate(spatial):
+            probabilities = np.zeros((bins, bins))
+            for y in range(bins):
+                for x in range(bins):
+                    moved = dict(targets[row], x=x, y=y, cell=(y//fine)*side+x//fine, offset=(y % fine)*fine+x % fine)
+                    try:
+                        with torch.no_grad():
+                            out = model.teacher_heads(encoded, [moved if i == row else t for i, t in enumerate(targets)],
+                                                      *trunk)['by_head']
+                    except ValueError:  # An illegal cell has no probability.
+                        continue
+                    probabilities[y, x] = np.exp(float(out['cell'][row]+out['offset'][row]))
+            self.assertAlmostEqual(probabilities.sum(), 1, places=9)
+            yy, xx = np.mgrid[0:bins, 0:bins]
+            distance = np.hypot(xx-targets[row]['x'], yy-targets[row]['y'])
+            self.assertAlmostEqual(float(expected[j]), float((probabilities*distance).sum()), places=5)
+            self.assertAlmostEqual(float(mode[j]), float(distance.flat[probabilities.argmax()]), places=5)
+        # The report: one microbatch's position rows by kind and, for movement, by order length.
+        from training_preparation import PreparationSpec, teacher_plan
+        plan = teacher_plan(PreparationSpec(model.config, 'k', reference=policy), encoded, targets, 40)
+        totals = Counter()
+        position_report(totals, {'plan': plan, 'rows': [{'target': t} for t in targets]}, expected, mode)
+        by_kind = position_summary(totals, 'position')
+        self.assertEqual({kind: v['orders'] for kind, v in by_kind.items()},
+                         dict(Counter(targets[i]['kind'] for i in spatial)))
+        moves = [j for j, i in enumerate(spatial) if targets[i]['kind'] == 'move']
+        self.assertAlmostEqual(by_kind['move']['mean_mode_pixels'], float(mode[moves].mean()), places=6)  # float32
+        self.assertAlmostEqual(by_kind['move']['mode_within_3'], float((mode[moves] <= 3).mean()))
+        lengths = position_summary(totals, 'position_length')
+        self.assertEqual(sum(v['orders'] for v in lengths.values()),
+                         sum(targets[i]['kind'] in ('move', 'attack_move', 'add_waypoint') for i in spatial))
+        self.assertEqual([order_length_band(d) for d in (None, 3, 15, 79.9, 80)], ['no_units', '0-15', '15-40', '40-80', '80+'])
+
     def test_fast_placement_likelihoods_and_gradients_match(self):
         self.check('fast')
 
     def test_full_mask_placement_likelihoods_and_gradients_match(self):
         self.check('full_mask')
+
+    def test_capped_head_logits_bound_each_decision_and_match(self):
+        for mode in ('fast', 'full_mask'):
+            with self.subTest(mode):
+                self.check(mode, head_scale=1e4)
 
 
 class StorageTests(unittest.TestCase):

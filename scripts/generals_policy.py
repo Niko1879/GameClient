@@ -18,13 +18,16 @@ import threading
 
 import numpy as np
 
-from generals_identity import IdentityHierarchy, in_production_scope, validate_production_scope
+from generals_identity import IdentityHierarchy, in_production_scope, production_twin, validate_production_scope
 from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum
 
-ARCHITECTURE = 'generals-relational-v4-event'
-OBSERVATION_VERSION = 9
+# v6 (re-export, Nov 2026): logit caps on every head (exact shift gradient), weapon/armour inputs,
+# full production queue, no science action, visible-only enemies (observation v10). Older models
+# play from their own code snapshot (their run's sources.zip), never through compatibility branches.
+ARCHITECTURE = 'generals-relational-v6-event'
+OBSERVATION_VERSION = 11
 KINDS = ('wait', 'move', 'attack_move', 'attack', 'stop', 'sell', 'build', 'train', 'rally', 'dock',
-         'resume_construction', 'upgrade', 'science', 'ability', 'enter', 'exit', 'evacuate',
+         'resume_construction', 'upgrade', 'ability', 'enter', 'exit', 'evacuate',
          'guard', 'guard_air', 'cancel_production', 'cancel_construction', 'scatter', 'add_waypoint',
          'force_attack', 'force_attack_ground', 'repair', 'get_repaired')
 # Ability commands add an entity target or a position according to their command.
@@ -41,11 +44,13 @@ QUEUE_SLOTS = 9
 PAIR_FIELDS = {'dock': 'dock_targets', 'enter': 'enter_targets', 'repair': 'repair_targets',
                'get_repaired': 'repair_depots'}
 COMMAND_KINDS = ('upgrade', 'ability')
-ENTITY_FEATURES = 22
+# v11 (15 Nov 2026) appends firing, poisoned and burning: what a player sees on a visible unit now.
+ENTITY_FEATURES = 25
 # Divides world units per second, so a fast ground unit is near 1.
 VELOCITY_SCALE = 100
 # Numeric columns read back when building model inputs.
 OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN, COOLDOWN_COLUMN, UNDER_ATTACK_COLUMN = 5, 6, 7, 14, 15
+SUPPLY_COLUMN, FIRING_COLUMN, POISONED_COLUMN, BURNING_COLUMN = 21, 22, 23, 24
 EXTRA_ENTITY_FEATURES = 14
 ENTITY_UPGRADE_SLOTS = 4
 # Upgrade/ability buttons per owned entity: (available, ready fraction) each. Vanilla
@@ -53,12 +58,25 @@ ENTITY_UPGRADE_SLOTS = 4
 ENTITY_COMMAND_SLOTS = 16
 # A full supply dock holds a few hundred boxes.
 SUPPLY_BOX_SCALE = 8
-# Pre-match Overall ladder rating, the player's and the opponent's: (rating-centre)/scale
-# and a rated flag each. Vanilla China players, 3 Nov 2026: median 1094, sd 291, 20%
-# unrated. Live play conditions on the 95th percentile (1730) against an unrated opponent.
+# Pre-match Overall ladder rating, the player's and the opponent's: (rating-centre)/scale, a
+# rated flag (a ladder rating, or the player's own rating found by name) and an estimated flag
+# (scripts/rating_estimator.py's joint estimate, for players with neither; re-export fix 7).
+# Vanilla China players, 3 Nov 2026: median 1094, sd 291. Live play conditions on the 95th
+# percentile (1730).
 RATING_CENTER, RATING_SCALE, PLAY_RATING = 1100, 300, 1730
-RATING_FEATURES = 4
-SCALAR_FEATURES = 16
+RATING_FEATURES = 6
+# v11 appends the public superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
+SCALAR_FEATURES = 22
+SUPERWEAPON_SECONDS = 600
+# v11 current perception (TrainingExporter: effects, audio_cues), one token group sharing the entity
+# attention but never an actor or target: projectiles and hazards visible now, and special-power
+# launch sounds heard in the last CUE_SECONDS. Columns: x, y, z, has position, velocity x/y/z,
+# radius, own, enemy, projectile, hazard, cue, cue age.
+EFFECT_FEATURES = 14
+CUE_SECONDS = 5
+EFFECT_RADIUS_SCALE = 50
+# Width of the map summary (map_fc), AlphaStar's 256 whatever the entity width (15 Nov 2026).
+MAP_EMBEDDING = 256
 # since_decision and since_command stay in stored scalars but never reach the model:
 # quiet rows are kept at most 120 ticks apart, so these clocks give away wait vs command.
 HIDDEN_SCALARS = (9, 14)
@@ -71,6 +89,10 @@ COOLDOWN_BINS = 32
 COOLDOWN_BIN_SECONDS = .045
 MAX_COOLDOWN_SECONDS = 10
 DERIVED_ENTITY_FEATURES = POSITION_BITS+COOLDOWN_BINS
+# Weapon and armour inputs (re-export fix 4): the engine's three weapon slots and its damage types
+# (DAMAGE_NUM_TYPES, both engine trees); the anti mask's low bits. See arms_inputs.
+WEAPON_SLOTS, DAMAGE_TYPES, ANTI_BITS = 3, 38, 8
+ARMS_FEATURES = WEAPON_SLOTS*(1+7+ANTI_BITS+DAMAGE_TYPES)+1+DAMAGE_TYPES
 # A unit counts as under attack on the alert map for this long after taking damage.
 UNDER_ATTACK_TICKS = 120
 ATTENTION_LAYERS = 3
@@ -80,7 +102,20 @@ SCATTER_SCALE = 8
 SCATTER_VOLUME = 4
 MAP_RESIDUAL_BLOCKS = 4
 LOCATION_BLOCKS = 4
+# Every head's logits, shifted so the best legal choice is 0, are soft-capped to
+# (-cap, 0]: no choice is more than e^cap times less likely than the best, bounding any
+# one decision's loss near cap+log(choices). The position map is capped as a whole
+# before its cell/offset split; the other heads at their categorical draw. The
+# upsampling stages before the position logits are layer-normalised so their gains
+# cannot compound. Uncapped action-kind and angle logits reached NLL 107 and 377 in
+# v10 (11 Nov 2026).
+LOGIT_CAP = 50.0
 ACTION_RESIDUAL_BLOCKS = 16
+# Each selected unit's key enters the autoregressive embedding divided by this constant, as
+# AlphaStar's mean over its fixed 512 entity slots does. It was the observation's own entity
+# count until 12 Nov 2026, which made the same selection ~40x fainter late in a game than in
+# the opening. 16 is about the smallest entity count seen, so no selection got fainter.
+SELECTED_UNIT_DIVISOR = 16
 # Live sampling temperature for every argument except the delay.
 SAMPLING_TEMPERATURE = .8
 
@@ -145,13 +180,18 @@ def entity_command_inputs(p, ids, states, e):
 
 
 def rating_inputs(own, opponent):
-    """Model rating inputs from two pre-match ratings; None is unrated."""
+    """Model rating inputs from two pre-match ratings.
+
+    A rating is a number (rated), {'rating': value, 'estimated': bool} (replay_cleaning.player_ratings)
+    or None (unknown). Each side gives (scaled value, rated flag, estimated flag)."""
     values = []
     for rating in (own, opponent):
         if rating is None:
-            values += [0., 0.]
-        else:
-            values += [float(np.clip((rating-RATING_CENTER)/RATING_SCALE, -3, 5)), 1.]
+            values += [0., 0., 0.]
+            continue
+        estimated = bool(rating['estimated']) if isinstance(rating, dict) else False
+        value = rating['rating'] if isinstance(rating, dict) else rating
+        values += [float(np.clip((value-RATING_CENTER)/RATING_SCALE, -3, 5)), float(not estimated), float(estimated)]
     return np.asarray(values)
 
 
@@ -169,6 +209,82 @@ def derived_inputs(numeric):
     numeric = np.asarray(numeric, dtype=np.float64)
     bins = np.minimum((numeric[..., COOLDOWN_COLUMN]/COOLDOWN_BIN_SECONDS+1e-6).astype(np.int64), COOLDOWN_BINS-1)
     return np.concatenate([position_bits(numeric[..., :2]), np.eye(COOLDOWN_BINS)[bins]], axis=-1)
+
+
+# The factions the policy plays and learns from (13 Nov 2026: vanilla China plus the Tank and Nuke
+# generals, which share its buildings and economy; "my general" is the player_identity input).
+CHINA_FACTIONS = ('FactionChina', 'FactionChinaTankGeneral', 'FactionChinaNukeGeneral')
+
+
+class TemplateTable:
+    """One game's weapon and armour stats by per-game id (re-export fix 4).
+
+    The exporter sends each template's stats once per player stream, in the observation where
+    it first appears (`template_stats`). Every captured observation must pass through add(),
+    selected for training or not. Times become seconds: the engines run at 30 or 60 logic frames.
+    """
+    def __init__(self, source_ticks_per_second):
+        self.rate, self.weapons, self.armors = float(source_ticks_per_second), {}, {}
+
+    def add(self, stats):
+        for w in (stats or {}).get('weapons', ()):
+            self.weapons[int(w['id'])] = [w['range'], w['min_range'], w['damage'], w['radius'],
+                                          (w['min_delay_frames']+w['max_delay_frames'])/2/self.rate,
+                                          w['clip_size'], w['clip_reload_frames']/self.rate,
+                                          w['anti_mask'], w['damage_type']]
+        for a in (stats or {}).get('armors', ()):
+            if len(a['damage_multipliers']) != DAMAGE_TYPES:
+                raise ValueError('Armour stats do not cover every damage type')
+            self.armors[int(a['id'])] = list(a['damage_multipliers'])
+
+    def arrays(self):
+        """`weapon_stats` (W, 9) and `armor_stats` (A, DAMAGE_TYPES), rows by id; ids never sent stay zero."""
+        weapons = np.zeros((max(self.weapons, default=-1)+1, 9))
+        for i, row in self.weapons.items():
+            weapons[i] = row
+        armors = np.zeros((max(self.armors, default=-1)+1, DAMAGE_TYPES))
+        for i, row in self.armors.items():
+            armors[i] = row
+        return {'weapon_stats': weapons, 'armor_stats': armors}
+
+
+def arms_inputs(encoded):
+    """Per-entity weapon and armour inputs (ARMS_FEATURES) from stored ids, bonuses and the game's table.
+
+    Per weapon slot: present; log-scaled range x range bonus, minimum range, damage x damage bonus,
+    radius, mean delay (s) / rate bonus, clip size, clip reload (s) / rate bonus; ANTI_BITS anti-mask
+    bits; damage-type one-hot. Then armour present and its damage multiplier per damage type.
+    """
+    weapon_ids, armor_ids = np.asarray(encoded['weapon_ids']), np.asarray(encoded['armor_ids'])
+    bonus = np.asarray(encoded['weapon_bonus'], dtype=np.float64)
+    # No table attached (e.g. a fixture row): no stats; any used id then fails the check below.
+    table = np.asarray(encoded.get('weapon_stats', np.zeros((0, 9))))
+    armors = np.asarray(encoded.get('armor_stats', np.zeros((0, DAMAGE_TYPES))))
+    # The exporter sends a template's stats before any entity uses its id.
+    if weapon_ids.max(initial=-1) >= len(table) or armor_ids.max(initial=-1) >= len(armors):
+        raise ValueError('Weapon/armour template id without stats in the game table')
+    # A game without any template keeps the columns: one zero row stands in.
+    table = table if len(table) else np.zeros((1, 9))
+    armors = armors if len(armors) else np.zeros((1, DAMAGE_TYPES))
+    count = len(armor_ids)
+    blocks = []
+    for slot in range(WEAPON_SLOTS):
+        ids = weapon_ids[:, slot]
+        present = ids >= 0
+        stats = np.where(present[:, None], table[np.maximum(ids, 0)], 0)
+        damage, reach, rate = bonus[:, 0], bonus[:, 1], np.maximum(bonus[:, 2], 1e-6)
+        numbers = np.stack([np.log1p(stats[:, 0]*reach)/7, np.log1p(stats[:, 1])/7, np.log1p(stats[:, 2]*damage)/7,
+                            np.log1p(stats[:, 3])/5, np.log1p(stats[:, 4]/rate)/3, np.log1p(stats[:, 5])/5,
+                            np.log1p(stats[:, 6]/rate)/3], axis=1)*present[:, None]
+        anti = ((stats[:, 7].astype(np.int64)[:, None] >> np.arange(ANTI_BITS)) & 1)*present[:, None]
+        kind = np.eye(DAMAGE_TYPES)[stats[:, 8].astype(np.int64)]*present[:, None]
+        blocks += [present[:, None].astype(float), numbers, anti, kind]
+    worn = armor_ids >= 0
+    multipliers = np.where(worn[:, None], np.clip(armors[np.maximum(armor_ids, 0)], 0, 4), 0)
+    blocks += [worn[:, None].astype(float), multipliers]
+    result = np.concatenate(blocks, axis=1)
+    assert result.shape == (count, ARMS_FEATURES)
+    return result
 
 
 def count_channels(numeric, count):
@@ -210,6 +326,16 @@ def location_order(config):
     return ((cell//n)*fine+offset//fine)*bins+(cell%n)*fine+offset%fine
 
 
+def cap_logits(logits, mask):
+    """LOGIT_CAP's soft cap on one head's logits (a Tensor), shifted by the best legal one.
+
+    The shift is that logit itself, not a detached copy: under the cap the shift changes the
+    distribution, so the gradient must flow through it to be exact."""
+    legal = np.flatnonzero(np.asarray(mask, dtype=bool))
+    top = logits[int(legal[np.argmax(logits.data[legal])])]
+    return ((logits-top)/LOGIT_CAP).tanh()*LOGIT_CAP
+
+
 def location_stages(config):
     """Output channels of each 2x upsampling from map_side to position_bins."""
     fine, channels = config['position_bins']//config['map_side'], config['map_hidden']
@@ -232,6 +358,8 @@ class Encoder:
         self.types = {name: i for i, name in enumerate(config['types'])}
         self.identity = IdentityHierarchy(config)
         self.upgrade_ids = {name: i+1 for i, name in enumerate(config['upgrades'])}
+        # Special powers (v11 sound cues); 0 is an unknown power.
+        self.power_ids = {name: i+1 for i, name in enumerate(config['powers'])}
         # Row 0 is the empty command slot.
         self.command_ids = {name: i+1 for i, name in enumerate(config['commands'])}
         # Per-game inputs, found by the identity of the game's terrain record.
@@ -317,12 +445,52 @@ class Encoder:
                 'low': low, 'span': span, 'rotated': False,
                 'purchasable_sciences': self._player_flags(observation['player'])[1]}
 
+    @staticmethod
+    def _superweapons(observation):
+        """Public timers (every player's, as the UI shows them), own then enemy: present, soonest, ready."""
+        me, values = observation['player']['index'], []
+        for own in (True, False):
+            timers = [t for t in observation['superweapons'] if (t['owner'] == me) == own]
+            values += [float(bool(timers)),
+                       min(t['ready_seconds'] for t in timers)/SUPERWEAPON_SECONDS if timers else 0.,
+                       float(any(t['ready'] for t in timers))]
+        return np.minimum(np.asarray(values), 1.)
+
+    def _effects(self, observation, low, high, span, rotated, source_ticks_per_second):
+        """(numeric (n, EFFECT_FEATURES), catalog types, power ids): v11's projectiles, hazards and sound cues.
+
+        Ordered without ids, like entities; positions and velocities in the canonical (mirrored) frame."""
+        me = observation['player']['index']
+        mirror = -1. if rotated else 1.
+        rows, types, powers = [], [], []
+        def place(position):
+            if position is None:
+                return [0., 0., 0., 0.]
+            xy = (low+high-np.asarray(position[:2], dtype=float)) if rotated else np.asarray(position[:2], dtype=float)
+            xy = (xy-low)/span
+            return [float(xy[0]), float(xy[1]), position[2]/512, 1.]
+        effects = sorted(observation['effects'], key=lambda e: (e['kind'], e['type'], tuple(e['position']), e['owner']))
+        for e in effects:
+            vx, vy, vz = (v*source_ticks_per_second/VELOCITY_SCALE for v in e['velocity'])
+            rows.append(place(e['position']) + [mirror*vx, mirror*vy, vz, min(e['radius']/EFFECT_RADIUS_SCALE, 1.),
+                        float(e['owner'] == me), float(e['owner'] >= 2 and e['owner'] != me),
+                        float(e['kind'] == 'projectile'), float(e['kind'] == 'hazard'), 0., 0.])
+            types.append(self.types.get(e['type'], 0)); powers.append(0)
+        cues = sorted(observation['audio_cues'], key=lambda c: (c['power'], c['owner'], c['ticks_since']))
+        for c in cues:
+            age = min(c['ticks_since']/source_ticks_per_second/CUE_SECONDS, 1.)
+            rows.append(place(c['position']) + [0., 0., 0., 0., float(c['owner'] == me),
+                        float(c['owner'] >= 2 and c['owner'] != me), 0., 0., 1., age])
+            types.append(0); powers.append(self.power_ids.get(c['power'], 0))
+        return (np.asarray(rows, dtype=float).reshape(-1, EFFECT_FEATURES), np.asarray(types, dtype=int),
+                np.asarray(powers, dtype=int))
+
     def encode(self, observation, terrain, frame, *, previous_frame=None, home_position=None,
                source_ticks_per_second=60):
         if observation.get('observation_policy_version') != OBSERVATION_VERSION:
             raise ValueError('Policy requires observation version %d' % OBSERVATION_VERSION)
-        if observation['player']['faction'] != 'FactionChina':
-            raise ValueError('Policy is for vanilla China')
+        if observation['player']['faction'] not in CHINA_FACTIONS:
+            raise ValueError('Policy is for vanilla, Tank and Nuke China')
         low, high, span = self._bounds(terrain)
         # Canonical coordinates: every player starts in the same half of the map.
         home_position = home_position if home_position is not None else initial_home(observation)
@@ -383,7 +551,9 @@ class Encoder:
                 mirror*np.sin(facing), mirror*np.cos(facing),
                 column('veterancy', 0) / 3,
                 # Public: a seen pile's depletion; a fogged sighting keeps its last count.
-                np.log1p(column('supply_boxes')) / SUPPLY_BOX_SCALE])
+                np.log1p(column('supply_boxes')) / SUPPLY_BOX_SCALE,
+                # v11: visible now (the exporter clears them on fog ghosts).
+                column('firing'), column('poisoned'), column('burning')])
         else:
             # A zero row keeps pooling and pointer shapes defined after defeat.
             numeric = np.asarray([[0] * ENTITY_FEATURES])
@@ -397,7 +567,8 @@ class Encoder:
             float(p['dead']), np.log1p(frame / 60) / 10, np.log1p(since_decision / 60),
             len(observation['own_entities']) / 100, len(observation['known_nonowned_entities']) / 100,
             span[0] / 4000, span[1] / 4000]), -10), 10),
-            [np.log1p(since_command)/5, source_ticks_per_second/60]])
+            [np.log1p(since_command)/5, source_ticks_per_second/60],
+            self._superweapons(observation)])
         visible_target = np.asarray([not e['own'] and e['visible'] and e['health'] > 0 and e['max_health'] > 0
                                      for e in entities] if real_count else [False])
         encoded = {'entities': entities, 'ids': {e['id']: i for i, e in enumerate(entities)},
@@ -420,7 +591,10 @@ class Encoder:
         info = self.config['command_info']
         grid_xy = np.clip((numeric[:real_count, :2] * side).astype(int), 0, side-1)
         cells = (grid_xy[:, 1]*side+grid_xy[:, 0]).tolist()
-        queued_types = [0]*real_count
+        # Every queue slot (re-export fix 6): a unit type (catalog id, -1 when the slot holds none)
+        # or an upgrade (upgrade id, 0 when none); slot 0 is the item in production now.
+        queue_units = np.full((max(real_count, 1), QUEUE_SLOTS), -1, dtype=int)
+        queue_upgrades = np.zeros((max(real_count, 1), QUEUE_SLOTS), dtype=int)
         extra_rows, extra_index = [], []
         for index, e in enumerate(entities):
             if not e['own']:
@@ -460,19 +634,38 @@ class Encoder:
             if names:
                 known = [upgrade_ids[name] for name in names if name in upgrade_ids]
                 entity_upgrades[index, :len(known[:ENTITY_UPGRADE_SLOTS])] = known[:ENTITY_UPGRADE_SLOTS]
-            queue = e.get('production_queue')
-            if queue:
-                queued_types[index] = catalog_types.get(queue[0].get('unit_type'), 0)
+            for slot, item in enumerate(e.get('production_queue', [])[:QUEUE_SLOTS]):
+                if item.get('unit_type'):
+                    queue_units[index, slot] = catalog_types.get(item['unit_type'], 0)
+                if item.get('upgrade'):
+                    queue_upgrades[index, slot] = upgrade_ids.get(item['upgrade'], 0)
         if real_count:
             extra = np.zeros((real_count, EXTRA_ENTITY_FEATURES))
             if extra_rows:
                 extra[extra_index] = extra_rows
         else:
             extra = np.asarray([[0]*EXTRA_ENTITY_FEATURES])
+        # Weapon/armour template ids into the game's TemplateTable, and an owned unit's fire bonus.
+        weapon_ids = np.full((max(real_count, 1), WEAPON_SLOTS), -1, dtype=int)
+        armor_ids = np.full(max(real_count, 1), -1, dtype=int)
+        weapon_bonus = np.ones((max(real_count, 1), 3))
+        for index, e in enumerate(entities):
+            weapons = e.get('weapons')
+            if weapons:
+                weapon_ids[index] = weapons[:WEAPON_SLOTS]
+            armor_ids[index] = e.get('armor', -1)
+            if e['own'] and e.get('weapon_bonus'):
+                weapon_bonus[index] = e['weapon_bonus']
         player_flags, purchasable_sciences = self._player_flags(p)
+        encoded.update(weapon_ids=weapon_ids, armor_ids=armor_ids, weapon_bonus=weapon_bonus,
+                       # Empty until the game's table is attached (shards: episode shared data; live: the actor).
+                       **TemplateTable(1).arrays())
+        effect_numeric, effect_types, effect_powers = self._effects(observation, low, high, span, rotated,
+                                                                    source_ticks_per_second)
+        encoded.update(effect_numeric=effect_numeric, effect_types=effect_types, effect_powers=effect_powers)
         encoded.update(map_visibility=visibility, map_static=base, cells=np.asarray(cells or [0]),
                        extra_numeric=extra,
-                       queued_types=np.asarray(queued_types or [0]),
+                       queue_units=queue_units, queue_upgrades=queue_upgrades,
                        entity_upgrades=entity_upgrades, entity_commands=entity_commands,
                        entity_command_states=command_states, player_flags=player_flags,
                        purchasable_sciences=purchasable_sciences,
@@ -539,9 +732,14 @@ class NeuralPolicy:
         self.parameters['base_faction_embedding'].data[0] = 0
         b('general_embedding', (len(vocab['generals']), e))
         b('variant_embedding', (len(vocab['objects']), e))
-        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+4*e, d)); b('entity_b', d)
+        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+ARMS_FEATURES+5*e, d)); b('entity_b', d)
         # Row 0 is the empty upgrade slot; it is masked out of every sum.
         w('upgrade_embedding', (len(config['upgrades'])+1, e), .5)
+        # v11 effect and sound-cue tokens (Encoder._effects); power 0 is none or unknown.
+        w('effect_w', (EFFECT_FEATURES, d)); b('effect_b', d)
+        w('effect_type_w', (e, d), .5); w('effect_power_w', (e, d), .5)
+        w('power_embedding', (len(config['powers'])+1, e), .5)
+        self.parameters['power_embedding'].data[0] = 0
         self.parameters['upgrade_embedding'].data[0] = 0
         # Per-entity buttons: ready, or charging plus progress. Row 0 is the empty slot.
         for name in ('entity_command_ready', 'entity_command_charging', 'entity_command_progress'):
@@ -553,9 +751,6 @@ class NeuralPolicy:
         w('command_embedding', (len(config['commands']), e), 1)
         w('command_query_w', (ar, e), .1); b('command_b', len(config['commands']))
         w('command_context_w', (e, ar), .2)
-        w('science_embedding', (len(config['sciences']), e), 1)
-        w('science_query_w', (ar, e), .1); b('science_b', len(config['sciences']))
-        w('science_context_w', (e, ar), .2)
         w('slot_w', (ar, QUEUE_SLOTS), .1); b('slot_b', QUEUE_SLOTS)
         for layer in range(ATTENTION_LAYERS):
             for name in ('attn_q', 'attn_k', 'attn_v', 'attn_out'):
@@ -571,7 +766,8 @@ class NeuralPolicy:
         for block in range(MAP_RESIDUAL_BLOCKS):
             c(f'map_res{block}_a', m, m, 3)
             c(f'map_res{block}_b', m, m, 3)
-        w('map_fc', (n*n*m, d)); b('map_fc_b', d)
+        # AlphaStar's spatial summary width, independent of the entity width (15 Nov 2026).
+        w('map_fc', (n*n*m, MAP_EMBEDDING)); b('map_fc_b', MAP_EMBEDDING)
         w('scalar_w', (SCALAR_FEATURES, s)); b('scalar_b', s)
         w('player_identity_w', (e, s), .5, generator=identity_rng)
         w('enemy_identity_w', (e, s), .5, generator=identity_rng)
@@ -596,7 +792,8 @@ class NeuralPolicy:
         if config['placement_mode'] == 'full_mask':
             w('build_map_w', (1, m), .2)
             w('build_angle_embedding', (16, ar), .2)
-        w('event_input_w', (s+5*d, h), .7); b('event_input_b', h)
+        # Scalars, own/visible enemy/hidden enemy/neutral/effect pools, map summary.
+        w('event_input_w', (s+5*d+MAP_EMBEDDING, h), .7); b('event_input_b', h)
         w('event_hidden_w', (h, h), .7); b('event_hidden_b', h)
         w('pool_query', (s, d), .2)
         # Action type: residual blocks, then a GLU gated by scalar_context.
@@ -662,6 +859,21 @@ class NeuralPolicy:
     def type_embedding(self, types):
         return self.object_embedding(self.encoder.identity.type_objects[types])
 
+    def queue_inputs(self, units, upgrades):
+        """(current, pending): the item in production now (queue slot 0) and the sum of the rest,
+        each a unit type embedding or an upgrade embedding; empty slots add nothing."""
+        p, e = self.parameters, self.config['embedding']
+
+        def items(u, g):
+            u, g = np.asarray(u), np.asarray(g)
+            unit = self.type_embedding(np.maximum(u, 0)) * Tensor((u >= 0).astype(float)[:, None])
+            upgrade = p['upgrade_embedding'][g] * Tensor((g > 0).astype(float)[:, None])
+            return unit + upgrade
+        rows, slots = units.shape
+        current = items(units[:, 0], upgrades[:, 0])
+        pending = items(units[:, 1:].reshape(-1), upgrades[:, 1:].reshape(-1)).reshape((rows, slots-1, e)).sum(axis=1)
+        return current, pending
+
     def regularization_loss(self):
         if not self.config.get('variant_l2', 0):
             return Tensor(0)
@@ -701,11 +913,24 @@ class NeuralPolicy:
             cached = masks[kind] = (mask, bool(mask.any()))
         return cached
 
+    def production_available(self, actor, kind):
+        """The actor's current build/train options as vanilla twins (generals_identity.production_twin)."""
+        return {production_twin(self.config, name)
+                for name in actor['buildable_templates' if kind == 'build' else 'trainable_templates']}
+
+    def production_native(self, actor, kind, template):
+        """The actor's own template whose twin is `template`: what a Tank/Nuke player sends to the engine."""
+        for name in actor['buildable_templates' if kind == 'build' else 'trainable_templates']:
+            if production_twin(self.config, name) == template:
+                return name
+        return template
+
     def _production_menu(self, name, kind):
         """The templates this type offers for `kind`, within the production scope."""
         key = (name, kind)
         menu = self._menus.get(key)
         if menu is None:
+            name = production_twin(self.config, name)
             menu = self.config['menus'].get(name + '|' + ('train' if kind == 'rally' else kind), [])
             if kind in ('build', 'train') and self.config.get('production_scope') is not None:
                 choices = self._choices
@@ -737,7 +962,7 @@ class NeuralPolicy:
                 menu = self._production_menu(e['type'], kind)
                 passes = bool(menu and (kind == 'rally' or e.get('construction_percent') == -1))
                 if kind != 'rally' and passes:
-                    passes = not menu.isdisjoint(e[field])
+                    passes = not menu.isdisjoint(self.production_available(e, kind))
                 mask[i] = passes
         elif kind in ('move', 'attack_move', 'add_waypoint'):
             mobile = self.mobile_types
@@ -753,8 +978,6 @@ class NeuralPolicy:
         elif kind == 'evacuate':
             info = self.config['command_info']
             mask[[i for i, e in rows if not any(info.get(name, [''])[0] == 'evacuate' for name in e.get('commands', ()))]] = False
-        elif kind == 'science':
-            mask[:] = False
         elif kind in GUARD_KINDS or kind == 'scatter':
             # Owner-only native flag: the group dispatch reaches every mobile AI.
             mask[[i for i, e in rows if not e.get('can_guard', False)]] = False
@@ -914,7 +1137,6 @@ class NeuralPolicy:
     def verb_mask(self, encoded):
         mask = np.asarray([True] + [self._cached_mask(encoded, k)[1] for k in KINDS[1:]])
         mask[KINDS.index('attack')] &= bool(encoded['visible_target'].any())
-        mask[KINDS.index('science')] = bool(self.science_mask(encoded).any())
         # A forced attack needs some other observable object to aim at.
         mask[KINDS.index('force_attack')] &= int(self.force_targets(encoded, []).sum()) > 1
         return mask
@@ -930,11 +1152,6 @@ class NeuralPolicy:
         try:
             if not self.verb_mask(encoded)[KINDS.index(kind)]:
                 raise Unrepresentable('Verb outside current action mask')
-            if kind == 'science':
-                target.update(selection=[], science=self.science_index[a['science']])
-                if not self.science_mask(encoded)[target['science']]:
-                    raise Unrepresentable('Promotion outside purchasable sciences')
-                return target
             ids = a['units'] if kind in GROUP_KINDS else [a.get('builder', a.get('producer'))]
             selection = sorted({encoded['ids'][i] for i in ids})
             if not selection or len(selection) > selection_limit(config, kind):
@@ -959,11 +1176,12 @@ class NeuralPolicy:
                 if type(a['slot']) is not int or not 0 <= a['slot'] < QUEUE_SLOTS or not self.slot_mask(encoded, selection)[a['slot']]:
                     raise Unrepresentable('Cancelled queue slot is empty')
             if kind in ('build', 'train'):
-                target['template'] = config['templates'].index(a['template'])
+                template = production_twin(config, a['template'])
+                target['template'] = config['templates'].index(template)
                 actor = encoded['entities'][selection[0]]
-                if a['template'] not in config['menus'].get(actor['type'] + '|' + kind, []):
+                if template not in config['menus'].get(production_twin(config, actor['type']) + '|' + kind, []):
                     raise Unrepresentable('Template outside producer menu')
-                if a['template'] not in actor['buildable_templates' if kind == 'build' else 'trainable_templates']:
+                if template not in self.production_available(actor, kind):
                     raise Unrepresentable('Template outside current capabilities')
             if command_target(config, target) == 'position':
                 bins = config['position_bins']
@@ -1035,24 +1253,28 @@ class NeuralPolicy:
         for stage in range(len(stages)):
             y = conv_transpose2d(y, p[f'location_up{stage}'], 2, 1)+p[f'location_up{stage}_b']
             if stage < len(stages)-1:
-                y = y.relu()
+                y = y.reshape((1, -1)).layer_norm().reshape(y.data.shape).relu()
         fine = config['position_bins']//n
-        return cells, y.reshape((-1,))[location_order(config)].reshape((n*n, fine*fine))
+        flat = y.reshape((-1,))
+        flat = ((flat-flat[int(np.argmax(flat.data))])/LOGIT_CAP).tanh()*LOGIT_CAP
+        return cells, flat[location_order(config)].reshape((n*n, fine*fine))
 
     def _encode_modalities(self, encoded):
         p, d, e = self.parameters, self.config['entity_hidden'], self.config['embedding']
         features = np.concatenate([encoded['numeric'], encoded['extra_numeric'],
-                                   derived_inputs(encoded['numeric'])], axis=1)
+                                   derived_inputs(encoded['numeric']), arms_inputs(encoded)], axis=1)
         offset = features.shape[1]
         slots = encoded['entity_upgrades']
         filled = Tensor((slots.reshape(-1) > 0).astype(float)[:, None])
         upgrades = (p['upgrade_embedding'][slots.reshape(-1)]*filled).reshape((len(slots), slots.shape[1], e)).sum(axis=1)
         commands = entity_command_inputs(p, encoded['entity_commands'], encoded['entity_command_states'], e)
+        current, pending = self.queue_inputs(encoded['queue_units'], encoded['queue_upgrades'])
         base = (Tensor(features) @ p['entity_w'][:offset]
                 + self.type_embedding(encoded['types']) @ p['entity_w'][offset:offset+e]
-                + self.type_embedding(encoded['queued_types']) @ p['entity_w'][offset+e:offset+2*e]
-                + upgrades @ p['entity_w'][offset+2*e:offset+3*e]
-                + commands @ p['entity_w'][offset+3*e:offset+4*e]
+                + current @ p['entity_w'][offset+e:offset+2*e]
+                + pending @ p['entity_w'][offset+2*e:offset+3*e]
+                + upgrades @ p['entity_w'][offset+3*e:offset+4*e]
+                + commands @ p['entity_w'][offset+4*e:offset+5*e]
                 + p['entity_b']).tanh()
         from unit_tasks import RELATIONS
         addition = Tensor(encoded['task_numeric']) @ p['task_w']
@@ -1061,7 +1283,15 @@ class NeuralPolicy:
             addition = addition + (linked @ p['task_'+role+'_w']) * Tensor(encoded['task_relation_valid'][:, i:i+1])
             addition = addition + Tensor(encoded['task_relation_features'][:, i]) @ p['task_'+role+'_features_w']
         entity = (base+addition).tanh()
-        count, heads = len(entity.data), self.config['attention_heads']
+        count = len(entity.data)
+        # v11 effects and sound cues join the attention as extra tokens, then leave before every head.
+        effects = None
+        if len(encoded['effect_numeric']):
+            tokens = (Tensor(encoded['effect_numeric']) @ p['effect_w']
+                      + self.type_embedding(encoded['effect_types']) @ p['effect_type_w']
+                      + p['power_embedding'][encoded['effect_powers']] @ p['effect_power_w'] + p['effect_b']).tanh()
+            entity = concatenate([entity.reshape((-1,)), tokens.reshape((-1,))]).reshape((count+len(tokens.data), d))
+        rows, heads = len(entity.data), self.config['attention_heads']
         width = d//heads
         for layer in range(ATTENTION_LAYERS):
             q, k, v = (entity @ p[f'{name}{layer}'] for name in ('attn_q', 'attn_k', 'attn_v'))
@@ -1071,9 +1301,11 @@ class NeuralPolicy:
                 weights = (q[:, sl] @ k[:, sl].transpose() / math.sqrt(width)).softmax(axis=1)
                 attended.append(weights @ v[:, sl])
             # concatenate() is vector-oriented; use a reshape around the head join.
-            joined = concatenate([a.transpose().reshape((-1,)) for a in attended]).reshape((d, count)).transpose()
+            joined = concatenate([a.transpose().reshape((-1,)) for a in attended]).reshape((d, rows)).transpose()
             entity = (entity + joined @ p[f'attn_out{layer}']).layer_norm()
             entity = (entity + (entity @ p[f'entity_ff_in{layer}']).relu() @ p[f'entity_ff_out{layer}']).layer_norm()
+        if rows > count:
+            effects, entity = entity[np.arange(count, rows)], entity[np.arange(count)]
         spatial, map_embedding = self._encode_map(encoded, entity)
         scalar = Tensor(visible_scalars(encoded['scalars'])) @ p['scalar_w'] + p['scalar_b']
         commands = visible_task_commands(encoded['task_commands'])
@@ -1095,10 +1327,10 @@ class NeuralPolicy:
         available = Tensor(np.asarray(self.verb_mask(encoded), dtype=float))
         scalar = scalar + Tensor(np.sqrt(counts)) @ p['unit_counts_w'] + available @ p['available_actions_w']
         gate = (identity @ p['gate_identity_w'] + enemy @ p['gate_enemy_w'] + available @ p['gate_actions_w'] + p['gate_b']).relu()
-        return scalar.tanh(), entity, spatial, map_embedding, gate
+        return scalar.tanh(), entity, spatial, map_embedding, gate, effects
 
     def _trunk(self, encoded):
-        scalar, entity, spatial, map_embedding, gate = self._encode_modalities(encoded)
+        scalar, entity, spatial, map_embedding, gate, effects = self._encode_modalities(encoded)
         p = self.parameters
         query = scalar @ p['pool_query']
         def pool(mask):
@@ -1111,8 +1343,10 @@ class NeuralPolicy:
         enemy = np.asarray([not e['own'] and e['owner'] >= 2 for e in entities] or [False])
         visible = np.asarray([e['visible'] for e in entities] or [False])
         neutral = np.asarray([not e['own'] and e['owner'] < 2 for e in entities] or [False])
+        effect_pool = (Tensor(np.zeros(self.config['entity_hidden'])) if effects is None
+                       else (effects @ query).softmax() @ effects)
         features = concatenate([scalar, pool(encoded['own']), pool(enemy & visible), pool(enemy & ~visible),
-                                pool(neutral), map_embedding])
+                                pool(neutral), effect_pool, map_embedding])
         hidden = ((features @ p['event_input_w'] + p['event_input_b']).tanh()
                   @ p['event_hidden_w'] + p['event_hidden_b']).tanh()
         value = (((hidden @ p['value_hidden_w'] + p['value_hidden_b']).tanh()) @ p['value_w'] + p['value_b'])[0]
@@ -1123,8 +1357,10 @@ class NeuralPolicy:
         p = self.parameters
         x = (hidden @ p['verb_in_w']+p['verb_in_b']).relu()
         for block in range(ACTION_RESIDUAL_BLOCKS):
-            y = (x @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']).layer_norm().relu()
-            x = x+(y @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b']).layer_norm().relu()
+            # Pre-activation: the branch ends in a linear layer, so a block can subtract from the
+            # stream as well as add (a trailing ReLU made every block's update non-negative).
+            y = x.layer_norm().relu() @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']
+            x = x+(y.layer_norm().relu() @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b'])
         logits = x.relu() @ p['verb_w']*(gate @ p['verb_gate_w']+p['verb_gate_b']).sigmoid()+p['verb_b']
         return logits, hidden @ p['ar_core_w']*(gate @ p['ar_core_gate_w']+p['ar_core_gate_b']).sigmoid()
 
@@ -1144,6 +1380,8 @@ class NeuralPolicy:
         def draw(name, logits, mask, override=None):
             nonlocal logp, entropy
             choice = override if override is not None else (teacher.get(name) if teacher is not None else None)
+            if name not in ('cell', 'offset'):  # Position: capped in _location.
+                logits = cap_logits(logits, mask)
             if teacher is None and name != 'delay' and not deterministic:
                 logits = logits/SAMPLING_TEMPERATURE
             choice, lp, ent = categorical(logits, mask, choice=choice, rng=rng, deterministic=deterministic)
@@ -1172,12 +1410,6 @@ class NeuralPolicy:
             x = (x @ p['delay_embed_hidden_w']+p['delay_embed_hidden_b']).relu()
             context = context+x @ p['delay_embed_out_w']+p['delay_embed_out_b']
         kind = KINDS[verb]
-        if kind == 'science':
-            # A player-level purchase: no actor selection.
-            embeddings = p['science_embedding']
-            index = draw('science', embeddings @ (context @ p['science_query_w']) + p['science_b'], self.science_mask(encoded))
-            trace = {'kind': kind, 'selection': [], 'science': index, 'delay': delay}
-            return [{'kind': kind, 'science': config['sciences'][index]}], trace, hidden, value, logp, entropy
         actors, selected = self.actor_mask(encoded, kind), []
         limit = selection_limit(config, kind)
         selection = teacher['selection'] if teacher else None
@@ -1199,7 +1431,7 @@ class NeuralPolicy:
             if index == len(actors):
                 break
             selected.append(index)
-            context = context+(keys[index]/len(actors)) @ p['unit_ar_w']+p['unit_ar_b']
+            context = context+(keys[index]/SELECTED_UNIT_DIVISOR) @ p['unit_ar_w']+p['unit_ar_b']
             available = self.selection_mask(encoded, kind, selected, actors)
             if not any(available[i] for i in range(len(actors)) if i not in selected):
                 break
@@ -1225,12 +1457,12 @@ class NeuralPolicy:
             action['target'] = encoded['entities'][index]['id']
         if kind in ('build', 'train'):
             actor = encoded['entities'][selected[0]]
-            menu = config['menus'][actor['type']+'|'+kind]
-            available = actor['buildable_templates' if kind == 'build' else 'trainable_templates']
+            menu = config['menus'][production_twin(config, actor['type'])+'|'+kind]
+            available = self.production_available(actor, kind)
             choices = [t in menu and t in available for t in config['templates']]
             embeddings = self.object_embedding(self.encoder.identity.template_objects)
             index = draw('template', embeddings @ (context @ p['template_query_w']) + p['template_b'], choices)
-            action['template'] = config['templates'][index]
+            action['template'] = self.production_native(actor, kind, config['templates'][index])
             context = context+embeddings[index] @ p['template_context_w']
         build_mask = None
         placement_unavailable = False

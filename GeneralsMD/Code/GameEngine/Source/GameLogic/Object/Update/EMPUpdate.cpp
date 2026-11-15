@@ -34,6 +34,7 @@
 #include "Common/ThingTemplate.h"
 #include "Common/INI.h"
 #include "Common/RandomValue.h"
+#include "Common/ReplayLogic.h"
 #include "Common/Player.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Module/EMPUpdate.h"
@@ -309,16 +310,18 @@ void EMPUpdate::doDisableAttack()
 
 					for (UnsignedInt e = 0 ; e < emitterCount; ++e)
 					{
-#if RETAIL_COMPATIBLE_CRC
 						// TheSuperHackers @fix The particle system is now decoupled from the logic crc
 						// and the side effects on the logic random seed values are preserved for retail compatibility.
+#if !RETAIL_COMPATIBLE_CRC
+						// Replays of releases before the particle decoupling spent these logic random values (Common/ReplayLogic.h).
+						if (replayLogic062026())
+#endif
 						{
 							Coord3D offs = {0,0,0};
 							curVictim->getGeometryInfo().makeRandomOffsetWithinFootprint( offs, LogicRandomValueClass() );
 							GameLogicRandomValue(3, victimHeight);
 							GameLogicRandomValue(1, 100);
 						}
-#endif
 
 						ParticleSystem *sys = TheParticleSystemManager->createParticleSystem(tmp);
 

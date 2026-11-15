@@ -80,6 +80,7 @@ __pycache__/
 # Standalone replay collection tools and their tests.
 /scripts/watch_china_replays.py
 /scripts/replay_collector.ps1
+/scripts/harvest_gentool.py
 /scripts/fetch_replay_alternates.py
 /scripts/test_watch_china_replays.py
 /scripts/test_replay_alternates.py

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ RUN=ROOT/'model-training'
 DATA=ROOT/'training-data'
 CATALOG=ROOT/'replays/catalog/replay-catalog.sqlite3'
 MANIFEST=DATA/'.model-training.json'
-ENGINE=ROOT/'replay-runtime/game/engine-38d28ef349dc3237.exe'
+ENGINE=ROOT/'replay-runtime/game/engine-df0f74a981e087f1.exe'
 STOP=RUN/'stop.json'
 
 for name in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):os.environ[name]='1'
@@ -41,29 +42,102 @@ def status(phase,**fields):
     save(RUN/'status.json',dict(phase=phase,pid=os.getpid(),updated=time.time(),**fields))
 
 
-def choose(candidates,training,validation,seed,protected_keys=(),protected_shas=(),validation_keys=None):
+# Validation strata (user decision, 9 Nov 2026): equal thirds of short, medium and
+# long games, and five rating bands by the match's mean pre-match Overall rating,
+# each with its proportional share but at least VALIDATION_FLOOR games per length
+# third, so the scarce high-rated games give a usable signal (~2% of them held out).
+LENGTH_BANDS=((10,'short'),(20,'medium'),(None,'long'))           # game minutes, upper bounds
+RATING_BANDS=((1100,'<1100'),(1400,'1100-1400'),(1700,'1400-1700'),(None,'1700+'))
+VALIDATION_FLOOR=50
+
+
+def band(value,bands):
+    return next(name for bound,name in bands if bound is None or value<bound)
+
+
+def validation_strata(metrics=None):
+    """match key -> (length band, rating band) from the raw-replay cleaning scan (scripts/replay_cleaning.py).
+
+    Length is measured from the replay's frames, never listing text. An unrated
+    match (either player without an Overall rating) is its own rating band.
+    """
+    from replay_cleaning import METRICS
+    strata={}
+    with Path(metrics or METRICS).open(encoding='utf-8') as stream:
+        for line in stream:
+            row=json.loads(line)
+            if 'error' in row:continue
+            minutes=max(row['frames'],row['last_command_frame'])/row['rate']/60
+            ratings=[(player.get('rating') or {}).get('overall') for player in row['players']]
+            rating='unrated' if None in ratings else band(sum(ratings)/len(ratings),RATING_BANDS)
+            strata[row['match_key']]=(band(minutes,LENGTH_BANDS),rating)
+    return strata
+
+
+def allocate(total,weights,capacity,floor=0):
+    """Integer quotas summing to total: at least `floor` each (when they all fit), then by weight, within capacity."""
+    cells=sorted(weights,key=str)
+    quota={c:min(floor,capacity[c]) for c in cells}
+    if sum(quota.values())>total:quota={c:0 for c in cells}
+    while sum(quota.values())<total:
+        open_=[c for c in cells if quota[c]<capacity[c]]
+        if not open_:raise ValueError(f'Only {sum(capacity.values())} candidates for {total} stratified validation matches')
+        free=total-sum(quota[c] for c in cells if c not in open_)
+        weight=sum(weights[c] for c in open_) or len(open_)
+        # One match to the open cell furthest below its weighted share; ties by name.
+        cell=max(open_,key=lambda c:(free*(weights[c] or 1)/weight-quota[c],-cells.index(c)))
+        quota[cell]+=1
+    return quota
+
+
+def stratified(rows,total,strata):
+    """`total` rows by stratum quota, each stratum in the given (seeded) order."""
+    cells={}
+    for row in rows:
+        cells.setdefault(strata[row['match_key']],[]).append(row)
+    lengths={}
+    for (length,rating),members in cells.items():
+        lengths.setdefault(length,{})[rating]=len(members)
+    per_length=allocate(total,{length:1 for length in lengths},{length:sum(sizes.values()) for length,sizes in lengths.items()})
+    chosen=set()
+    for length,sizes in lengths.items():
+        for rating,count in allocate(per_length[length],sizes,sizes,VALIDATION_FLOOR).items():
+            chosen.update(id(row) for row in cells[(length,rating)][:count])
+    return [row for row in rows if id(row) in chosen]
+
+
+def choose(candidates,training,validation,seed,protected_keys=(),protected_shas=(),validation_keys=None,strata=None):
     """Experiment roles are chosen here, independently of conversion hints.
 
     Validation is chosen first, so runs of different training sizes share it;
-    validation_keys reuses an earlier run's exact validation matches.
-    training=None takes every remaining compatible replay.
+    validation_keys reuses an earlier run's exact validation matches, and
+    strata (validation_strata) draws it by length and rating band instead of
+    the plain seeded order. training=None takes every remaining compatible replay.
     """
-    selected=[];keys=set();shas=set();wanted=set(validation_keys or ())
+    wanted=set(validation_keys or ())
     ordered=sorted(candidates,key=lambda r:(hashlib.sha256(f'{seed}|{r["replay_sha256"]}'.encode()).digest(),r['archive_sha256']))
     if wanted:ordered=[r for r in ordered if r['match_key'] in wanted]+[r for r in ordered if r['match_key'] not in wanted]
+    unique=[];keys=set();shas=set()
     for row in ordered:
         key,sha=row['match_key'],row['replay_sha256']
         if key in protected_keys or sha in protected_shas or key in keys or sha in shas:continue
-        if wanted and len(selected)<validation and key not in wanted:
+        keys.add(key);shas.add(sha);unique.append(row)
+    if wanted:
+        held=unique[:validation]
+        if len(held)<validation or any(r['match_key'] not in wanted for r in held):
             raise ValueError('Reused validation matches are not all prepared and available')
-        keys.add(key);shas.add(sha)
-        selected.append(dict(row,split='validation' if len(selected)<validation else 'train'))
-        if training is not None and len(selected)==training+validation:break
-    if training is None and len(selected)<=validation:
-        raise ValueError(f'Need more than {validation} unique compatible prepared replays; found {len(selected)}')
-    if training is not None and len(selected)!=training+validation:
-        raise ValueError(f'Need {training+validation} unique compatible prepared replays; found {len(selected)}')
-    return selected
+    elif strata is not None:
+        held=stratified(unique,validation,strata)
+    else:
+        held=unique[:validation]
+    taken={id(r) for r in held}
+    rest=[r for r in unique if id(r) not in taken]
+    if training is None and not rest:
+        raise ValueError(f'Need more than {validation} unique compatible prepared replays; found {len(unique)}')
+    if training is not None and len(rest)<training:
+        raise ValueError(f'Need {training+validation} unique compatible prepared replays; found {len(unique)}')
+    return ([dict(r,split='validation') for r in held]
+            +[dict(r,split='train') for r in (rest if training is None else rest[:training])])
 
 
 def selection(args):
@@ -81,7 +155,14 @@ def selection(args):
         protected.update(r['match_key'] for r in load(ROOT/'replays/test-reserve.json')['matches'])
         protected_shas={row[0] for row in db.execute('SELECT raw_sha256 FROM replay WHERE match_key IN ('+','.join('?' for _ in protected)+')',list(protected))} if protected else set()
         candidates=[]
-        for row in db.execute('SELECT * FROM prepared_shard WHERE available=1 AND feature_key=? AND engine_sha256=?',(key,digest(ENGINE))):
+        # Shards from the pinned engine and from the retail 1.04 engine (gamereplays.org archive,
+        # scripts/retail_conversion.py; user decision 6 Nov 2026: one batch, rating-conditioned).
+        # The Generals Online 062026 release plays on the pinned engine since the v6 re-pin.
+        from retail_conversion import RETAIL_ENGINE_SHA
+        engines=(digest(ENGINE),RETAIL_ENGINE_SHA)
+        # fetchall first: the file checks below must not hold a read lock on the live catalogue
+        # (journal_mode=delete, so a long read blocks the converter's commits).
+        for row in db.execute('SELECT * FROM prepared_shard WHERE available=1 AND feature_key=? AND engine_sha256 IN (?,?)',(key,*engines)).fetchall():
             path=Path(row['storage_path']);path=path if path.is_absolute() else ROOT/path
             if path.is_file() and path.parent.resolve()==DATA.resolve() and path.stat().st_size==row['bytes']:
                 candidates.append(dict(row))
@@ -95,22 +176,103 @@ def selection(args):
             if unscanned:raise ValueError(f'{len(unscanned)} candidates lack cleaning metrics (e.g. {unscanned[0]}); run replay_cleaning.py scan')
             before=len(candidates);candidates=[r for r in candidates if r['match_key'] not in dropped]
             cleaning.update(candidates_before=before,candidates_after=len(candidates))
+        rung=None
+        if getattr(args,'min_rating',None) is not None:
+            from replay_cleaning import china_match_ratings
+            best=china_match_ratings()
+            before=len(candidates)
+            candidates=[r for r in candidates if best.get(r['match_key']) is not None and best[r['match_key']]>=args.min_rating]
+            rung=dict(min_rating=args.min_rating,rule='highest China rating, estimates count',
+                      candidates_before=before,candidates_after=len(candidates))
+        vanilla=None
+        if getattr(args,'vanilla_from',None):
+            from replay_cleaning import vanilla_china_matches
+            allowed={e['match_key'] for e in load(args.vanilla_from)['entries']}
+            with_vanilla=vanilla_china_matches()
+            before=len(candidates)
+            candidates=[r for r in candidates if r['match_key'] not in with_vanilla or r['match_key'] in allowed]
+            vanilla=dict(source=args.vanilla_from,candidates_before=before,candidates_after=len(candidates))
         reused=None
         if args.validation_from:
             reused={e['match_key'] for e in load(args.validation_from)['entries'] if e['split']=='validation'}
             if len(reused)!=args.validation:raise ValueError('Reused validation set has a different size')
-        selected=choose(candidates,args.training,args.validation,args.seed,protected,protected_shas,reused)
+        pool,forced,archive=archive_selection(db,candidates,args)
+        training=None if args.training is None else args.training-len(forced)
+        if training is not None and training<1:raise ValueError('Forced archive matches fill the whole training set')
+        strata=validation_strata()
+        selected=choose(pool,training,args.validation,args.seed,protected,protected_shas,reused,strata=strata)
+        taken={r['match_key'] for r in selected}|{r['replay_sha256'] for r in selected}
+        selected+=[dict(r,split='train') for r in forced
+                   if r['match_key'] not in protected and r['replay_sha256'] not in protected_shas
+                   and r['match_key'] not in taken and r['replay_sha256'] not in taken]
         doc=document(db,selected,policy,model)
+        if rung:
+            # The bundle's own per-shard rule (subset_manifest.match_rating) must agree with the cut.
+            # A shard's player indices are the engine's; the ratings are keyed by the replay header's slot order.
+            # They differ when the lobby had an empty slot between players (0.4% of the top 10% on 12 Nov), so
+            # such a shard joins no rating, or the opponent's (pgo:3488269: China in header slot 2, shard player 3
+            # = the GLA player's slot). Either way it is kept (the cut was met by the header rule) and counted;
+            # more than 1% disagreeing would mean the two rules have drifted apart, not the known mismatch.
+            from subset_manifest import match_rating
+            below=sorted(e['match_key'] for e in doc['entries'] if (r:=match_rating(e)) is not None and r<args.min_rating)
+            if len(below)>0.01*len(doc['entries']):raise ValueError(f'{len(below)} selected matches fall below --min-rating by the shard rule (e.g. {below[0]})')
+            rung['shards_without_joined_rating']=sum(match_rating(e) is None for e in doc['entries'])
+            rung['shards_joined_below_cut']=below
+        held=collections.Counter('/'.join(strata[r['match_key']]) for r in selected if r['split']=='validation')
         doc['selection']=dict(seed=args.seed,training=args.training,validation=args.validation,
-            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning)
+            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning,archive=archive,rung=rung,vanilla_from=vanilla,
+            validation_strata=dict(length_minutes=LENGTH_BANDS,mean_rating=RATING_BANDS,floor=VALIDATION_FLOOR,
+                                   reused=bool(reused),counts=dict(sorted(held.items()))))
         return doc,key
     finally:db.close()
+
+
+# Archive replays (scripts/retail_conversion.py): the user's curated gamereplays.org batch
+# and GenTool uploads, told apart by their source folder.
+ARCHIVE_SOURCES={'curated':os.sep+'gamereplays'+os.sep,'gentool':os.sep+'gentool'+os.sep}
+CURATED_HOLDOUT_SALT='curated-holdout-v1'
+
+
+def archive_selection(db,candidates,args):
+    """(pool chosen by seed, training rows forced in, provenance) for the archive options.
+
+    archive='all' keeps every source in one pool. 'main' drops archive replays; 'curated'
+    forces every curated match into training (less a fixed holdout) and fills the rest
+    from the main store. GenTool uploads are only ever in 'all'. main_from restricts the
+    main store to an earlier dataset's matches, so two arms share their seed order.
+    """
+    mode=getattr(args,'archive','all')
+    if mode not in ('all','main','curated'):raise ValueError('Unknown archive mode '+str(mode))
+    sources={}
+    if mode=='all' and not getattr(args,'curated_holdout',0) and not getattr(args,'main_from',None):
+        # One pool, no holdout: provenance is not needed, and the scan (all 1.4M conversion jobs on
+        # 12 Nov) is the one long read that would block a running converter.
+        return candidates,[],dict(mode=mode,curated_available=None,curated_train=0,curated_holdout=[],main_from=None)
+    for sha,path in db.execute("SELECT replay_sha256,source_path FROM conversion_job WHERE instr(source_path,?)>0 OR instr(source_path,?)>0",
+                               tuple(ARCHIVE_SOURCES.values())):
+        sources[sha]=next(name for name,part in ARCHIVE_SOURCES.items() if part in path)
+    curated=sorted((r for r in candidates if sources.get(r['replay_sha256'])=='curated'),
+                   key=lambda r:hashlib.sha256(f'{CURATED_HOLDOUT_SALT}|{r["match_key"]}'.encode()).digest())
+    # The holdout never depends on the seed: every arm and replicate leaves out the same games.
+    count=getattr(args,'curated_holdout',0) or 0
+    holdout=[r['match_key'] for r in curated[:count]]
+    main=[r for r in candidates if r['replay_sha256'] not in sources]
+    main_from=getattr(args,'main_from',None)
+    if main_from:
+        keys={e['match_key'] for e in load(main_from)['entries']}
+        main=[r for r in main if r['match_key'] in keys]
+    forced=[]
+    if mode=='all':pool=[r for r in candidates if r['match_key'] not in set(holdout)]
+    elif mode=='main':pool=main
+    else:pool,forced=main,curated[count:]
+    return pool,forced,dict(mode=mode,curated_available=len(curated),curated_train=len(forced),
+                            curated_holdout=holdout,main_from=main_from)
 
 
 def document(db,selected,policy,model):
     """Dataset document for selected prepared_shard rows (each with its 'split'); primary-key reads only."""
     from replay_catalog import document_bytes
-    from enemy_side import enemy_faction
+    from enemy_side import match_factions
     entries=[];profile_cache={};deployment=None
     # Model rating inputs (generals_policy.rating_inputs), joined per match from the raw-replay scan.
     from replay_cleaning import player_ratings
@@ -127,7 +289,9 @@ def document(db,selected,policy,model):
         entry.update(path=Path(row['storage_path']).name,split=row['split'])
         if entry['index']['source']['replay_sha256']!=row['replay_sha256']:
             raise ValueError('Catalogue entry differs from original replay identity')
-        entry['enemy_identity']=list(model.encoder.identity.player_identity(enemy_faction(entry['index']['source']['original_replay'])))
+        # Both players' identities; event_dataset.read gives each row the one that is not its own.
+        factions=match_factions(entry['index']['source']['original_replay'])
+        entry['faction_identities']=[list(model.encoder.identity.player_identity(f)) for f in factions] if factions else None
         entry['ratings']=ratings.get(row['match_key'],{})
         entries.append(entry)
     return dict(schema=1,kind='generals_event_dataset',complete=True,config=policy,deployment=deployment,
@@ -272,7 +436,7 @@ def run(args):
                 checkpoint_stop=RUN/'checkpoint-stop.json';checkpoint_stop.unlink(missing_ok=True)
                 command=[sys.executable,'-B',ROOT/'scripts/train_events.py','train','--dataset',MANIFEST,'--output',RUN,
                     '--device',plan['device'],'--epochs',str(plan['max_epochs']),'--early-stopping-patience',str(plan['patience']),
-                    '--seed',str(plan['seed']),'--threads','1','--batch-size','256','--buffer-mib','64',
+                    '--seed',str(plan['seed']),'--threads','1','--batch-size','256','--buffer-mib','512',
                     '--pair-budget','8000000','--checkpoint-seconds','600','--min-free-ram-mib','1024',
                     '--max-private-mib','8192','--stop-file',checkpoint_stop,
                     '--lr-decay',str(plan.get('lr_decay',1.0)),'--min-lr',str(plan.get('min_lr',0.0))]
@@ -321,6 +485,17 @@ def run(args):
         except BaseException as error:status('failed',error=repr(error));raise
 
 
+def add_archive_arguments(parser):
+    parser.add_argument('--archive',choices=('all','main','curated'),default='all',
+        help="all: one pool; main: no archive replays; curated: every curated match in training, the rest from the main store")
+    parser.add_argument('--curated-holdout',type=int,default=0,help='Curated matches left out of training (fixed, seed-independent)')
+    parser.add_argument('--main-from',help="Draw main-store matches only from this dataset manifest's matches")
+    parser.add_argument('--min-rating',type=float,help='Rating ladder rung: only matches whose highest China rating '
+        '(estimates count) is at least this, for training and validation. Shares of ALL replays (12 Nov): top 10%% = 1574, top 20%% = 1356')
+    parser.add_argument('--vanilla-from',help="Matches with a vanilla China player only from this dataset manifest's matches "
+        "(Tank/Nuke-only matches unrestricted): a faction-mix arm then gains no vanilla games its baseline lacked")
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--background',action='store_true')
@@ -330,10 +505,11 @@ def main():
     parser.add_argument('--patience',type=int,default=3)
     parser.add_argument('--max-epochs',type=int,default=0,help='Optional ceiling; 0 trains until validation plateau')
     parser.add_argument('--device',choices=('cpu','cuda'),default='cuda')
-    parser.add_argument('--lr-decay',type=float,default=1.0,help='Learning-rate factor after each epoch without validation improvement (1 disables)')
+    parser.add_argument('--lr-decay',type=float,default=1.0,help='Learning-rate factor after two validation rounds in a row without improvement (1 disables)')
     parser.add_argument('--min-lr',type=float,default=0.0)
     parser.add_argument('--validation-from',help='Reuse the validation matches of an earlier dataset manifest')
     parser.add_argument('--no-cleaning',dest='cleaning',action='store_false',help='Select without the raw-replay cleaning filter')
+    add_archive_arguments(parser)
     parser.add_argument('--cleaning-option',action='append',default=[],metavar='NAME=VALUE',
         help='Override a replay_cleaning threshold, e.g. checks=afk,early_end or early_end_minutes=4')
     args=parser.parse_args()

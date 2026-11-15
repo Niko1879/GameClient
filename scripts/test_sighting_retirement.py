@@ -25,9 +25,19 @@ class SightingRetirementTests(unittest.TestCase):
 
     def test_ordinary_hidden_sightings_stay_frozen(self):
         rows = self.rows()
-        self.assertEqual(self.audit(rows)["observation_policy_version"], 9)
+        self.assertEqual(self.audit(rows)["observation_policy_version"], 11)
         rows[3]['observation']['known_nonowned_entities'][0]['health'] += 1
         with self.assertRaisesRegex(ValueError, 'Hidden sighting changed'):
+            self.audit(rows)
+
+    def test_current_activity_is_never_remembered(self):
+        # v11: a unit seen poisoned, firing or burning becomes a ghost that shows none of it.
+        rows = self.rows()
+        rows[2]['observation']['known_nonowned_entities'][0].update(poisoned=True, firing=True, burning=True)
+        rows[3]['observation']['known_nonowned_entities'][0].update(poisoned=False, firing=False, burning=False)
+        self.assertEqual(self.audit(rows)["observation_policy_version"], 11)
+        rows[3]['observation']['known_nonowned_entities'][0]['poisoned'] = True
+        with self.assertRaisesRegex(ValueError, 'Fog ghost shows current activity'):
             self.audit(rows)
 
     def test_visible_temporary_target_allowed_but_hidden_memory_rejected(self):
@@ -68,7 +78,7 @@ class SightingRetirementTests(unittest.TestCase):
         rows[0]['observation_policy'].update(neutral_excluded_templates=['Barrel'], playable_players=[entity['owner']])
         for row in rows[2:-1]:
             row['observation']['known_nonowned_entities'][0]['type'] = 'Barrel'
-        self.assertEqual(self.audit(rows)["observation_policy_version"], 9)
+        self.assertEqual(self.audit(rows)["observation_policy_version"], 11)
         rows[0]['observation_policy']['playable_players'] = [rows[2]['player_index']]
         with self.assertRaisesRegex(ValueError, 'Neutral scenery entity entered observation'):
             self.audit(rows)

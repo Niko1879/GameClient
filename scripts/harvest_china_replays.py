@@ -335,16 +335,23 @@ class MatchesFeed:
             raise ValueError(f"Feed rejected request: {state['memo']['errors']}")
         return parse_page(component["effects"]["html"])
 
-    def page(self, number):
+    def page(self, number, day=None):
+        """One feed page; `day` (ISO date) limits it to matches played that day.
+
+        The feed pages by offset, so deep pages of the unfiltered feed time out
+        (502 from page ~9,867 on 5 Nov 2026). One day is a few dozen pages at most.
+        """
+        days = {"start": day, "end": day} if day else None
         page = self.update({"amount": 100, "filters.matchTypes": ["1v1"],
-                            "filters.hasReplay": True},
+                            "filters.hasReplay": True, "filters.dateRange": days},
                            [{"path": "", "method": "gotoPage", "params": [number]}])
         state = json.loads(self.snapshot)["data"]
         filters = state["filters"][0]
+        applied = filters["dateRange"][0] if filters["dateRange"] else None
         if (state["amount"] != 100 or filters["matchTypes"][0] != ["1v1"]
-                or filters["hasReplay"] is not True
+                or filters["hasReplay"] is not True or applied != days
                 or state["paginators"][0].get("page") != number):
-            raise ValueError("Server did not apply the expected 1v1/replay/page filters")
+            raise ValueError("Server did not apply the expected 1v1/replay/date/page filters")
         return page.rows
 
 
@@ -391,7 +398,16 @@ def atomic_write(path, data):
 
 
 class Archive:
-    def __init__(self, root, *, map_name=None, map_crc=None, include_desynced=False):
+    def wanted(self, factions):
+        """A 1v1 listing with one of our sides and none of the skipped ones."""
+        return (len(factions) == 2 and any(f in self.sides for f in factions)
+                and not any(f in self.skip_sides for f in factions))
+
+    def __init__(self, root, *, map_name=None, map_crc=None, include_desynced=False,
+                 sides=("China",), skip_sides=()):
+        # sides: listing factions that make a 1v1 a candidate (default vanilla China); skip_sides: games with
+        # any of these are left to another archive (13 Nov 2026: China Tank/Nuke archive skips vanilla China).
+        self.sides, self.skip_sides = tuple(sides), tuple(skip_sides)
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.root / "harvest.sqlite3")
@@ -521,8 +537,8 @@ class Archive:
             self.finish(match_id, "excluded", error="Replay map name/revision does not match the map filter")
             return "excluded"
         factions = row["factions"]
-        if len(factions) != 2 or "China" not in factions:
-            raise ValueError("Listing does not identify a vanilla-China 1v1")
+        if not self.wanted(factions):
+            raise ValueError(f"Listing does not identify a 1v1 with one of {self.sides}")
         # Random remains unresolved in some headers. Do not invent a template ID.
         fixed = [p["header_faction"] for p in header["players"] if p["template_id"] != -1]
         available = list(factions)

@@ -13,7 +13,11 @@ from collections import Counter
 from replay_storage import open_trajectory, manifest_path
 
 # Mirrors generals_policy.OBSERVATION_VERSION; this module stays importable without NumPy.
-OBSERVATION_VERSION = 9
+OBSERVATION_VERSION = 11
+# Observation v11 per-entity state visible only now (TrainingExporter: false on fog ghosts).
+CURRENT_FIELDS = ('firing', 'poisoned', 'burning')
+# Factions whose players are exported and learned from (generals_policy.CHINA_FACTIONS; this module stays stdlib-only).
+CHINA_FACTIONS = {"FactionChina", "FactionChinaTankGeneral", "FactionChinaNukeGeneral"}
 
 
 def _finite_float(token):
@@ -113,7 +117,7 @@ def audit(path, *, level='integrity', command_counter=None, record_consumer=None
         if kind == "header":
             require(header is None and samples == 0 and terrain is None, "Duplicate/misordered header")
             require(record["schema_version"] == 1, "Unsupported schema")
-            require(record["controlled_faction"] == "FactionChina", "Wrong training faction")
+            require(set(record["controlled_faction"].split(",")) <= CHINA_FACTIONS, "Wrong training faction")
             require(record["ticks_per_second"] > 0, "Invalid tick rate")
             policy = record.get('observation_policy', {})
             require(policy.get('version') == OBSERVATION_VERSION, 'Unsupported observation version')
@@ -171,7 +175,7 @@ def audit(path, *, level='integrity', command_counter=None, record_consumer=None
             require(light or observation.get('observation_policy_version') == OBSERVATION_VERSION,
                     'Observation version mismatch')
             require(light or observation["player"]["index"] == player, "Player identity mismatch")
-            require(light or observation["player"]["faction"] == "FactionChina", "Non-vanilla China sample")
+            require(light or observation["player"]["faction"] in CHINA_FACTIONS, "Non-China sample")
             require(light or len(observation["visibility_grid"]) == terrain["grid_size"] ** 2, "Bad visibility shape")
             require(light or set(observation["visibility_grid"]) <= {0, 1, 2}, "Invalid visibility status")
             if full:
@@ -259,11 +263,13 @@ def _check_entities(observation, player, frame, memory, excluded_templates, visi
         require(not entity["own"] and entity["owner"] != player, "Wrong nonowned entity")
         require(entity.keys().isdisjoint(PRIVATE_FIELDS), "Private nonowned state leaked")
         require(entity["last_seen_frame"] <= frame, "Future sighting")
-        frozen = dict(entity)
-        frozen.pop("visible", None)
+        # v11 current activity (firing, poisoned, burning) belongs to the moment, not the sighting:
+        # it is left out of the frozen copy, and a fog ghost must show none of it.
+        frozen = {key: value for key, value in entity.items() if key != "visible" and key not in CURRENT_FIELDS}
         if entity["visible"]:
             require(entity["last_seen_frame"] == frame, "Stale visible entity")
         else:
+            require(not any(entity.get(key) for key in CURRENT_FIELDS), "Fog ghost shows current activity")
             require(entity.get('type') not in visible_only_templates, 'Hidden temporary sighting retained')
             require(player_memory.get(entity["id"]) == frozen, "Hidden sighting changed or was never seen")
         player_memory[entity["id"]] = frozen
@@ -397,7 +403,9 @@ def export(args):
         options.extend(['-trainingFormat', args.storage])
     # An earlier release's game logic, for replays it recorded (engine Common/ReplayLogic.h).
     logic = getattr(args, 'replay_logic', 'current')
-    require(logic in ('current', '081326'), 'Unknown replay logic')
+    require(logic in ('current', '081326', '062026'), 'Unknown replay logic')
+    # 062026 loads particle templates at engine start, so a reused engine session can't switch to it.
+    require(logic != '062026' or getattr(args, 'engine_session', None) is None, '062026 logic needs a fresh engine')
     # scheduled: quiet observations only where the event schedule can use them
     # (scheduled_capture.py); preparation output is unchanged.
     quiet_capture = getattr(args, 'quiet_capture', 'all')
@@ -450,6 +458,10 @@ def export(args):
         if status in ('passed', 'crc_diverged') and getattr(args, 'ticks_per_second', None) is not None:
             if native['ticks_per_second'] != args.ticks_per_second:
                 status = 'rate_mismatch'
+        # A failed capture schedule matters only for a playback that would be exported.
+        failure = controller.failure() if controller is not None else None
+        if failure is not None and status in ('passed', 'crc_diverged'):
+            raise RuntimeError('Capture schedule failed') from failure
         return status, native, returncode, earlier
 
     status, native, returncode, earlier = play()

@@ -55,7 +55,7 @@ class ProductionScopeTests(unittest.TestCase):
         self.assertEqual(vanilla_china_production(self.wide),self.config)
         wide = NeuralPolicy(self.wide,5)
         encoded = wide.encoder.encode(self.obs,self.terrain,0)
-        for key in ('types','numeric','extra_numeric','queued_types','scalars','map_visibility','player_identity'):
+        for key in ('types','numeric','extra_numeric','queue_units','queue_upgrades','scalars','map_visibility','player_identity'):
             np.testing.assert_array_equal(self.encoded[key],encoded[key])
         self.assertNotEqual(feature_identity(self.policy),feature_identity(wide))
 
@@ -63,11 +63,9 @@ class ProductionScopeTests(unittest.TestCase):
         index = self.encoded['ids']
         self.assertTrue(self.policy.actor_mask(self.encoded,'train')[index[20]])
         self.assertFalse(self.policy.actor_mask(self.encoded,'train')[index[30]])
-        self.assertFalse(self.policy.actor_mask(self.encoded,'train')[index[40]])
         self.assertTrue(self.policy.actor_mask(self.encoded,'build')[index[10]])
         self.assertFalse(self.policy.actor_mask(self.encoded,'build')[index[32]])
         for action in (dict(kind='train',producer=30,template='GLATankScorpion'),
-                       dict(kind='train',producer=40,template='ChinaVehicleDozer'),
                        dict(kind='build',builder=32,template='AmericaPowerPlant',position=[300,400,0])):
             with self.assertRaises(Unrepresentable): self.policy.target(self.encoded,[action])
         for action in (dict(kind='move',units=[31],position=[400,500,0]),
@@ -75,6 +73,29 @@ class ProductionScopeTests(unittest.TestCase):
                        dict(kind='stop',units=[31]),dict(kind='sell',units=[30]),
                        dict(kind='rally',producer=30,position=[400,500,0])):
             self.assertEqual(self.policy.target(self.encoded,[action])['kind'],action['kind'])
+
+    def test_tank_and_nuke_production_is_learned_and_played_as_vanilla_twins(self):
+        from generals_identity import production_twin
+        self.assertEqual(production_twin(self.config,'Nuke_ChinaVehicleDozer'),'ChinaVehicleDozer')
+        self.assertEqual(production_twin(self.config,'Tank_ChinaTankEmperor'),'ChinaTankOverlord')
+        self.assertEqual(production_twin(self.config,'Infa_ChinaVehicleDozer'),'Infa_ChinaVehicleDozer')
+        self.assertEqual(production_twin(self.config,'GLATankScorpion'),'GLATankScorpion')
+        self.assertEqual(production_twin(self.wide,'Nuke_ChinaVehicleDozer'),'Nuke_ChinaVehicleDozer')
+        obs=copy.deepcopy(self.obs)
+        nuke=next(e for e in obs['own_entities'] if e['id']==40)
+        nuke['trainable_templates']=['Nuke_ChinaVehicleDozer']
+        obs['player']['faction']='FactionChinaNukeGeneral'
+        encoded=self.policy.encoder.encode(obs,self.terrain,0)
+        action=dict(kind='train',producer=40,template='Nuke_ChinaVehicleDozer')
+        teacher=self.policy.target(encoded,[action])
+        self.assertEqual(self.config['templates'][teacher['template']],'ChinaVehicleDozer')
+        played=self.policy.decide(encoded,teacher=teacher)[0][0]
+        self.assertEqual(played['template'],'Nuke_ChinaVehicleDozer')
+        rows=[self.row(0,[action]),self.row(30,[action])]
+        for row in rows: row['observation']=obs
+        counts=Counter(); events=list(decisions(rows,self.config,counts))
+        self.assertEqual([event['source']['frame'] for event in events],[0,30])
+        self.assertEqual(counts['truncated:production_scope'],0)
 
     def test_chinese_producer_with_only_foreign_availability_is_not_selected(self):
         obs=copy.deepcopy(self.obs)
@@ -86,7 +107,6 @@ class ProductionScopeTests(unittest.TestCase):
         stop=[dict(kind='stop',units=[10])]
         train=[dict(kind='train',producer=20,template='ChinaVehicleDozer')]
         for foreign in (dict(kind='train',producer=30,template='GLATankScorpion'),
-                        dict(kind='train',producer=40,template='ChinaVehicleDozer'),
                         dict(kind='build',builder=32,template='AmericaPowerPlant',position=[300,400,0])):
             rows=[self.row(0,stop),self.row(30,train),self.row(60,[foreign]),self.row(90,stop)]
             counts=Counter(); events=list(decisions(rows,self.config,counts))

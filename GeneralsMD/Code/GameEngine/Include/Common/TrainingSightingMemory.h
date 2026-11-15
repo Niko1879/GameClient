@@ -39,4 +39,15 @@ auto forgetHiddenTemporary(Cache &cache)
         [](const auto &entry) { return !entry.visible && !entry.persistent; }), cache.end());
     return before-cache.size();
 }
+
+// The game removes a fog ghost once its spot is revealed and the object is not seen there.
+// `revealed(entry)` must ask the observer's own shroud at the remembered position, nothing hidden.
+template<class Cache, class Revealed>
+auto forgetRevealedHidden(Cache &cache, Revealed revealed)
+{
+    const auto before = cache.size();
+    cache.erase(std::remove_if(cache.begin(), cache.end(),
+        [&](const auto &entry) { return !entry.visible && revealed(entry); }), cache.end());
+    return before-cache.size();
+}
 }

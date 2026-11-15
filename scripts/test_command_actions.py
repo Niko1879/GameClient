@@ -44,7 +44,6 @@ def fixture_commands():
 
 
 ACTIONS = ([{'kind': 'upgrade', 'producer': 20, 'command': 'Command_UpgradeChinaRadar'}],
-           [{'kind': 'science', 'science': 'SCIENCE_ArtilleryBarrage1'}],
            [{'kind': 'ability', 'units': [10], 'command': 'Command_Capture', 'target': 99}],
            [{'kind': 'ability', 'units': [20], 'command': 'Command_ArtilleryBarrage', 'position': [512.0, 640.0, 0]}],
            [{'kind': 'enter', 'units': [10, 11], 'target': 40}],
@@ -78,7 +77,7 @@ class CommandActionTests(unittest.TestCase):
     def test_every_new_kind_is_legal_and_round_trips_through_its_teacher(self):
         encoded = self.encode()
         verbs = self.policy.verb_mask(encoded)
-        for kind in ('upgrade', 'science', 'ability', 'enter', 'exit', 'evacuate', 'guard', 'guard_air', 'cancel_production',
+        for kind in ('upgrade', 'ability', 'enter', 'exit', 'evacuate', 'guard', 'guard_air', 'cancel_production',
                      'cancel_construction', 'scatter', 'add_waypoint', 'force_attack', 'force_attack_ground',
                      'repair', 'get_repaired'):
             self.assertTrue(verbs[KINDS.index(kind)], kind)
@@ -114,12 +113,10 @@ class CommandActionTests(unittest.TestCase):
                        {'kind': 'get_repaired', 'units': [10], 'target': 20}):
             with self.assertRaises(Unrepresentable, msg=str(action)):
                 self.policy.target(encoded, [action])
-        obs = copy.deepcopy(self.obs)
-        obs['player']['purchasable_sciences'] = []
-        encoded = self.encode(obs)
-        self.assertFalse(self.policy.verb_mask(encoded)[KINDS.index('science')])
+        # Science purchases are automated in live play (re-export fix 2): not a policy action.
+        self.assertNotIn('science', KINDS)
         with self.assertRaises(Unrepresentable):
-            self.policy.target(encoded, ACTIONS[1])
+            self.policy.target(encoded, [{'kind': 'science', 'science': 'SCIENCE_Frenzy1'}])
 
     def test_group_ability_needs_a_command_shared_by_every_member(self):
         encoded = self.encode()
@@ -164,6 +161,17 @@ class CommandActionTests(unittest.TestCase):
         result = ReplayActionAdapter({}).decode(sample(command('MSG_SET_MINE_CLEARING_DETAIL'), disarm))
         self.assertEqual(result['actions'], [disarm['command_result']['action']])
         self.assertTrue(result['imitation_loss_mask'])
+        # The deprecated area selection is a logic no-op: it must not cost the command sent with it.
+        alone = ReplayActionAdapter({}).decode(sample(command('MSG_AREA_SELECTION_DEPRECATED', 1, 2)))
+        self.assertEqual((alone['actions'], alone['unsupported'], alone['imitation_loss_mask']), ([], [], False))
+        # Science purchases are automated in live play: a human purchase is not a demonstration.
+        purchase = command('MSG_PURCHASE_SCIENCE', 12)
+        purchase['command_result'] = {'resolved': True, 'action': {'kind': 'science', 'science': 'SCIENCE_Frenzy1'}}
+        bought = ReplayActionAdapter({}).decode(sample(purchase))
+        self.assertEqual((bought['actions'], bought['unsupported'], bought['imitation_loss_mask']), ([], [], False))
+        mixed = ReplayActionAdapter({}).decode(sample(command('MSG_AREA_SELECTION_DEPRECATED', 1, 2), disarm))
+        self.assertEqual((mixed['actions'], mixed['unsupported']), ([disarm['command_result']['action']], []))
+        self.assertTrue(mixed['imitation_loss_mask'])
 
     def test_audit_requires_a_valid_command_resolution(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -201,23 +209,22 @@ class CommandActionTests(unittest.TestCase):
             h, entities, spatial = learner.model.events(encoded)
             actual = learner.model.teacher_heads(encoded, [r['target'] for r in batch], h, entities, spatial)
             np.testing.assert_allclose(actual['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
-        # Science selects no units: a microbatch whose only commands are
-        # promotions has no unit tokens and must still prepare and train.
-        science = [rows[0], rows[2]]
+        # A microbatch with no unit tokens (only waits) must still prepare and train.
+        quiet = [rows[0], copy.deepcopy(rows[0])]
         with no_grad():
-            expected = [float(self.policy.decide(r['encoded'], None, teacher=r['target'])[4].data) for r in science]
-        prepared = prepare_update(learner.model, science, learner.pair_budget)
-        self.assertEqual([part['plan']['unit_tokens'] for part in prepared['microbatches']], [0])
+            expected = [float(self.policy.decide(r['encoded'], None, teacher=r['target'])[4].data) for r in quiet]
+        prepared = prepare_update(learner.model, quiet, learner.pair_budget)
+        self.assertEqual([part['plan'].get('unit_tokens', 0) for part in prepared['microbatches']], [0])
         part = prepared['microbatches'][0]
         h, entities, spatial = learner.model.events(prepared=part)
         actual = learner.model.teacher_heads(None, [r['target'] for r in part['rows']], h, entities, spatial,
                                              plan=part['plan'])
-        by_kind = {r['target']['kind']: value for r, value in zip(science, expected)}
+        by_kind = {r['target']['kind']: value for r, value in zip(quiet, expected)}
         np.testing.assert_allclose(actual['logp'].detach().cpu().numpy(),
                                    [by_kind[row['target']['kind']] for row in part['rows']], rtol=4e-6, atol=3e-5)
         self.assertEqual(learner.run(prepared, train=True)['updates'], 1)
         learner.batch(portable, train=True)
-        for name in ('command_embedding', 'command_query_w', 'science_embedding', 'science_query_w',
+        for name in ('command_embedding', 'command_query_w',
                      'upgrade_embedding', 'player_flags_w', 'target_pointer_w'):
             self.assertGreater(float(learner.model.weights[name].grad.abs().sum().cpu()), 0, name)
 

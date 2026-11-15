@@ -19,8 +19,12 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/Weapon.h"
+#include "GameLogic/WeaponSet.h"
+#include "GameLogic/Armor.h"
+#include "GameLogic/ArmorSet.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameClient/ControlBar.h"
+#include "GameClient/InGameUI.h"
 #include "GameClient/Drawable.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Module/AIUpdate.h"
@@ -36,6 +40,14 @@
 #include "GameLogic/Module/SpawnBehavior.h"
 #include "GameLogic/Module/LifetimeUpdate.h"
 #include "GameLogic/Module/PhysicsUpdate.h"
+#include "GameLogic/Module/PoisonedBehavior.h"
+#include "GameLogic/Module/DumbProjectileBehavior.h"
+#include "GameLogic/Module/SpecialPowerModule.h"
+#include "Common/SpecialPower.h"
+#include "Common/SpecialPowerType.h"
+#include "Common/GameAudio.h"
+#include "Common/AudioEventInfo.h"
+#include "Common/AudioEventRTS.h"
 #include "GameNetwork/GeneralsOnline/json.hpp"
 #include "Common/ReplaySimulation.h"
 #include "GameClient/MapUtil.h"
@@ -537,6 +549,10 @@ bool hasDockInterface(Object *o)
 
 bool persistentSightingTemplate(const ThingTemplate *t)
 {
+    // Re-export fix 5 (scripts/training_data_review.md): the observation holds only what the
+    // player's screen shows. Hidden mobile units are not kept; the game draws fog ghosts only
+    // for immobile objects (PartitionData attach: KINDOF_IMMOBILE), so those stay as sightings.
+    if (!t->isKindOf(KINDOF_IMMOBILE)) return false;
     const ModuleInfo &modules = t->getBehaviorModuleInfo();
     for (int i = 0; i < modules.getCount(); ++i) {
         const AsciiString &name = modules.getNthName(i);
@@ -549,6 +565,137 @@ bool persistentSightingTemplate(const ThingTemplate *t)
         }
     }
     return true;
+}
+
+// ---- Observation v11 (re-export batch, user 15 Nov 2026) ----------------------------------------
+// Everything below is what a player perceives right now; none of it enters sighting memory.
+
+// Transient battlefield effects: projectiles and missiles in flight, and ground hazards (fire
+// fields and walls, toxin/anthrax, radiation). retainedEntityTemplate excludes all of these.
+enum { EFFECT_NONE = 0, EFFECT_PROJECTILE = 1, EFFECT_HAZARD = 2 };
+int effectTemplateKind(const ThingTemplate *t)
+{
+    if (t->isKindOf(KINDOF_PROJECTILE) || t->isKindOf(KINDOF_SMALL_MISSILE)) return EFFECT_PROJECTILE;
+    if (t->isKindOf(KINDOF_CLEANUP_HAZARD)) return EFFECT_HAZARD;
+    if (!t->isKindOf(KINDOF_UNATTACKABLE) || t->isKindOf(KINDOF_STRUCTURE) || t->isKindOf(KINDOF_BRIDGE)) return EFFECT_NONE;
+    // Unattackable damage areas (Dragon fire walls, napalm, firestorms) burn through a FireWeaponUpdate.
+    const ModuleInfo &modules = t->getBehaviorModuleInfo();
+    for (int i = 0; i < modules.getCount(); ++i)
+        if (modules.getNthName(i) == "FireWeaponUpdate") return EFFECT_HAZARD;
+    return EFFECT_NONE;
+}
+std::vector<std::pair<const ThingTemplate *, int>> effectTemplates(4096, {nullptr, EFFECT_NONE});
+int effectKind(const Object *o)
+{
+    const ThingTemplate *type = o->getTemplate();
+    auto &known = effectTemplates[(reinterpret_cast<size_t>(type) >> 4) & 4095];
+    if (known.first != type) known = {type, effectTemplateKind(type)};
+    return known.second;
+}
+const char *effectName(int kind) { return kind == EFFECT_PROJECTILE ? "projectile" : "hazard"; }
+
+// Ballistic shells move by position along a flight path (any physics they carry is not their motion).
+Coord3D effectVelocity(const Object *o)
+{
+    static const NameKeyType key = NAMEKEY("DumbProjectileBehavior");
+    if (const auto *shell = static_cast<const DumbProjectileBehavior *>(o->findUpdateModule(key)))
+        return shell->getFlightVelocity();
+    const PhysicsBehavior *physics = o->getPhysics();
+    return physics ? *physics->getVelocity() : Coord3D{0, 0, 0};
+}
+
+// Muzzle flashes and tracers: a shot within the last half second, by the object or by an occupant
+// firing out of it (garrisons, fire ports). Hidden occupants stay hidden; only the flash shows.
+bool firingVisibly(const Object *o, unsigned frame, bool occupants = true)
+{
+    if (o->testStatus(OBJECT_STATUS_IS_FIRING_WEAPON)) return true;
+    const unsigned window = LOGICFRAMES_PER_SECOND/2;
+    for (int slot = PRIMARY_WEAPON; slot < WEAPONSLOT_COUNT; ++slot) {
+        const Weapon *weapon = o->getWeaponInWeaponSlot(static_cast<WeaponSlotType>(slot));
+        const UnsignedInt last = weapon ? weapon->getLastShotFrame() : 0;
+        if (last && last <= frame && frame-last <= window) return true;
+    }
+    if (occupants)
+        if (const ContainModuleInterface *contain = o->getContain())
+            if (const ContainedItemsList *items = contain->getContainedItemsList())
+                for (const Object *inside : *items)
+                    if (firingVisibly(inside, frame, false)) return true;
+    return false;
+}
+// The green poison tint and the flames on a burning unit.
+bool poisonedVisibly(const Object *o)
+{
+    static const NameKeyType key = NAMEKEY("PoisonedBehavior");
+    const auto *poison = static_cast<const PoisonedBehavior *>(o->findUpdateModule(key));
+    return poison && poison->isPoisoned();
+}
+bool burningVisibly(const Object *o) { return o->testStatus(OBJECT_STATUS_AFLAME); }
+
+// Public superweapon countdowns: exactly the timers InGameUI draws for every player (its own list,
+// so powers hidden by script or by an unearned science are left out), with the display's rules.
+template<class Visit> void publicSuperweapons(Visit visit)
+{
+    if (!TheInGameUI) return;
+    const UnsignedInt now = TheGameLogic->getFrame();
+    TheInGameUI->forEachDisplayedSuperweapon([&](Int playerIndex, const SuperweaponInfo &info) {
+        Object *owner = TheGameLogic->findObjectByID(info.m_id);
+        const Player *player = ThePlayerList->getNthPlayer(playerIndex);
+        if (!owner || !player || owner->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) return;
+        SpecialPowerModuleInterface *power = owner->getSpecialPowerModule(info.getSpecialPowerTemplate());
+        if (!power) return;
+        const UnsignedInt ready = power->getReadyFrame();
+        visit(player, info.getSpecialPowerTemplate()->getName().str(),
+              ready > now ? static_cast<int>((ready-now)/LOGICFRAMES_PER_SECOND) : 0, static_cast<bool>(power->isReady()));
+    });
+}
+
+// Special-power launch sounds (SpecialPowerModule::aboutToDoSpecialPower): the sound at the
+// launcher, the sound at the target, and EVA's superweapon announcement. Each is heard by the
+// audience its AudioEventInfo names (AudioManager::shouldPlayLocally), evaluated per player. A cue
+// lasts CUE_SECONDS; its position is given only where the listener has vision (sound is heard near
+// the camera, so a far-off launch carries no location).
+struct PowerCue {
+    unsigned frame = 0;
+    int owner = -1;
+    std::string power;
+    bool hasTarget = false, announced = false;
+    Coord3D source{}, target{};
+    unsigned sourceAudience = 0, targetAudience = 0;
+};
+std::vector<PowerCue> powerCues;
+const unsigned CUE_SECONDS = 5;
+unsigned soundAudience(const AudioEventRTS *sound)
+{
+    if (!sound || sound->getEventName().isEmpty() || !TheAudio) return 0;
+    const AudioEventInfo *info = TheAudio->findAudioEventInfo(sound->getEventName());
+    if (!info) return 0;
+    // shouldPlayLocally treats a sound with no audience restriction as heard by everyone.
+    return BitIsSet(info->m_type, (ST_PLAYER | ST_ALLIES | ST_ENEMIES | ST_EVERYONE)) ? info->m_type : ST_EVERYONE;
+}
+bool hears(unsigned audience, int ownerIndex, const Player *listener)
+{
+    const Player *owner = ThePlayerList->getNthPlayer(ownerIndex);
+    if (!audience || !owner || !listener || !listener->getDefaultTeam()) return false;
+    if (BitIsSet(audience, ST_EVERYONE)) return true;
+    if (BitIsSet(audience, ST_PLAYER)) return owner == listener;
+    if (BitIsSet(audience, ST_ALLIES)) return owner != listener && owner->getRelationship(listener->getDefaultTeam()) == ALLIES;
+    if (BitIsSet(audience, ST_ENEMIES)) return owner->getRelationship(listener->getDefaultTeam()) == ENEMIES;
+    return false;
+}
+template<class Visit> void audibleCues(Player *listener, unsigned frame, Visit visit)
+{
+    const int index = static_cast<int>(listener->getPlayerIndex());
+    auto seen = [index](const Coord3D &where) {
+        return ThePartitionManager->getShroudStatusForPlayer(index, &where) == CELLSHROUD_CLEAR;
+    };
+    for (const PowerCue &cue : powerCues) {
+        if (cue.frame > frame || frame-cue.frame > CUE_SECONDS*LOGICFRAMES_PER_SECOND) continue;
+        const bool atSource = hears(cue.sourceAudience, cue.owner, listener);
+        const bool atTarget = cue.hasTarget && hears(cue.targetAudience, cue.owner, listener);
+        if (!atSource && !atTarget && !cue.announced) continue;
+        const Coord3D *where = atTarget && seen(cue.target) ? &cue.target : atSource && seen(cue.source) ? &cue.source : nullptr;
+        visit(cue, frame-cue.frame, where);
+    }
 }
 
 Json taskReference(ObjectID id, Player *owner, Json result = Json())
@@ -730,13 +877,99 @@ int ticksSinceDamage(const BodyModuleInterface *body, unsigned frame)
     return last == 0 || last == 0xffffffff || last > frame ? -1 : static_cast<int>(frame-last);
 }
 
+// Weapon and armour identity (re-export fix 4, scripts/training_data_review.md). Templates get a
+// per-game numeric id on first sight; each player's stream receives a template's stats once, in
+// the observation where it first appears, before training gathers them by id. Stats are read
+// without logic random numbers (never WeaponTemplate::getDelayBetweenShots).
+struct TemplateCatalog {
+    std::vector<const WeaponTemplate *> weapons;
+    std::vector<const ArmorTemplate *> armors;
+    std::array<size_t, MAX_PLAYER_COUNT> weaponsSent{}, armorsSent{};
+    void reset() { weapons.clear(); armors.clear(); weaponsSent.fill(0); armorsSent.fill(0); }
+    template<class T> static int id(std::vector<const T *> &list, const T *item)
+    {
+        if (!item) return -1;
+        const auto found = std::find(list.begin(), list.end(), item);
+        if (found != list.end()) return static_cast<int>(found-list.begin());
+        list.push_back(item);
+        return static_cast<int>(list.size()-1);
+    }
+} armsCatalog;
+
+// An owned unit's current weapons, armour and fire bonus; any other unit its type's default
+// weapon and armour sets with no bonus (its upgrades are not observable; veterancy is exported).
+struct EntityArms {
+    std::array<int, WEAPONSLOT_COUNT> weapons;
+    int armor = -1;
+    float damage = 1, range = 1, rate = 1;
+};
+
+EntityArms entityArms(const Object *object, bool own)
+{
+    EntityArms arms;
+    arms.weapons.fill(-1);
+    const ThingTemplate *type = object->getTemplate();
+    if (own) {
+        for (int slot = 0; slot < WEAPONSLOT_COUNT; ++slot) {
+            const Weapon *weapon = object->getWeaponInWeaponSlot(static_cast<WeaponSlotType>(slot));
+            arms.weapons[slot] = TemplateCatalog::id(armsCatalog.weapons, weapon ? weapon->getTemplate() : nullptr);
+        }
+        if (const Weapon *weapon = object->getCurrentWeapon()) {
+            WeaponBonus bonus;
+            weapon->computeTrainingBonus(object, bonus);
+            arms.damage = bonus.getField(WeaponBonus::DAMAGE);
+            arms.range = bonus.getField(WeaponBonus::RANGE);
+            arms.rate = bonus.getField(WeaponBonus::RATE_OF_FIRE);
+        }
+        ArmorSetFlags flags;
+        if (BodyModuleInterface *body = object->getBodyModule())
+            for (int set = 0; set < ARMORSET_COUNT; ++set)
+                if (body->testArmorSetFlag(static_cast<ArmorSetType>(set))) flags.set(static_cast<ArmorSetType>(set), 1);
+        const ArmorTemplateSet *armor = type->findArmorTemplateSet(flags);
+        arms.armor = TemplateCatalog::id(armsCatalog.armors, armor ? armor->getArmorTemplate() : nullptr);
+    } else {
+        const WeaponTemplateSet *set = type->findWeaponTemplateSet(WeaponSetFlags());
+        for (int slot = 0; slot < WEAPONSLOT_COUNT; ++slot)
+            arms.weapons[slot] = TemplateCatalog::id(armsCatalog.weapons, set ? set->getNth(static_cast<WeaponSlotType>(slot)) : nullptr);
+        const ArmorTemplateSet *armor = type->findArmorTemplateSet(ArmorSetFlags());
+        arms.armor = TemplateCatalog::id(armsCatalog.armors, armor ? armor->getArmorTemplate() : nullptr);
+    }
+    return arms;
+}
+
+// Stats of the templates this player's stream has not received yet; the shard keeps one table per game.
+Json templateStats(int player)
+{
+    Json result = {{"weapons", Json::array()}, {"armors", Json::array()}};
+    auto &catalog = armsCatalog;
+    const WeaponBonus none;
+    for (size_t i = catalog.weaponsSent[player]; i < catalog.weapons.size(); ++i) {
+        const WeaponTemplate *t = catalog.weapons[i];
+        result["weapons"].push_back({{"id", i}, {"name", t->getName().str()},
+            {"range", t->getAttackRange(none)}, {"min_range", t->getMinimumAttackRange()},
+            {"damage", t->getPrimaryDamage(none)}, {"radius", t->getPrimaryDamageRadius(none)},
+            {"min_delay_frames", t->getMinDelayBetweenShots()}, {"max_delay_frames", t->getMaxDelayBetweenShots()},
+            {"clip_size", t->getClipSize()}, {"clip_reload_frames", t->getClipReloadTime(none)},
+            {"anti_mask", t->getAntiMask()}, {"damage_type", static_cast<int>(t->getDamageType())}});
+    }
+    catalog.weaponsSent[player] = catalog.weapons.size();
+    for (size_t i = catalog.armorsSent[player]; i < catalog.armors.size(); ++i) {
+        Json multipliers = Json::array();
+        for (int damage = 0; damage < DAMAGE_NUM_TYPES; ++damage)
+            multipliers.push_back(catalog.armors[i]->adjustDamage(static_cast<DamageType>(damage), 1.0f));
+        result["armors"].push_back({{"id", i}, {"damage_multipliers", std::move(multipliers)}});
+    }
+    catalog.armorsSent[player] = catalog.armors.size();
+    return result;
+}
+
 Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookups, Json j = Json())
 {
     ExportTimer timer(EXPORT_ENTITY);
     Player *owner = object->getControllingPlayer();
     BodyModuleInterface *body = object->getBodyModule();
     ExportTimer base(EXPORT_ENTITY_BASE);
-    if (!j.is_object() || j.value("own", !own) != own) j = reservedObject(own ? 39 : 14);
+    if (!j.is_object() || j.value("own", !own) != own) j = reservedObject(own ? 42 : 16);
     j["id"] = static_cast<unsigned>(object->getID());
     setString(j["type"], object->getTemplate()->getName().str());
     j["owner"] = owner ? static_cast<int>(owner->getPlayerIndex()) : -1;
@@ -752,6 +985,15 @@ Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookup
     j["facing"] = object->getOrientation();
     j["veterancy"] = static_cast<int>(object->getVeterancyLevel());
     j["supply_boxes"] = supplyBoxes(object);
+    const EntityArms arms = entityArms(object, own);
+    j["weapons"] = Json::array();
+    for (const int id : arms.weapons) j["weapons"].push_back(id);
+    j["armor"] = arms.armor;
+    // v11: what a player sees on any visible unit right now (cleared on fog ghosts).
+    j["firing"] = firingVisibly(object, frame);
+    j["poisoned"] = poisonedVisibly(object);
+    j["burning"] = burningVisibly(object);
+    if (own) j["weapon_bonus"] = {arms.damage, arms.range, arms.rate};
     base.stop();
     if (own) {
         // No game tick or INI override occurs during this read-only snapshot.
@@ -962,11 +1204,36 @@ Json mapFeatures()
     return result;
 }
 
+// The China factions whose players are exported (13 Nov 2026: vanilla, Tank and Nuke; Infantry is
+// too different to share one policy). Players of any other faction are only observed.
+static const char *const EXPORTED_FACTIONS[] = {"FactionChina", "FactionChinaTankGeneral", "FactionChinaNukeGeneral"};
+
+static Bool exportedFaction(Player *p)
+{
+    if (!p || !p->getPlayerTemplate()) return FALSE;
+    const char *name = p->getPlayerTemplate()->getName().str();
+    for (const char *faction : EXPORTED_FACTIONS)
+        if (!strcmp(name, faction)) return TRUE;
+    return FALSE;
+}
+
 void mapRecord()
 {
     // Replay setup loads map.ini after Begin. Resolve its final template
     // overrides before declaring the exact classes that the encoder excludes.
     pendingHeader["observation_policy"] = observationPolicy();
+    // The exported players are known now: name their factions, in EXPORTED_FACTIONS order. A replay
+    // with only vanilla China players keeps exactly "FactionChina", as before.
+    std::string factions;
+    for (const char *faction : EXPORTED_FACTIONS) {
+        Bool present = FALSE;
+        for (int i = 0; i < ThePlayerList->getPlayerCount() && !present; ++i) {
+            Player *p = ThePlayerList->getNthPlayer(i);
+            present = p && p->getPlayerTemplate() && !strcmp(p->getPlayerTemplate()->getName().str(), faction);
+        }
+        if (present) factions += (factions.empty() ? "" : ",") + std::string(faction);
+    }
+    if (!factions.empty()) pendingHeader["controlled_faction"] = factions;
     write(pendingHeader);
     pendingHeader = Json();
     write(mapFeatures());
@@ -1007,7 +1274,11 @@ Json observation(Player *player, unsigned frame, Json result = Json())
     }
     auto &memory = sightings[index];
     ExportTimer flags(EXPORT_SIGHTING_FLAGS);
-    for (auto &entry : memory) { entry.visible = false; entry.value["visible"] = false; }
+    for (auto &entry : memory) {
+        entry.visible = false; entry.value["visible"] = false;
+        // A fog ghost shows no current activity.
+        entry.value["firing"] = false; entry.value["poisoned"] = false; entry.value["burning"] = false;
+    }
     flags.stop();
     ExportTimer world(EXPORT_WORLD_SCAN);
     for (Object *o = TheGameLogic->getFirstObject(); o; o = o->getNextObject()) {
@@ -1034,8 +1305,14 @@ Json observation(Player *player, unsigned frame, Json result = Json())
         }
     }
     world.stop();
-    // Pruning depends on observed visibility and static template metadata only.
+    // Pruning depends on observed visibility, the observer's own shroud and static template metadata only.
     temporarySightingsForgotten[index] += static_cast<unsigned>(training_sightings::forgetHiddenTemporary(memory));
+    temporarySightingsForgotten[index] += static_cast<unsigned>(training_sightings::forgetRevealedHidden(memory,
+        [index](const auto &entry) {
+            const Json &p = entry.value["position"];
+            const Coord3D where{p[0].get<float>(), p[1].get<float>(), p[2].get<float>()};
+            return ThePartitionManager->getShroudStatusForPlayer(index, &where) == CELLSHROUD_CLEAR;
+        }));
     ExportTimer copy(EXPORT_SIGHTING_COPY);
     own.get_ref<Json::array_t &>().resize(owned);
     size_t remembered = 0;
@@ -1077,7 +1354,36 @@ Json observation(Player *player, unsigned frame, Json result = Json())
     result["own_entities"] = std::move(own);
     result["known_nonowned_entities"] = std::move(known);
     result["visibility_grid"] = std::move(visibility);
-    result["observation_policy_version"] = 9;
+    result["observation_policy_version"] = 11;
+    {
+        Json effects = Json::array();
+        for (Object *o = TheGameLogic->getFirstObject(); o; o = o->getNextObject()) {
+            const int kind = effectKind(o);
+            if (kind == EFFECT_NONE || o->isEffectivelyDead() || o->isDestroyed()) continue;
+            if (o->getControllingPlayer() != player && !TrainingObjectVisibleTo(o, index)) continue;
+            const Player *owner = o->getControllingPlayer();
+            const Coord3D velocity = effectVelocity(o);
+            effects.push_back({{"id", static_cast<unsigned>(o->getID())}, {"type", o->getTemplate()->getName().str()},
+                               {"owner", owner ? static_cast<int>(owner->getPlayerIndex()) : -1},
+                               {"kind", effectName(kind)}, {"position", position(o->getPosition())},
+                               {"velocity", {velocity.x, velocity.y, velocity.z}},
+                               {"radius", o->getGeometryInfo().getBoundingCircleRadius()}});
+        }
+        result["effects"] = std::move(effects);
+        Json superweapons = Json::array();
+        publicSuperweapons([&](const Player *owner, const char *power, int seconds, bool ready) {
+            superweapons.push_back({{"owner", static_cast<int>(owner->getPlayerIndex())}, {"power", power},
+                                    {"ready_seconds", seconds}, {"ready", ready}});
+        });
+        result["superweapons"] = std::move(superweapons);
+        Json cues = Json::array();
+        audibleCues(player, frame, [&](const PowerCue &cue, unsigned ticks, const Coord3D *where) {
+            cues.push_back({{"power", cue.power}, {"owner", cue.owner}, {"ticks_since", ticks},
+                            {"position", where ? position(where) : Json()}});
+        });
+        result["audio_cues"] = std::move(cues);
+    }
+    result["template_stats"] = templateStats(index);
     result["last_submission"] = commandContext(submissions, player, frame, std::move(result["last_submission"]));
     result["last_validation"] = commandContext(validations, player, frame, std::move(result["last_validation"]));
     return result;
@@ -1127,11 +1433,14 @@ void TrainingObservationReset()
 {
     for (auto &memory : sightings) memory.clear();
     for (auto &memory : directSightings) memory.clear();
+    armsCatalog.reset();
     observedSightingRemovals.fill(0); temporarySightingsForgotten.fill(0);
     submissions.fill(Json()); validations.fill(Json());
     liveObservations.fill(Json());
     observationLookups.commandSets.clear(); observationLookups.docks.clear();
     std::fill(retainedTemplates.begin(), retainedTemplates.end(), RetainedTemplate{});
+    std::fill(effectTemplates.begin(), effectTemplates.end(), std::make_pair(static_cast<const ThingTemplate *>(nullptr), static_cast<int>(EFFECT_NONE)));
+    powerCues.clear();
     directScratch.gridCells.clear();
 }
 
@@ -1143,6 +1452,37 @@ void TrainingObserveObjectRemoval(const Object *object)
         if (training_sightings::retireObserved(sightings[player], directSightings[player], id,
             [object, player] { return TrainingObjectVisibleTo(object, player); }))
             ++observedSightingRemovals[player];
+}
+
+void TrainingObserveSpecialPower(const Object *source, const SpecialPowerTemplate *power, const Coord3D *target)
+{
+    if (!TheGlobalData || !TheGlobalData->m_headless || !ThePlayerList || !source || !power) return;
+    const Player *owner = source->getControllingPlayer();
+    if (!owner) return;
+    const unsigned frame = TheGameLogic->getFrame();
+    powerCues.erase(std::remove_if(powerCues.begin(), powerCues.end(), [frame](const PowerCue &cue) {
+        return cue.frame > frame || frame-cue.frame > CUE_SECONDS*LOGICFRAMES_PER_SECOND;
+    }), powerCues.end());
+    PowerCue cue;
+    cue.frame = frame;
+    cue.owner = static_cast<int>(owner->getPlayerIndex());
+    cue.power = power->getName().str();
+    cue.source = *source->getPosition();
+    cue.sourceAudience = soundAudience(power->getInitiateSound());
+    if (target) {
+        cue.hasTarget = true;
+        cue.target = *target;
+        cue.targetAudience = soundAudience(power->getInitiateAtTargetSound());
+    }
+    // EVA announces superweapon launches to every player (SpecialPowerModule::aboutToDoSpecialPower).
+    switch (power->getSpecialPowerType()) {
+    case SPECIAL_PARTICLE_UPLINK_CANNON: case SUPW_SPECIAL_PARTICLE_UPLINK_CANNON: case LAZR_SPECIAL_PARTICLE_UPLINK_CANNON:
+    case SPECIAL_NEUTRON_MISSILE: case NUKE_SPECIAL_NEUTRON_MISSILE: case SUPW_SPECIAL_NEUTRON_MISSILE:
+    case SPECIAL_SCUD_STORM:
+        cue.announced = true; break;
+    default: break;
+    }
+    powerCues.push_back(std::move(cue));
 }
 
 void TrainingObserveCommand(const GameMessage *message, const AIGroup *selection)
@@ -1362,9 +1702,11 @@ Json observationPolicy()
     Json excluded = reservedArray(classes.size());
     Json visibleOnly = reservedArray(classes.size());
     Json neutralExcluded = reservedArray(classes.size());
+    Json effects = Json::object();
     for (size_t i = 0; i < classes.size(); ++i) {
         // Preserve the old map's sorted names and last-value-wins semantics.
         if (i+1 < classes.size() && classes[i]->getName() == classes[i+1]->getName()) continue;
+        if (const int kind = effectTemplateKind(classes[i])) effects[classes[i]->getName().str()] = effectName(kind);
         if (!retainedEntityTemplate(classes[i])) { excluded.push_back(classes[i]->getName().str()); continue; }
         if (!persistentSightingTemplate(classes[i])) visibleOnly.push_back(classes[i]->getName().str());
         if (!retainedNeutralTemplate(classes[i])) neutralExcluded.push_back(classes[i]->getName().str());
@@ -1373,8 +1715,11 @@ Json observationPolicy()
     for (int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
         if (ThePlayerList->getNthPlayer(i)->isPlayableSide()) playable.push_back(i);
     Json result = reservedObject(8);
-    result["version"] = 9;
+    result["version"] = 11;
     result["excluded_templates"] = std::move(excluded);
+    // v11: excluded entity templates that appear, visible-now only, in the observation's effects list.
+    result["effect_templates"] = std::move(effects);
+    result["current_perception"] = "effects (projectiles, ground hazards) owned or visible now; entity firing/poisoned/burning on own and visible units, false on fog ghosts; public superweapon timers; special-power sound cues audible to the player for 5 s, positioned only where the player has vision";
     result["visible_only_templates"] = std::move(visibleOnly);
     // These templates are omitted unless a playable side controls the object.
     result["neutral_excluded_templates"] = std::move(neutralExcluded);
@@ -1418,12 +1763,17 @@ Int TrainingExporterServe()
         printf("-replayServer requires -headless.\n");
         return 1;
     }
+    // 062026 logic loads particle templates at engine start, so its engine serves no other logic.
+    const bool started062026 = replayLogic062026();
     std::string line;
     while (std::getline(std::cin, line)) {
         // A job is {"replay", "output", "logic"}; a malformed one is a controller bug.
         const Json job = Json::parse(line);
         outputDirectory = job.at("output").get<std::string>();
-        TheReplayLogic = job.at("logic").get<std::string>() == "081326" ? REPLAY_LOGIC_081326 : REPLAY_LOGIC_CURRENT;
+        if (!parseReplayLogicName(job.at("logic").get<std::string>().c_str(), TheReplayLogic))
+            throw std::runtime_error("Unknown replay logic in job");
+        if (replayLogic062026() != started062026)
+            throw std::runtime_error("062026 replay logic needs an engine started with -replayLogic 062026");
         // The controller adds a replay's map to the private profile just before its job.
         TheMapCache->updateCache();
         const std::vector<AsciiString> replays(1, AsciiString(job.at("replay").get<std::string>().c_str()));
@@ -1476,7 +1826,7 @@ Bool TrainingExporterBegin(const AsciiString &replay)
         pendingHeader["ticks_per_second"] = static_cast<int>(LOGICFRAMES_PER_SECOND);
         pendingHeader["interval_ms"] = intervalMilliseconds;
         pendingHeader["quiet_capture"] = scheduledQuietCapture ? "scheduled" : "all";
-        pendingHeader["replay_logic"] = TheReplayLogic == REPLAY_LOGIC_081326 ? "081326" : "current";
+        pendingHeader["replay_logic"] = replayLogicName(TheReplayLogic);
         pendingHeader["controlled_faction"] = "FactionChina";
         pendingHeader["placement_mode"] = fullPlacementMask ? "full_mask" : "fast";
         pendingHeader["template_catalog"] = templateCatalog();
@@ -1508,7 +1858,7 @@ void TrainingExporterCapturePreCommands()
         const unsigned cadence = std::max(1, (intervalMilliseconds * LOGICFRAMES_PER_SECOND + 999) / 1000);
         for (int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
             Player *p = ThePlayerList->getNthPlayer(i);
-            if (!p || !p->getPlayerTemplate() || strcmp(p->getPlayerTemplate()->getName().str(), "FactionChina")) continue;
+            if (!exportedFaction(p)) continue;
             Json actions = actionsFor(i);
             if (actions.empty() && frame % cadence != 0) continue;
             if (lastSample[i].has_value() && lastSample[i] == frame) continue;

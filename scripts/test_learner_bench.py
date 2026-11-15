@@ -56,6 +56,18 @@ class LearnerBenchTests(unittest.TestCase):
                 learner_bench.summary(SimpleNamespace(reports=[str(root/'run.json'), str(root/'b.json')]))
             self.assertIn('first 2 updates differ by at most 0.00e+00', out.getvalue())
 
+    def test_ranks_time_the_same_global_decisions_as_one_process(self):
+        from train_events import spawn_ranks
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.dataset(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                single = learner_bench.run(self.arguments(root, output=str(root/'one.json')))
+            spawn_ranks(learner_bench.run, self.arguments(root, prefetch=1, world_size=2, ranks_per_gpu=1), 2)
+            ranked = json.loads((root/'run.json').read_text())
+            self.assertEqual((ranked['world_size'], ranked['updates']), (2, 2))
+            self.assertEqual(ranked['decisions'], single['decisions'])
+
     def test_gpu_sampler_parses_samples_and_names_the_bound(self):
         import sys
         script = "import time\nfor v in (40, 'N/A', 60, 50):\n    print(v, flush=True)\ntime.sleep(30)\n"
@@ -86,9 +98,9 @@ class LearnerBenchTests(unittest.TestCase):
                          {'hidden': 2112, 'entity_hidden': 384, 'map_hidden': 192, 'scalar_hidden': 384})
         self.assertEqual(learner_bench.model_widths(config), {})
         import cloud_bundle
-        self.assertEqual(learner_bench.model_widths(config, 'wide'), cloud_bundle.WIDTHS['wide'])
+        self.assertEqual(learner_bench.model_widths(config, 'big'), cloud_bundle.WIDTHS['big'])
         with self.assertRaises(ValueError):
-            learner_bench.model_widths(config, 'wide', 2.0)
+            learner_bench.model_widths(config, 'big', 2.0)
         with self.assertRaises(ValueError):
             learner_bench.model_widths(config, '{"map_side": 32}')
         with tempfile.TemporaryDirectory() as temporary:

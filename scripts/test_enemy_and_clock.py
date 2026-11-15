@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from enemy_side import NATIVE, _other
+from enemy_side import NATIVE, _natives, enemy_of
 from event_policy import EventActor
 from event_store import feature_identity
 from generals_identity import PLAYER_FACTIONS
@@ -147,11 +147,17 @@ class EnemyAndClockTests(unittest.TestCase):
     def test_replay_sides_name_every_native_faction(self):
         self.assertEqual(set(NATIVE.values()), set(PLAYER_FACTIONS))
         self.assertEqual(set(TEMPLATES.values())-{'Random'}, set(NATIVE))
-        self.assertEqual(_other(['China', 'GLA Toxin']), 'FactionGLAToxinGeneral')
-        self.assertEqual(_other(['China', 'China']), 'FactionChina')
-        self.assertIsNone(_other(['China', 'Random']))
-        self.assertIsNone(_other(['Random', 'Random']))
-        self.assertIsNone(_other(()))
+        self.assertEqual(_natives(['China', 'GLA Toxin']), ['FactionChina', 'FactionGLAToxinGeneral'])
+        self.assertEqual(enemy_of('FactionChina', _natives(['China', 'GLA Toxin'])), 'FactionGLAToxinGeneral')
+        self.assertEqual(enemy_of('FactionChina', _natives(['China', 'China'])), 'FactionChina')
+        # Both players of a mixed China match are exported: each one's enemy is the other's faction.
+        mixed = _natives(['China Tank', 'China'])
+        self.assertEqual(enemy_of('FactionChinaTankGeneral', mixed), 'FactionChina')
+        self.assertEqual(enemy_of('FactionChina', mixed), 'FactionChinaTankGeneral')
+        self.assertIsNone(_natives(['China', 'Random']))
+        self.assertIsNone(_natives(['Random', 'Random']))
+        self.assertIsNone(_natives(()))
+        self.assertIsNone(enemy_of('FactionChina', None))
 
 
 if __name__ == '__main__':

@@ -855,7 +855,8 @@ public:
 	// Must not overload init to keep loading the particle system templates,
 	// which are unfortunately needed to preserve the correct logic crc.
 #else
-	virtual void init() override {}
+	// Loads the templates only for replays whose logic still spent random values on them (ParticleSys.cpp).
+	virtual void init() override;
 	virtual void reset() override {}
 #endif
 	virtual void update() override {}

@@ -14,7 +14,7 @@ import zipfile
 import numpy as np
 
 import generals_policy
-from generals_policy import ARCHITECTURE, NeuralPolicy
+from generals_policy import ARCHITECTURE, NeuralPolicy, TemplateTable
 from prepared_io import _array_bytes, _common, _digest, _json_bytes, _write_json
 from replay_events import encoded_events
 from tensor_replay_store import Column, TensorRows, decode_columns, encode_columns, project
@@ -38,7 +38,7 @@ FEATURE_CONSTANTS = ('OBSERVATION_VERSION', 'KINDS', 'TARGET_KINDS', 'BUILDER_KI
                      'ENTITY_COMMAND_SLOTS', 'SUPPLY_BOX_SCALE',
                      'SCALAR_FEATURES', 'MAP_CHANNELS')
 MODEL_ONLY = {'hidden', 'entity_hidden', 'embedding', 'attention_heads', 'map_hidden', 'scalar_hidden',
-              'variant_l2', 'argument_loss_weights', 'delay_loss_weight'}
+              'variant_l2', 'argument_loss_weights', 'delay_loss_weight', 'target_smoothing'}
 
 
 _FEATURE_CODE = []
@@ -73,6 +73,8 @@ def write_shard(destination, games, policy, source):
             for number, game in enumerate(games):
                 common, buffer, size, chunks, start = None, [], 0, [], 0
                 episode_counts = Counter()
+                # The game's weapon/armour stats, from every captured observation (episode shared data).
+                table = TemplateTable(game['source_ticks_per_second'])
 
                 def flush():
                     nonlocal buffer, size, start
@@ -92,7 +94,7 @@ def write_shard(destination, games, policy, source):
                     start += len(buffer)
                     buffer, size = [], 0
 
-                for row in encoded_events(policy, game, episode_counts):
+                for row in encoded_events(policy, game, episode_counts, table):
                     if common is None:
                         common = _common(row)
                     estimate = _array_bytes(row['encoded'])
@@ -104,6 +106,7 @@ def write_shard(destination, games, policy, source):
                 counts.update(episode_counts)
                 if common is None:
                     continue
+                common.update(table.arrays())
                 raw = encode_columns({name: Column.build([value], float_dtype=float_dtype) for name, value in common.items()
                                       if isinstance(value, np.ndarray)}, [{}], float_dtype=float_dtype)
                 member = f'shared/{number:04d}.bin'

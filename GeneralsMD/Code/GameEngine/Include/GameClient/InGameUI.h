@@ -424,6 +424,15 @@ public:  // ********************************************************************
 
 	virtual void setSuperweaponDisplayEnabledByScript(Bool enable);	///< Set the superweapon display enabled or disabled
 	virtual Bool getSuperweaponDisplayEnabledByScript() const;				///< Get the current superweapon display status
+	// Training export (15 Nov 2026): every player's timer entry the display would draw, read only.
+	template<class Visit> void forEachDisplayedSuperweapon(Visit visit) const
+	{
+		if (m_superweaponHiddenByScript) return;
+		for (Int player = 0; player < MAX_PLAYER_COUNT; ++player)
+			for (SuperweaponMap::const_iterator group = m_superweapons[player].begin(); group != m_superweapons[player].end(); ++group)
+				for (SuperweaponList::const_iterator item = group->second.begin(); item != group->second.end(); ++item)
+					if (*item && !(*item)->m_hiddenByScript && !(*item)->m_hiddenByScience) visit(player, **item);
+	}
 
 	virtual void hideObjectSuperweaponDisplayByScript(const Object* obj);
 	virtual void showObjectSuperweaponDisplayByScript(const Object* obj);

@@ -30,6 +30,7 @@
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"
 #include "Common/RandomValue.h"
+#include "Common/ReplayLogic.h"
 #include "Common/Xfer.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
@@ -85,7 +86,8 @@ UnsignedInt DeletionUpdate::calcSleepDelay(UnsignedInt minFrames, UnsignedInt ma
 	// render it before DeletionUpdate destroys it, versus 33ms at the retail 30hz.
 	// This caused one frame objects (like Frenzy's cloud effect) to intermittently never get drawn. 
 	// Doubling the 1 frame case just restores the original real world time.
-	if (delay <= 1) delay = 2;
+	// Replays of releases before this fix keep the 1 frame lifetime (Common/ReplayLogic.h).
+	if (delay <= 1) delay = replayLogic062026() ? 1 : 2;
 #else
 	if (delay < 1) delay = 1;
 #endif

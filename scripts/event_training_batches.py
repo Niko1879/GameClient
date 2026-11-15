@@ -180,7 +180,26 @@ class _Slots:
         self.blocks = []
 
 
-def _serve(manifest, digest, spec_options, pair_budget, requests, results, free, slots, active, worker, workers):
+def prepare_share(spec, rows, pair_budget, share=None):
+    """One rank's part of a global batch: every world-th row, from row `rank`.
+
+    Batches are sorted by entity count, so strided shares keep the ranks' work
+    similar. A contiguous split by entity count was slower (2 x 5090, 9 Nov:
+    0.72x at global batch 256): ranks run in lockstep, so the rank holding the
+    large observations set the pace. Losses are divided by the global row count,
+    so the ranks' summed gradients equal the single-process gradient of the
+    whole batch, for any partition.
+    """
+    if share is None:
+        return prepare_update(spec, rows, pair_budget)
+    rank, world = share
+    update = prepare_update(spec, rows[rank::world], pair_budget)
+    update['global_rows'] = len(rows)
+    return update
+
+
+def _serve(manifest, digest, spec_options, pair_budget, requests, results, free, slots, active, worker, workers,
+           share=None):
     """Reader process `worker` of `workers`: it prepares windows worker, worker+workers, ...
 
     One long-lived dataset per process, so shards are verified once per run.
@@ -238,7 +257,7 @@ def _serve(manifest, digest, spec_options, pair_budget, requests, results, free,
                 start = cursor[1] if window == cursor[0] else 0
                 for rows, position in dataset.window_batches(windows[window], seed=settings['seed'],
                         epoch=settings['epoch'], window=window, batch_size=settings.get('batch_size', 256), start=start):
-                    if active.value != serial or not send_update(prepare_update(spec, rows, pair_budget),
+                    if active.value != serial or not send_update(prepare_share(spec, rows, pair_budget, share),
                                                                  (window, position)):
                         break
                 if active.value != serial or not send((serial, 'window', window)):
@@ -260,7 +279,7 @@ class PreparedReader:
     stream is active at a time; abandoning one retires its serial, readers stop
     at their next update and leftovers are discarded by the following stream.
     """
-    def __init__(self, dataset, spec, pair_budget, depth=1, processes=1):
+    def __init__(self, dataset, spec, pair_budget, depth=1, processes=1, share=None):
         if depth < 1 or processes < 1:
             raise ValueError('Positive prefetch depth and reader count required')
         context = multiprocessing.get_context('spawn')
@@ -273,7 +292,7 @@ class PreparedReader:
             # Queued updates, one being written and one being copied here.
             process = context.Process(target=_serve, name=f'event-update-reader-{worker}', daemon=True,
                 args=(str(dataset.path), dataset.digest, options, pair_budget,
-                      requests, results, free, depth+2, self.active, worker, processes))
+                      requests, results, free, depth+2, self.active, worker, processes, share))
             process.start()
             self.readers.append((process, requests, results, free))
 
@@ -360,10 +379,10 @@ class PreparedReader:
         self.close()
 
 
-def prepared(dataset, split, *, spec, pair_budget, reader=None, **settings):
-    """Prepared updates from `reader`, or prepared inline when it is None."""
+def prepared(dataset, split, *, spec, pair_budget, reader=None, share=None, **settings):
+    """Prepared updates from `reader` (built with the same share), or prepared inline when it is None."""
     if reader is not None:
         yield from reader.stream(split, **settings)
         return
     for rows, cursor in dataset.batches(split, **settings):
-        yield prepare_update(spec, rows, pair_budget), cursor
+        yield prepare_share(spec, rows, pair_budget, share), cursor

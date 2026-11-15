@@ -161,14 +161,21 @@ class EventDataset:
         if len(metadata) != descriptor['rows']:
             raise ValueError('Event column row count mismatch')
         rows = chunk_rows(columns, metadata, self.shared[identity], self.key)
-        # Not stored in the shard: run_prepared_training.selection adds it from the replay.
-        enemy = tuple(entry.get('enemy_identity', (0, 0)))
+        # Not stored in the shard: run_prepared_training.selection adds both players' identities from the
+        # replay; a row's enemy is the one that is not its own (mixed vanilla/Tank/Nuke matches, 13 Nov 2026).
+        identities = [tuple(i) for i in (entry.get('faction_identities') or ())]
         # Pre-match ratings by player index (None: unrated), set by run_prepared_training.selection
         # like enemy_identity; each row is one player's view.
         inputs = player_rating_inputs(entry.get('ratings', {}))
         for row in rows:
-            row['encoded']['enemy_identity'] = enemy
+            own = tuple(row['encoded']['player_identity'])
+            row['encoded']['enemy_identity'] = (identities[1] if own == identities[0] else identities[0])                 if len(identities) == 2 and own in identities else (0, 0)
             row['encoded']['ratings'] = inputs.get(str(row['player']), UNRATED)
+            # The acting player's pre-match rating (estimated or not), for reporting only (train_events by_rating).
+            rating = entry.get('ratings', {}).get(str(row['player']))
+            row['rating'] = rating['rating'] if isinstance(rating, dict) else rating
+            # Reporting only: names the match of an extreme-loss decision (train_events outliers).
+            row['match_key'] = entry['match_key']
         return rows
 
     def windows(self, split, *, seed, epoch, buffer_bytes=64*1024*1024):

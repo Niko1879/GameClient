@@ -1,5 +1,8 @@
 """Resumable bundle upload over tar and ssh, for workstations without rsync.
 
+A bundle holds code and data/dataset.json; its shards are streamed from the
+directory bundle.json names (training-data/), so they never take workstation
+disk space twice. On the instance they land in data/ as before.
 The bundle goes up as parts of at most --part-files files. A part is marked done
 on the instance only after its tar stream has been fully extracted, so an
 interrupted upload is rerun with the same command and resends one part at most.
@@ -24,19 +27,56 @@ import time
 from engine_runtime import disable_power_throttling
 
 
-def parts(bundle, part_files):
-    """Small files first, so the code and manifest arrive before the shards."""
+def shard_source(bundle):
+    """training-data/ (bundle.json), after checking every listed shard is there.
+
+    Bundling hashed each shard in place and --verify hashes it again on the instance.
+    """
+    source = Path(json.loads((bundle/'bundle.json').read_text(encoding='utf-8'))['shard_source'])
+    doc = json.loads((bundle/'data/dataset.json').read_text(encoding='utf-8'))
+    for entry in doc['entries']:
+        path = source/entry['path']
+        if not path.is_file():
+            raise SystemExit(f"Shard missing from {source}: {entry['path']}")
+    return source
+
+
+def link_present(args, bundle, ssh):
+    """Hard-link shards another bundle on the instance already holds (--link-from), and return
+    the names now present in data/, so only missing shards are sent. A nested rung's shards are
+    mostly its smaller rungs'; --verify still hashes every shard, linked ones included."""
+    doc = json.loads((bundle/'data/dataset.json').read_text(encoding='utf-8'))
+    wanted = '\n'.join(e['path'] for e in doc['entries'])+'\n'
+    # Directories are relative to the login directory, like --remote.
+    data = shlex.quote(f'{args.remote}/data')
+    sources = ' '.join(shlex.quote(f'{source}/data') for source in args.link_from)
+    # For each wanted name missing here, link the first source copy found (same filesystem).
+    script = (f'base=$PWD; cd {data} && while IFS= read -r name; do [ -e "$name" ] && continue; '
+              f'for source in {sources}; do [ -f "$base/$source/$name" ] && ln "$base/$source/$name" "$name" && break; '
+              f'done; done; ls -1')
+    result = subprocess.run(ssh+[script], input=wanted.encode(), capture_output=True, check=True)
+    return set(result.stdout.decode().split())
+
+
+def parts(bundle, part_files, present=frozenset()):
+    """Small files first, so the code and manifest arrive before the shards.
+
+    The first part's names are relative to the bundle; shard parts' names are
+    file names in the shard source, extracted into data/ on the instance.
+    """
     files = sorted(p.relative_to(bundle).as_posix() for p in bundle.iterdir() if p.is_file())
     files += sorted('code/'+p.name for p in (bundle/'code').iterdir())
+    files += ['replay-runtime/science-orders.json']  # the scripted science buyer (cloud_bundle)
     yield files+['data/dataset.json']
     doc = json.loads((bundle/'data/dataset.json').read_text(encoding='utf-8'))
-    shards = sorted('data/'+e['path'] for e in doc['entries'])
+    # Shards already on the instance (linked by --link-from) are not sent again.
+    shards = sorted(e['path'] for e in doc['entries'] if e['path'] not in present)
     for start in range(0, len(shards), part_files):
         yield shards[start:start+part_files]
 
 
 def part_id(names):
-    return hashlib.sha256('\n'.join(names).encode()).hexdigest()[:24]
+    return hashlib.sha256('\n'.join('data/'+name for name in names).encode()).hexdigest()[:24]
 
 
 def manifest_id(bundle, names):
@@ -47,18 +87,20 @@ def manifest_id(bundle, names):
     return digest.hexdigest()[:24]
 
 
-def size(bundle, names):
-    return sum((bundle/name).stat().st_size for name in names)
+def size(directory, names):
+    return sum((directory/name).stat().st_size for name in names)
 
 
-def upload_part(args, bundle, ssh, names, marker):
+def upload_part(args, directory, destination, ssh, names, marker):
+    """tar `names` from `directory` into `destination` (relative to the remote bundle)."""
     with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8', newline='\n') as stream:
         stream.write('\n'.join(names)+'\n')
         listing = Path(stream.name)
     remote = shlex.quote(args.remote)
-    command = f'tar --no-same-owner -xf - -C {remote} && touch {remote}/.upload-done/{marker}'
+    target = shlex.quote(f'{args.remote}/{destination}'.rstrip('/'))
+    command = f'tar --no-same-owner -xf - -C {target} && touch {remote}/.upload-done/{marker}'
     try:
-        tar = subprocess.Popen(['tar', '-C', str(bundle), '-cf', '-', '-T', str(listing)], stdout=subprocess.PIPE)
+        tar = subprocess.Popen(['tar', '-C', str(directory), '-cf', '-', '-T', str(listing)], stdout=subprocess.PIPE)
         receiver = subprocess.Popen(ssh+[command], stdin=tar.stdout)
         disable_power_throttling(int(tar._handle))
         disable_power_throttling(int(receiver._handle))
@@ -93,9 +135,12 @@ def main():
     parser.add_argument('--retries', type=int, default=5)
     parser.add_argument('--limit-bytes', type=int, help='Stop after about this many bytes: a speed test')
     parser.add_argument('--verify', action='store_true')
+    parser.add_argument('--link-from', action='append', default=[],
+                        help='Another bundle directory on the instance (repeatable): hard-link its shards instead of sending them')
     args = parser.parse_args()
     disable_power_throttling()
     bundle = Path(args.bundle).resolve()
+    source = shard_source(bundle)
     ssh = ['ssh', '-i', str(Path(args.identity).expanduser()), '-p', str(args.port),
            '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'Compression=no',
            '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=6', args.host]
@@ -103,11 +148,17 @@ def main():
     listing = subprocess.run(ssh+[f'mkdir -p {remote}/data {remote}/code {remote}/.upload-done && ls {remote}/.upload-done'],
                              check=True, capture_output=True, text=True)
     done = set(listing.stdout.split())
-    manifest, *shard_parts = parts(bundle, args.part_files)
+    present = link_present(args, bundle, ssh) if args.link_from else frozenset()
+    if present:
+        print(json.dumps({'shards_already_present': len(present)}), flush=True)
+    manifest, *shard_parts = parts(bundle, args.part_files, present)
     markers = {tuple(manifest): manifest_id(bundle, manifest)}
     markers.update((tuple(names), part_id(names)) for names in shard_parts)
     pending = [list(names) for names, marker in markers.items() if marker not in done]
-    total = sum(size(bundle, names) for names in pending)
+    def place(names):
+        return (bundle, '') if names == manifest else (source, 'data')
+
+    total = sum(size(place(names)[0], names) for names in pending)
     sent = 0
     started = time.time()
     print(json.dumps({'pending_parts': len(pending), 'pending_gib': round(total/2**30, 2)}), flush=True)
@@ -119,13 +170,13 @@ def main():
             return
         marker = markers[tuple(names)]
         for attempt in range(args.retries+1):
-            if upload_part(args, bundle, ssh, names, marker):
+            if upload_part(args, *place(names), ssh, names, marker):
                 break
             if attempt == args.retries:
                 raise RuntimeError(f'Part {marker} failed {attempt+1} times; rerun to resume')
             time.sleep(min(60, 5*2**attempt))
         with lock:
-            sent += size(bundle, names)
+            sent += size(place(names)[0], names)
             rate = sent/max(time.time()-started, 1e-3)
             print(json.dumps({'sent_gib': round(sent/2**30, 2), 'total_gib': round(total/2**30, 2),
                               'mbit_s': round(rate*8/1e6, 1), 'eta_hours': round((total-sent)/max(rate, 1)/3600, 2)}), flush=True)

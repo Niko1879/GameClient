@@ -34,6 +34,7 @@
 // USER INCLUDES //////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 #include "Common/Player.h"
+#include "Common/ReplayLogic.h"
 #include "Common/Xfer.h"
 #include "Common/ThingTemplate.h"
 #include "Common/ThingFactory.h"
@@ -324,7 +325,9 @@ void HelixContain::removeFromContain( Object *obj, Bool exposeStealthUnits )
 #if RETAIL_COMPATIBLE_CRC
       portable->friend_setContainedByID(INVALID_ID);
 #else
-      portable->friend_setContainedBy(nullptr);
+      // Replays of releases before this change left the portable pointing at us (Common/ReplayLogic.h).
+      if (!replayLogic062026())
+        portable->friend_setContainedBy(nullptr);
 #endif
 
       m_portableStructureID = INVALID_ID;

@@ -41,6 +41,7 @@
 #include "Common/INI.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/ReplayLogic.h"
 #include "Common/ThingTemplate.h"
 #include "Common/ThingFactory.h"
 #include "Common/GameLOD.h"
@@ -1352,7 +1353,16 @@ protected:
 
 		for (Int nn = 0; nn < m_debrisToGenerate; nn++)
 		{
+#if RETAIL_COMPATIBLE_CRC
 			Int pick = GameLogicRandomValue(0, m_names.size() - 1);
+#else
+			// Replays of releases before parseDebrisObjectNames stored every name had only
+			// every other one, so they pick among the even entries (Common/ReplayLogic.h).
+			const Bool everyOther = replayLogic062026();
+			Int pick = GameLogicRandomValue(0, (everyOther ? (Int)(m_names.size() + 1) / 2 : (Int)m_names.size()) - 1);
+			if (everyOther)
+				pick *= 2;
+#endif
 
 			const ThingTemplate* tmpl;
 			if (m_nameAreObjects)

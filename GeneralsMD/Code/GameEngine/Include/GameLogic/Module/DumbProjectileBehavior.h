@@ -95,6 +95,22 @@ public:
 	virtual void setFramesTillCountermeasureDiversionOccurs( UnsignedInt frames ) override {}
 	virtual void projectileNowJammed() override {}
 
+	// Training export (15 Nov 2026): the shell's current per-frame displacement along its
+	// flight path (it moves by position, not physics). Read only.
+	Coord3D getFlightVelocity() const
+	{
+		Coord3D velocity;
+		velocity.zero();
+		Int step = m_currentFlightPathStep;
+		if (step > (Int)m_flightPath.size() - 1) step = (Int)m_flightPath.size() - 1;
+		if (step >= 1) {
+			velocity.x = m_flightPath[step].x - m_flightPath[step-1].x;
+			velocity.y = m_flightPath[step].y - m_flightPath[step-1].y;
+			velocity.z = m_flightPath[step].z - m_flightPath[step-1].z;
+		}
+		return velocity;
+	}
+
 protected:
 
 	void positionForLaunch(const Object *launcher, WeaponSlotType wslot, Int specificBarrelToUse);

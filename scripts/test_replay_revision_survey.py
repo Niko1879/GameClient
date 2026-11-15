@@ -38,6 +38,11 @@ class SurveyTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(classify(evidence, dict(header, map_crc=value), stream, 0), 'map_mismatch')
                 self.assertEqual(classify(dict(evidence, loaded_map_crc=value), header, stream, 0), 'map_mismatch')
+        for value in ('0', '00000000'):  # unrecorded in the header (14 Nov 2026): the CRC checks decide
+            with self.subTest(unrecorded=value):
+                self.assertEqual(classify(evidence, dict(header, map_crc=value), stream, 0), 'passed')
+                self.assertEqual(classify(dict(evidence, crc_comparisons=0), dict(header, map_crc=value), stream, 0),
+                                 'no_crc_evidence')
         evidence['crc_mismatch'] = True
         self.assertEqual(classify(evidence, header, stream, 1), 'crc_diverged')
         self.assertEqual(classify(dict(evidence, crc_comparisons=0), header, stream, 0), 'no_crc_evidence')

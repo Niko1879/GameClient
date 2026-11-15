@@ -12,13 +12,14 @@ import numpy as np
 
 from generals_policy import KINDS, NeuralPolicy, Unrepresentable
 from replay_events import decisions, encoded_events
-from scheduled_capture import GrowingFile, PlayerSchedule, wanted_frames
+from replay_sequences import normalize_demonstration
+from scheduled_capture import GrowingFile, PlayerSchedule, wanted_frames, wanted_native
 from test_fixtures import entity, fixture, raw_row
 
 CADENCE = 6
 
 
-def scenario(obs, seed, length=2400):
+def scenario(obs, seed, length=2400, cadence=CADENCE):
     """As the engine samples: every command frame, plus each command-free cadence frame.
 
     Busy and silent stretches alternate, so silences exceed the scheduling cap.
@@ -37,7 +38,7 @@ def scenario(obs, seed, length=2400):
                 rows.append(raw_row(frame, obs, ui=True))
             else:
                 rows.append(raw_row(frame, obs, unsupported=True))
-        elif frame % CADENCE == 0:
+        elif frame % cadence == 0:
             rows.append(raw_row(frame, obs))
     rows[-1]['terminal_sample'], rows[-1]['hold_ticks'] = True, None
     return rows
@@ -47,12 +48,14 @@ def commanded(row):
     return bool(row['actions'] or row['unsupported'] or not row['imitation_loss_mask'])
 
 
-def simulated_export(policy, terrain, rows, every_row=False):
+def simulated_export(policy, terrain, rows, every_row=False, rate=60):
     """The engine's capture loop: quiet rows keep observations only on request.
 
     every_row is the reference: ask again after every observed row. Returns the
-    rows and the number of questions asked.
+    rows and the number of questions asked. At `rate` Hz the schedule sees rows in
+    canonical 60 Hz time, as CaptureController feeds it.
     """
+    cadence = CADENCE*rate//60
     quiet_frames = {r['frame'] for r in rows if not commanded(r)}
     schedule = PlayerSchedule(2, policy, {'map': terrain, 'source_ticks_per_second': 60, 'player': 2})
     schedule.start()
@@ -66,8 +69,8 @@ def simulated_export(policy, terrain, rows, every_row=False):
                 current = False
             if not current and (every_row or row['frame'] >= earliest):
                 schedule.settled(30)
-                wanted = wanted_frames(row['frame'], schedule.last_decision, schedule.done or schedule.finished,
-                                       policy.config['event_max_delay'], CADENCE,
+                wanted = wanted_native(row['frame'], rate, schedule.last_decision, schedule.done or schedule.finished,
+                                       policy.config['event_max_delay'], cadence,
                                        lambda f: f in quiet_frames or f > rows[-1]['frame'])
                 earliest = wanted[0] if wanted else float('inf')
                 current, asked = True, asked+1
@@ -78,7 +81,7 @@ def simulated_export(policy, terrain, rows, every_row=False):
         if not observed:
             del kept['observation']
         sparse.append(kept)
-        schedule.put(kept)
+        schedule.put(normalize_demonstration(kept, rate))
     schedule.close(); schedule.join(30)
     if schedule.error is not None:
         raise schedule.error
@@ -111,6 +114,24 @@ class ScheduledCaptureTests(unittest.TestCase):
                 omitted = sum('observation' not in row for row in sparse)
                 self.assertGreater(omitted, len(rows)//3)
                 self.assert_same_events(self.events(rows), self.events(sparse))
+
+    def test_thirty_hertz_sparse_rows_prepare_exactly_like_every_row(self):
+        # Retail 1.04 runs at 30 Hz; preparation normalizes its rows to 60 Hz frames.
+        for seed in range(4):
+            with self.subTest(seed=seed):
+                rows = scenario(self.obs, seed, length=1200, cadence=CADENCE//2)
+                sparse, _ = simulated_export(self.policy, self.terrain, rows, rate=30)
+                omitted = sum('observation' not in row for row in sparse)
+                self.assertGreater(omitted, len(rows)//3)
+                self.assert_same_events(self.events([normalize_demonstration(r, 30) for r in rows]),
+                                        self.events([normalize_demonstration(r, 30) for r in sparse]))
+
+    def test_wanted_native_is_wanted_frames_in_native_time(self):
+        quiet = lambda f: f % 3 == 0 and f != 45
+        # Last decision at canonical 60 (native 30): the cap ends at 100, bracketed by 96 and 102.
+        self.assertEqual(wanted_native(30, 30, 60, False, 40, 3, quiet), [48, 51])
+        self.assertEqual(wanted_native(30, 60, 60, False, 40, 6, quiet), wanted_frames(30, 60, False, 40, 6, quiet))
+        self.assertEqual(wanted_native(30, 30, None, False, 40, 3, quiet), [30])
 
     def test_asking_only_when_it_matters_captures_the_same_rows(self):
         for seed in range(6):

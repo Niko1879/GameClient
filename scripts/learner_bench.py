@@ -2,7 +2,7 @@
 
   # Workstation: a bench bundle from a checkpoint's recorded split. Catalogue
   # reads are primary-key/indexed lookups only, so the converter can keep
-  # running; shards are hard links into training-data/.
+  # running; shards stay in training-data/ (cloud_upload.py streams them).
   python -B scripts/learner_bench.py bundle --checkpoint .cache/cloud-runs/v9-10k/best.npz \\
       --training 600 --output .cache/cloud-bundles/bench-v9 --baseline fd3eeed36
   # Instance, after setup.sh: the whole matrix (bench.sh), or one condition.
@@ -32,7 +32,7 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 
 ROOT = Path(__file__).resolve().parents[1]
-# Trunk widths a width sweep scales (the keys cloud_bundle's 'wide' preset changes).
+# Trunk widths a width sweep scales uniformly (the 'big' preset instead leaves map_hidden alone).
 WIDTH_KEYS = ('hidden', 'entity_hidden', 'map_hidden', 'scalar_hidden')
 LEARNER = ('train_events.py', 'torch_training_inputs.py', 'torch_policy_v3.py', 'training_preparation.py',
            'event_training_batches.py', 'generals_policy.py')
@@ -45,7 +45,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p results
 if [ ! -d baseline ]; then mkdir baseline && (cd baseline && unzip -q ../baseline-code.zip); fi
-READERS=${READERS:-$(( $(nproc) >= 12 ? 8 : ($(nproc) > 4 ? 4 : $(nproc) - 1) ))}
+export TORCHINDUCTOR_COMPILE_THREADS=1  # One ~0.5 GB compile worker per CPU thread otherwise (11 Nov).
+# Readers each load the dataset index (~3.3 GB at 112.7k matches): cap by the memory limit.
+MEM_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+[ "$MEM_LIMIT" = max ] && MEM_LIMIT=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) * 1024 ))
+MEM_READERS=$(( (MEM_LIMIT / 1048576 - 12288) / 3584 ))
+CPU_READERS=$(( $(nproc) >= 12 ? 8 : ($(nproc) > 4 ? 4 : $(nproc) - 1) ))
+READERS=${READERS:-$(( MEM_READERS < CPU_READERS ? (MEM_READERS > 1 ? MEM_READERS : 1) : CPU_READERS ))}
 UPDATES=${UPDATES:-400}
 # One warm-up for every run: throughput depends on which updates are timed
 # (eager baseline 1,936 dec/s after 60 updates, 2,357 after 250, same host),
@@ -69,6 +75,41 @@ if [ "${SWEEP:-0}" = 1 ]; then
   done
   # The first condition again: drift on a shared host shows up as a disagreement.
   run sweep-w1-b256-repeat --compile --width-scale 1 --batch-size 256 --warmup "$WARMUP"
+  .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
+  exit 0
+fi
+# BIG=1: the v11 big run's sizes (15 Nov 2026; the map is not scaled), compiled (~45 min): 'big' (C,
+# 52.1M) at batch 512/1024/2048 with the shuffle window at 2x the batch, then B (45.9M) and the
+# default (29.0M) at 512 for the cost of width. Run on the training host while the shards upload.
+if [ "${BIG:-0}" = 1 ]; then
+  for batch in 512 1024 2048; do
+    run "big-C-b$batch" --compile --widths big --batch-size "$batch" --buffer-mib $(( batch * 2 )) --warmup "$WARMUP"
+  done
+  run big-B-b512 --compile --widths '{"hidden": 2048, "entity_hidden": 512, "scalar_hidden": 384}' \
+    --batch-size 512 --buffer-mib 1024 --warmup "$WARMUP"
+  run big-default-b512 --compile --batch-size 512 --buffer-mib 1024 --warmup "$WARMUP"
+  .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
+  exit 0
+fi
+# SCALE=1: data-parallel scaling (train_events --world-size), compiled, on every GPU count
+# from 1 up to this host's, at global batch 256 and at 256 per GPU (and one GPU at those
+# batches); then two ranks sharing
+# one GPU, since a CPU-bound learner may leave room for a second process (~40 min on 4 GPUs).
+if [ "${SCALE:-0}" = 1 ]; then
+  GPUS=$(nvidia-smi -L | wc -l)
+  for world in 1 2 4 8; do
+    [ "$world" -le "$GPUS" ] || break
+    per_rank=$(( ($(nproc) - world) / world )); readers=$(( per_rank >= 8 ? 8 : (per_rank > 1 ? per_rank : 1) ))
+    # One GPU at every batch too: a larger global batch is faster on its own.
+    for batch in 256 512 1024 2048; do
+      [ "$batch" -le $(( 256 * GPUS )) ] || continue
+      [ "$world" = 1 ] || [ "$batch" = 256 ] || [ "$batch" = $(( 256 * world )) ] || continue
+      READERS=$readers run "scale-w$world-b$batch" --compile --world-size "$world" --batch-size "$batch" --warmup "$WARMUP"
+    done
+  done
+  per_rank=$(( ($(nproc) - 2) / 2 )); readers=$(( per_rank >= 8 ? 8 : (per_rank > 1 ? per_rank : 1) ))
+  READERS=$readers run scale-shared2-b256 --compile --world-size 2 --ranks-per-gpu 2 --batch-size 256 --warmup "$WARMUP"
+  run scale-w1-b256-repeat --compile --world-size 1 --batch-size 256 --warmup "$WARMUP"
   .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
   exit 0
 fi
@@ -128,7 +169,7 @@ def bundle(args):
     import sqlite3
     import zipfile
     import run_prepared_training as experiment
-    from cloud_bundle import SETUP, link_or_copy
+    from cloud_bundle import SETUP, check_shards
     from event_dataset import EventDataset
     from event_store import feature_identity
     from generals_policy import NeuralPolicy
@@ -162,12 +203,10 @@ def bundle(args):
                         'validation': args.validation, 'feature_key': key, 'purpose': 'learner benchmark'}
     (output/'data').mkdir(parents=True)
     (output/'code').mkdir()
-    links = Counter(link_or_copy(experiment.DATA/entry['path'], output/'data'/entry['path']) for entry in doc['entries'])
     experiment.save(output/'data/dataset.json', doc)
-    dataset = EventDataset(output/'data/dataset.json')
-    for entry in dataset.entries:
-        if digest(dataset.shard_path(entry)) != entry['archive_sha256']:
-            raise ValueError('Bundled shard checksum mismatch: '+entry['path'])
+    EventDataset(output/'data/dataset.json')  # The manifest's own checks.
+    # Shards stay in training-data/; cloud_upload.py streams them from there.
+    shard_bytes = check_shards(doc['entries'], experiment.DATA)
     for script in sorted((ROOT/'scripts').glob('*.py')):
         (output/'code'/script.name).write_bytes(script.read_bytes())
     archive = subprocess.run(['git', 'archive', '--format=zip', baseline, 'scripts'], cwd=ROOT, check=True,
@@ -180,7 +219,8 @@ def bundle(args):
         (output/name).write_text(text, encoding='utf-8', newline='\n')
     summary = {'kind': 'generals_learner_bench_bundle', 'created': time.time(), 'baseline': baseline,
                'feature_key': key, 'training': args.training, 'validation': args.validation,
-               'dataset_sha256': digest(output/'data/dataset.json'), **links}
+               'dataset_sha256': digest(output/'data/dataset.json'),
+               'shard_source': str(experiment.DATA), 'shard_bytes': shard_bytes}
     (output/'bundle.json').write_text(json.dumps(summary)+'\n', encoding='utf-8', newline='\n')
     print(json.dumps(summary))
 
@@ -279,7 +319,19 @@ def launches(profiler, updates):
     return {name: value/updates for name, value in counts.items()}
 
 
-def run(args):
+class _Solo:
+    """One process (also for --code baselines, whose train_events has no rank support)."""
+    rank, world, share = 0, 1, None
+
+    def barrier(self):
+        pass
+
+    def merge(self, counts):
+        return counts
+
+
+def run(args, ranks=None):
+    """Time updates; with ranks (--world-size), every rank trains its share and rank 0 reports the total."""
     if args.code:
         sys.path.insert(0, str(Path(args.code).resolve()))
     import numpy as np
@@ -296,9 +348,11 @@ def run(args):
     widths = model_widths(dataset.config, args.widths, args.width_scale)
     reference = NeuralPolicy({**dataset.config, **widths}, args.seed)
     parameters = sum(value.data.size for value in reference.parameters.values())
+    ranks = ranks or _Solo()
+    share = {'share': ranks.share} if ranks.share else {}
     learner = train_events.EventLearner(reference, device=args.device, threads=1,
                                         pair_budget=args.pair_budget, precision=args.precision,
-                                        compile_encoder=args.compile)
+                                        compile_encoder=args.compile, **({'ranks': ranks} if ranks.share else {}))
     if args.compile_heads:
         import torch_training_inputs
         torch_training_inputs.teacher_heads = torch.compile(torch_training_inputs.teacher_heads, dynamic=True)
@@ -307,9 +361,13 @@ def run(args):
                            device_type=learner.model.device_type)
     cuda = learner.model.device.type == 'cuda'
     sync = torch.cuda.synchronize if cuda else (lambda: None)
-    reader = PreparedReader(dataset, spec, args.pair_budget, args.prefetch, args.readers) if args.prefetch else None
+    reader = (PreparedReader(dataset, spec, args.pair_budget, args.prefetch, args.readers, *share.values())
+              if args.prefetch else None)
     stream = prepared_batches(dataset, 'train', spec=spec, pair_budget=args.pair_budget, reader=reader, seed=args.seed,
-                              epoch=0, batch_size=args.batch_size, buffer_bytes=args.buffer_mib*1024*1024, cursor=(0, 0))
+                              epoch=0, batch_size=args.batch_size, buffer_bytes=args.buffer_mib*1024*1024, cursor=(0, 0),
+                              **share)
+    if hasattr(learner, 'staged'):  # Older --code baselines upload on the main thread.
+        stream = learner.staged(stream)
     measured, waits, losses, profile, busy, sampler = Counter(), [], [], None, None, None
     # NVIDIA only: the ROCm build reports device type 'cuda' too, without nvidia-smi.
     nvidia = cuda and torch.version.hip is None
@@ -318,12 +376,12 @@ def run(args):
         updates = iter(stream)
         for index in range(total):
             if index == args.warmup:
-                sync()
+                sync(); ranks.barrier()  # Ranks start the timed updates together.
                 start, waits = time.perf_counter(), []
                 if nvidia:
                     sampler = GpuSampler.nvidia(torch.cuda.current_device())
             if args.profile and index == args.warmup+args.updates:
-                sync()
+                sync(); ranks.barrier()
                 elapsed = time.perf_counter()-start
                 if sampler:
                     busy, sampler = sampler.stop(), None
@@ -340,7 +398,7 @@ def run(args):
             losses.append(totals['loss_sum']/max(1, totals['decisions']))
             if args.warmup <= index < args.warmup+args.updates:
                 measured.update(totals)
-        sync()
+        sync(); ranks.barrier()
         if args.profile:
             profiler.__exit__(None, None, None)
             profile = launches(profiler, args.profile)
@@ -355,6 +413,9 @@ def run(args):
         if reader is not None:
             reader.close()
     measured_waits = waits[:args.updates]
+    measured = ranks.merge(measured)  # Every rank's decisions; one update per step.
+    if ranks.rank:
+        return None
     report = {'label': args.label or source.name, 'code': str(source),
               'code_sha256': {name: digest(source/name) for name in LEARNER if (source/name).exists()},
               'settings': {k: v for k, v in vars(args).items() if k not in ('command', 'output', 'label')},
@@ -365,6 +426,7 @@ def run(args):
               'skipped_updates': measured['skipped_updates'], 'kernels': profile, 'gpu_busy': busy,
               'max_gpu_mib': torch.cuda.max_memory_allocated()/2**20 if cuda else None,
               'widths': widths, 'parameters': parameters,
+              'world_size': ranks.world, 'ranks_per_gpu': getattr(args, 'ranks_per_gpu', 1),
               'gpu': torch.cuda.get_device_name() if cuda else None, 'cpu': cpu_name(),
               'torch': torch.__version__, 'python': platform.python_version()}
     if args.output:
@@ -378,7 +440,9 @@ def run(args):
 def summary(args):
     reports = [json.loads(Path(path).read_text(encoding='utf-8')) for path in args.reports]
     timed = {r['label']: r for r in reports if r['updates']}
-    base = [r['decisions_per_second'] for label, r in timed.items() if label.startswith('baseline-eager')]
+    # The scaling matrix (SCALE=1) is relative to its own one-GPU runs.
+    prefix = 'baseline-eager' if any(label.startswith('baseline-eager') for label in timed) else 'scale-w1-b256'
+    base = [r['decisions_per_second'] for label, r in timed.items() if label.startswith(prefix)]
     reference = sum(base)/len(base) if base else None
     print(f"{'label':28s} {'dec/s':>8s} {'x base':>7s} {'upd/s':>6s} {'wait':>5s} {'GPU MiB':>8s} "
           f"{'busy%':>6s} {'p10-p90':>8s} {'loss':>8s}  kernels/update")
@@ -438,16 +502,25 @@ def main():
     timing.add_argument('--updates', type=int, default=400)
     timing.add_argument('--profile', type=int, default=0, help='Updates to profile after the timed ones')
     timing.add_argument('--batch-size', type=int, default=256)
-    timing.add_argument('--widths', help="Model-only widths: cloud_bundle preset ('default', 'wide') or JSON")
+    timing.add_argument('--widths', help="Model-only widths: cloud_bundle preset ('default', 'big') or JSON")
     timing.add_argument('--width-scale', type=float, default=1.0, help='Scale the trunk widths (multiples of 64)')
     timing.add_argument('--pair-budget', type=int, default=8_000_000)
-    timing.add_argument('--buffer-mib', type=int, default=64)
+    timing.add_argument('--buffer-mib', type=int, default=512)
     timing.add_argument('--prefetch', type=int, default=2)
     timing.add_argument('--readers', type=int, default=4)
     timing.add_argument('--seed', type=int, default=123)
+    timing.add_argument('--world-size', type=int, default=1, help='Data-parallel ranks (train_events --world-size)')
+    timing.add_argument('--ranks-per-gpu', type=int, default=1,
+                        help='Ranks sharing each GPU (gloo gradient sums): tests a CPU-bound learner on one card')
     report = sub.add_parser('summary', help='Compare run reports')
     report.add_argument('reports', nargs='+')
     args = parser.parse_args()
+    if args.command == 'run' and args.world_size > 1:
+        if args.code:
+            parser.error('--world-size times this directory\'s learner; --code is for single-process baselines')
+        from train_events import spawn_ranks
+        spawn_ranks(run, args, args.world_size, args.ranks_per_gpu)
+        return
     {'splits': splits, 'bundle': bundle, 'run': run, 'summary': summary}[args.command](args)
 
 

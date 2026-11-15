@@ -38,6 +38,10 @@ void TrainingObserveObjectRemoval(const Object *object);
 // Observer-only command context, outside simulation state and CRCs.
 void TrainingObserveCommand(const GameMessage *message, const AIGroup *selection);
 void TrainingObserveValidation(Int playerIndex, const std::string &feedback);
+// Observer-only record of a special power's launch sounds (SpecialPowerModule::aboutToDoSpecialPower),
+// for the audio cues each player hears. Never affects simulation state.
+class SpecialPowerTemplate;
+void TrainingObserveSpecialPower(const Object *source, const SpecialPowerTemplate *power, const Coord3D *target);
 std::string TrainingObservationJSON(Int playerIndex);
 std::string TrainingMapJSON();
 std::string TrainingTemplateCatalogJSON();

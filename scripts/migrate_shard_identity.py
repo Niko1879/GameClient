@@ -107,21 +107,39 @@ def replace(temporary, path):
 
 
 def finish_interrupted(db, data):
-    """After the catalogue commits, its hashes name the replacements; anything else is unfinished."""
+    """After the catalogue commits, its hashes name the replacements; anything else is unfinished.
+    Returns the swaps it completed, for verification."""
+    finished = []
     for temporary in data.glob('*'+SUFFIX):
-        if db.execute('SELECT 1 FROM prepared_shard WHERE archive_sha256=?', (file_digest(temporary),)).fetchone():
-            replace(temporary, temporary.with_name(temporary.name[:-len(SUFFIX)]))
+        sha = file_digest(temporary)
+        if db.execute('SELECT 1 FROM prepared_shard WHERE archive_sha256=?', (sha,)).fetchone():
+            path = temporary.with_name(temporary.name[:-len(SUFFIX)])
+            replace(temporary, path)
+            finished.append(dict(archive_sha256=sha, path=str(path)))
         else:
             temporary.unlink()
+    return finished
 
 
-def migrate(catalog, root, source_key, source_engine, identity, workers, progress=print):
+def migrate(catalog, root, source_key, source_engine, identity, workers, config, deployment_engine, progress=print, limit=None,
+            exclude=()):
+    """`config` is the target pipeline's policy; profiles keep the live deployment (always the main engine).
+
+    Every replacement is built before the swap, so a pass needs free space for its shards: `limit`
+    migrates at most that many per pass, and rerunning continues with the rest. Shards of the match keys in
+    `exclude` are left alone: their new export legitimately differs (13 Nov 2026: matches with a vanilla and a
+    Tank/Nuke China player now export both players), so the converter re-exports them instead."""
     root, data = Path(root), Path(root)/'training-data'
     db = connect(catalog)
     try:
-        finish_interrupted(db, data)
+        resumed = finish_interrupted(db, data)
+        db.execute('CREATE TEMP TABLE IF NOT EXISTS excluded_match(match_key TEXT PRIMARY KEY)')
+        db.execute('DELETE FROM excluded_match')
+        db.executemany('INSERT OR IGNORE INTO excluded_match VALUES(?)', [(key,) for key in exclude])
         rows = db.execute('''SELECT archive_sha256,storage_path,index_sha256,profile_id,entry_document_sha256
-            FROM prepared_shard WHERE available=1 AND feature_key=? AND engine_sha256=?''', (source_key, source_engine)).fetchall()
+            FROM prepared_shard WHERE available=1 AND feature_key=? AND engine_sha256=?
+            AND match_key NOT IN (SELECT match_key FROM excluded_match) ORDER BY archive_sha256 LIMIT ?''',
+            (source_key, source_engine, -1 if limit is None else limit)).fetchall()
         jobs = [dict(archive_sha256=row[0], path=str(root/row[1]), index_sha256=row[2], identity=identity) for row in rows]
         progress(f'{len(jobs)} shards to migrate')
         built = {}
@@ -144,7 +162,8 @@ def migrate(catalog, root, source_key, source_engine, identity, workers, progres
                 new_sha = store_document(db, canonical(new_entry), 'shard-identity-migration', 'prepared-entry')
                 if profile_id not in profiles:
                     profile = json.loads(document_bytes(db, db.execute('SELECT document_sha256 FROM prepared_profile WHERE profile_id=?', (profile_id,)).fetchone()[0]))
-                    profile['deployment'] = dict(profile['deployment'], engine_sha256=identity['engine_sha256'])
+                    profile['deployment'] = dict(profile['deployment'], engine_sha256=deployment_engine)
+                    profile['config'] = config
                     profiles[profile_id] = profile_for(db, profile, identity['feature_key'], 'shard-identity-migration')
                 db.execute('''UPDATE prepared_shard SET archive_sha256=?,engine_sha256=?,feature_key=?,index_sha256=?,
                     bytes=?,profile_id=?,entry_document_sha256=? WHERE archive_sha256=?''',
@@ -158,9 +177,8 @@ def migrate(catalog, root, source_key, source_engine, identity, workers, progres
                 path = root/row[1]
                 replace(path.with_name(path.name+SUFFIX), path)
             progress('shards replaced')
-            jobs = [dict(archive_sha256=sha, path=str(root/stored)) for sha, stored in db.execute(
-                'SELECT archive_sha256,storage_path FROM prepared_shard WHERE available=1 AND feature_key=? AND engine_sha256=?',
-                (identity['feature_key'], identity['engine_sha256'])).fetchall()]
+            # This pass's shards; earlier passes were verified when they ran.
+            jobs = resumed+[dict(archive_sha256=built[row[0]], path=str(root/row[1])) for row in rows]
             bad = [sha for sha, same in pool.map(verify, jobs, chunksize=32) if not same]
         if bad:
             raise ValueError(f'{len(bad)} shards differ from the catalogue after migration')
@@ -176,13 +194,23 @@ def main():
     parser.add_argument('--qualification', required=True, help='Evidence that a random sample came out identical')
     parser.add_argument('--catalog', default=str(DEFAULT_CATALOG)); parser.add_argument('--root', default=str(ROOT))
     parser.add_argument('--workers', type=int, default=12)
+    parser.add_argument('--limit', type=int, help='Shards per pass; rerun until none remain')
+    parser.add_argument('--exclude-match-keys', help='File of match keys (one per line) whose shards are not migrated')
+    parser.add_argument('--backend', choices=('main', 'retail'), default='main',
+                        help='Converter whose contract names the target identity')
     args = parser.parse_args()
-    from replay_conversion import contract
-    target = contract()
+    import importlib
+    import replay_conversion as rc
+    module = {'main': 'replay_conversion', 'retail': 'retail_conversion'}[args.backend]
+    target = importlib.import_module(module).contract()
+    config = json.loads(rc.POLICY.read_text(encoding='utf-8'))
     identity = dict(feature_key=target['feature_key'], engine_sha256=target['engine_sha256'], qualification=args.qualification)
     disable_power_throttling()
     print(json.dumps(dict(migrated=migrate(args.catalog, args.root, args.from_key, args.from_engine, identity, args.workers,
-                                           lambda text: print(text, flush=True))[0], **identity)))
+                                           config, rc.contract()['engine_sha256'], lambda text: print(text, flush=True),
+                                           args.limit, exclude=Path(args.exclude_match_keys).read_text(encoding='utf-8').split()
+                                           if args.exclude_match_keys else ())[0],
+                          **identity)))
 
 
 if __name__ == '__main__':

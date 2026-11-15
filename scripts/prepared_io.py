@@ -11,7 +11,7 @@ import numpy as np
 
 # Extent, terrain, public supply sources and cell coordinates do not change within a
 # perspective; prepared events share one copy of them.
-COMMON_FIELDS = ('low', 'span', 'map_static')
+COMMON_FIELDS = ('low', 'span', 'map_static', 'weapon_stats', 'armor_stats')
 
 
 def _json_bytes(value):

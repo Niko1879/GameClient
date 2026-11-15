@@ -440,6 +440,10 @@ public:
 	WeaponPrefireType getPrefireType() const { return m_prefireType; }
 	Bool getAutoReloadsClip() const { return m_reloadType == AUTO_RELOAD; }
 	Int getClipSize() const { return m_clipSize; }
+	// Training export: the raw delay range. getDelayBetweenShots() draws a logic random number
+	// when min != max, so read-only exporters must never call it.
+	Int getMinDelayBetweenShots() const { return m_minDelayBetweenShots; }
+	Int getMaxDelayBetweenShots() const { return m_maxDelayBetweenShots; }
 	Int getContinuousFireOneShotsNeeded() const { return m_continuousFireOneShotsNeeded; }
 	Int getContinuousFireTwoShotsNeeded() const { return m_continuousFireTwoShotsNeeded; }
 	UnsignedInt getContinuousFireCoastFrames() const { return m_continuousFireCoastFrames; }
@@ -690,6 +694,9 @@ public:
 	void createLaser( const Object *sourceObj, const Object *victimObj, const Coord3D *victimPos );
 
 	const WeaponTemplate* getTemplate() const { return m_template; }
+	// Training export: the bonus this weapon would fire with now (veterancy, upgrades, container),
+	// computed by the real computeBonus. Read-only; no logic random numbers.
+	void computeTrainingBonus(const Object *source, WeaponBonus& bonus) const { computeBonus(source, 0, bonus); }
 	WeaponSlotType getWeaponSlot() const { return m_wslot; }
 	AsciiString getName() const { return m_template->getName(); }
 	UnsignedInt getLastShotFrame() const { return m_lastFireFrame; }						///< frame a shot was last fired on

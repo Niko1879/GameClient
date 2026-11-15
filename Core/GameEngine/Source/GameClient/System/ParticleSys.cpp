@@ -34,6 +34,9 @@
 #include "Common/GameState.h"
 #include "Common/INI.h"
 #include "Common/PerfTimer.h"
+#if !RTS_GENERALS
+#include "Common/ReplayLogic.h"
+#endif
 #include "Common/ThingFactory.h"
 #include "Common/GameLOD.h"
 #include "Common/Xfer.h"
@@ -2992,6 +2995,21 @@ void ParticleSystemManager::init()
 }
 
 // ------------------------------------------------------------------------------------------------
+/** Headless playback skips the templates, except for replays of releases whose logic spent random
+	values on effects only when their particle template existed, as on the recording client
+	(9a402fbe2 decoupled that; Common/ReplayLogic.h). */
+// ------------------------------------------------------------------------------------------------
+#if !RETAIL_COMPATIBLE_CRC
+void ParticleSystemManagerDummy::init()
+{
+#if !RTS_GENERALS
+	if (replayLogic062026())
+		ParticleSystemManager::init();
+#endif
+}
+#endif
+
+// ------------------------------------------------------------------------------------------------
 /** Reset the manager and all particle systems */
 // ------------------------------------------------------------------------------------------------
 void ParticleSystemManager::reset()
@@ -3116,6 +3134,12 @@ ParticleSystem *ParticleSystemManager::createParticleSystem( const ParticleSyste
 	// sanity
 	if (sysTemplate == nullptr)
 		return nullptr;
+
+#if !RTS_GENERALS && !RETAIL_COMPATIBLE_CRC
+	// Headless playback loads templates only for older replay logic; it never needs the systems.
+	if (isDummy())
+		return nullptr;
+#endif
 
 	m_uniqueSystemID = (ParticleSystemID)((UnsignedInt)m_uniqueSystemID + 1);
 	ParticleSystem *sys = newInstance(ParticleSystem)( sysTemplate, m_uniqueSystemID, createSlaves );

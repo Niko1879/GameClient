@@ -53,6 +53,10 @@ def sample(args):
             archive.db.close()
 
 
+def unrecorded_map_crc(value):
+    return isinstance(value, str) and re.fullmatch(r"0{1,8}", value) is not None
+
+
 def classify(evidence, header, stream, returncode, log_text=""):
     # Setup problems must not inflate the measured rate of engine divergence.
     if evidence is None:
@@ -61,7 +65,10 @@ def classify(evidence, header, stream, returncode, log_text=""):
         return "engine_error"
     if not crc32_matches(evidence.get("engine_ini_crc"), header.get("ini_crc")):
         return "data_mismatch"
-    if not crc32_matches(evidence.get("loaded_map_crc"), header.get("map_crc")):
+    # A header map CRC of zero means the recorder did not write one (some retail 1.04 games, 14 Nov 2026);
+    # nothing to compare, and a wrong or missing map still fails the CRC checks below within seconds.
+    if (not crc32_matches(evidence.get("loaded_map_crc"), header.get("map_crc"))
+            and not unrecorded_map_crc(header.get("map_crc"))):
         return "map_mismatch"
     if evidence["crc_comparisons"] <= 0:
         return "no_crc_evidence"

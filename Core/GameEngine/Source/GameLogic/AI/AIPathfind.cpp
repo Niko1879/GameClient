@@ -33,6 +33,9 @@
 #include "Common/Player.h"
 #include "Common/CRCDebug.h"
 #include "Common/GlobalData.h"
+#if !RTS_GENERALS
+#include "Common/ReplayLogic.h"
+#endif
 #include "Common/LatchRestore.h"
 #include "Common/ThingTemplate.h"
 #include "Common/ThingFactory.h"
@@ -5555,7 +5558,12 @@ Bool Pathfinder::adjustDestination(Object *obj, const LocomotorSet& locomotorSet
 		// even when no adjustment is necessary because there are no obstructions. For single units this adjustment
 		// can be skipped in order to provide more accurate movement, which is especially noticeable for chinooks.
 		const Bool singleUnit = obj && obj->getGroup() && obj->getGroup()->getCount() == 1;
-		const Bool useExactDestination = isHuman && singleUnit;
+		Bool useExactDestination = isHuman && singleUnit;
+#if !RTS_GENERALS
+		// Replays of releases before this fix always snap (Common/ReplayLogic.h).
+		if (replayLogic062026())
+			useExactDestination = FALSE;
+#endif
 		if (!useExactDestination) {
 			*dest = adjustDest;
 		}

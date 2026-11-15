@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from generals_policy import COMMAND_KINDS, command_target, selection_limit
+from generals_identity import production_twin
 
 
 def build_legality(policy, encoded, teacher, key):
@@ -15,11 +16,6 @@ def build_legality(policy, encoded, teacher, key):
               'verb': policy.verb_mask(encoded)}
     kind = teacher['kind']
     if kind == 'wait':
-        return result
-    if kind == 'science':
-        # Player-level: no actor tokens, only the purchasable promotions.
-        result.update(actor=np.zeros(count, dtype=bool), unit_masks=np.zeros((0, count+1), dtype=bool),
-                      unit_choices=[], selected=[], science=policy.science_mask(encoded))
         return result
     actors = policy.actor_mask(encoded, kind)
     limit = selection_limit(config, kind)
@@ -48,8 +44,8 @@ def build_legality(policy, encoded, teacher, key):
         result['target'] = policy.target_mask(encoded, kind, selected, teacher.get('command'))
     if kind in ('build', 'train'):
         actor = encoded['entities'][selected[0]]
-        menu = config['menus'][actor['type']+'|'+kind]
-        available = actor['buildable_templates' if kind == 'build' else 'trainable_templates']
+        menu = config['menus'][production_twin(config, actor['type'])+'|'+kind]
+        available = policy.production_available(actor, kind)
         result['template'] = np.asarray([name in menu and name in available for name in config['templates']], dtype=bool)
     if mode == 'position':
         n, fine = config['map_side'], config['position_bins']//config['map_side']

@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from generals_policy import (ATTENTION_LAYERS, ARCHITECTURE, LOCATION_BLOCKS, MAP_RESIDUAL_BLOCKS, SCATTER_SCALE,
+from generals_policy import (ATTENTION_LAYERS, ARCHITECTURE, LOCATION_BLOCKS, LOGIT_CAP, MAP_RESIDUAL_BLOCKS, SCATTER_SCALE,
                              SCATTER_VOLUME, UNDER_ATTACK_COLUMN, location_order, location_stages)
 
 
@@ -142,20 +142,27 @@ class TorchPolicyV3(nn.Module):
         for stage in range(len(stages)):
             y = F.conv_transpose2d(y, p[f'location_up{stage}'], stride=2, padding=1)+p[f'location_up{stage}_b']
             if stage < len(stages)-1:
-                y = F.relu(y)
+                y = F.relu(F.layer_norm(y.flatten(1), (y[0].numel(),), eps=1e-5).reshape(y.shape))
         fine = config['position_bins']//n
-        return cells, y.flatten(1)[:, self.location_order].reshape(rows, n*n, fine*fine)
+        flat = y.flatten(1)
+        flat = torch.tanh((flat-flat.gather(1, flat.detach().argmax(1, keepdim=True)))/LOGIT_CAP)*LOGIT_CAP
+        return cells, flat[:, self.location_order].reshape(rows, n*n, fine*fine)
 
     def encode_inputs(self, inputs):
         """Numerical encoder after CPU preparation and device staging."""
         p, config = self.weights, self.config
         features = inputs['numeric']
         batch, count, _ = features.shape
-        # One lookup into a per-type table for current and queued types, then a
-        # single input GEMM: the same sums as separate per-slice products, with
-        # far fewer token-sized embedding backward passes.
+        # One per-type table for an entity's own type and its queue items, then a single input
+        # GEMM: the same sums as separate per-slice products (generals_policy._encode_modalities).
         table = self.object_embedding(self.identity_type_objects)
-        types = F.embedding(torch.stack([inputs['types'], inputs['queued']], dim=-1), table).reshape(batch, count, -1)
+        types = F.embedding(inputs['types'], table)
+        # Queue: slot 0 is in production now, the rest pending; a slot is a unit type (-1: none)
+        # or an upgrade (0: none), as NeuralPolicy.queue_inputs.
+        queue, queued_upgrades = inputs['queue_units'], inputs['queue_upgrades']
+        items = (F.embedding(queue.clamp(min=0), table)*(queue >= 0)[..., None].to(self.dtype)
+                 + F.embedding(queued_upgrades, p['upgrade_embedding'])*(queued_upgrades > 0)[..., None].to(self.dtype))
+        types = torch.cat([types, items[:, :, 0], items[:, :, 1:].sum(dim=2)], dim=-1)
         # Empty upgrade slots (index 0) are masked out, as in the reference.
         slots = inputs['entity_upgrades']
         upgrades = (F.embedding(slots, p['upgrade_embedding']) * (slots > 0)[..., None].to(self.dtype)).sum(dim=2)
@@ -181,14 +188,22 @@ class TorchPolicyV3(nn.Module):
                     @ torch.cat([p['task_'+role+'_features_w'] for role in RELATIONS]))
         entity = torch.tanh(base.index_add(0, inputs['task_rows'], addition.to(base.dtype))).reshape(batch, count, hidden)
         heads, width = config['attention_heads'], config['entity_hidden']//config['attention_heads']
-        valid = ~inputs['valid'][:, None, None, :]
+        # v11 effect and sound-cue tokens (generals_policy.Encoder._effects) join the attention, then
+        # leave before the map scatter, pools of units and every head; padded tokens are never keys.
+        effect_valid = inputs['effect_valid']
+        tokens = torch.tanh(inputs['effect_numeric'] @ p['effect_w'] + self.type_embedding(inputs['effect_types']) @ p['effect_type_w']
+                            + F.embedding(inputs['effect_powers'], p['power_embedding']) @ p['effect_power_w'] + p['effect_b'])
+        entity = torch.cat([entity, tokens.to(entity.dtype)], dim=1)
+        rows = entity.shape[1]
+        valid = ~torch.cat([inputs['valid'], effect_valid], dim=1)[:, None, None, :]
         for layer in range(ATTENTION_LAYERS):
-            q, k, v = [(entity @ p[f'{name}{layer}']).reshape(batch, count, heads, width).transpose(1, 2)
+            q, k, v = [(entity @ p[f'{name}{layer}']).reshape(batch, rows, heads, width).transpose(1, 2)
                        for name in ('attn_q', 'attn_k', 'attn_v')]
             scores = (q @ k.transpose(-1, -2)/math.sqrt(width)).masked_fill(valid, -torch.inf)
-            attended = (scores.softmax(dim=-1) @ v).transpose(1, 2).reshape(batch, count, config['entity_hidden'])
+            attended = (scores.softmax(dim=-1) @ v).transpose(1, 2).reshape(batch, rows, config['entity_hidden'])
             entity = self.normalize(entity + attended @ p[f'attn_out{layer}'])
             entity = self.normalize(entity + F.relu(entity @ p[f'entity_ff_in{layer}']) @ p[f'entity_ff_out{layer}'])
+        entity, effects = entity[:, :count], entity[:, count:]
         spatial, map_embedding = self.encode_map(inputs, entity)
         scalar = inputs['scalars'] @ p['scalar_w'] + p['scalar_b']
         for i, prefix in enumerate(('task_command', 'task_validation')):
@@ -210,13 +225,14 @@ class TorchPolicyV3(nn.Module):
         gate = F.relu(identity @ p['gate_identity_w'] + enemy @ p['gate_enemy_w'] + available @ p['gate_actions_w'] + p['gate_b'])
         scalar = torch.tanh(scalar)
         query = scalar @ p['pool_query']
-        def pool(mask):
-            logits = torch.bmm(entity, query.unsqueeze(-1)).squeeze(-1).masked_fill(~mask, -torch.inf)
+        def pool(mask, rows=entity):
+            logits = torch.bmm(rows, query.unsqueeze(-1)).squeeze(-1).masked_fill(~mask, -torch.inf)
             logits = torch.where(mask.any(dim=1, keepdim=True), logits, torch.zeros_like(logits))
             weights = logits.softmax(dim=1)*mask
-            return torch.bmm(weights.unsqueeze(1), entity).squeeze(1)
+            return torch.bmm(weights.unsqueeze(1), rows).squeeze(1)
         features = torch.cat([scalar, pool(inputs['pool_own']), pool(inputs['pool_visible']),
-                              pool(inputs['pool_hidden']), pool(inputs['pool_neutral']), map_embedding], dim=1)
+                              pool(inputs['pool_hidden']), pool(inputs['pool_neutral']), pool(effect_valid, effects),
+                              map_embedding], dim=1)
         return features, entity, spatial, gate
 
     def events(self, encoded=None, *, prepared=None):
@@ -227,15 +243,18 @@ class TorchPolicyV3(nn.Module):
         if prepared is None:
             features, entities, spatial, gate = self.encode_batch(encoded)
         else:
-            features, entities, spatial, gate = self.encode_inputs(self.stager.stage(prepared['values']))
+            staged = prepared['staged_values'] if 'staged_values' in prepared else self.stager.stage(prepared['values'])
+            features, entities, spatial, gate = self.encode_inputs(staged)
         p = self.weights
         hidden = torch.tanh(torch.tanh(features @ p['event_input_w']+p['event_input_b'])
                             @ p['event_hidden_w']+p['event_hidden_b'])
         return torch.cat([hidden, gate], dim=1), entities, spatial
 
-    def teacher_heads(self, encoded, teachers, memories, entities, spatial, *, loss_only=False, plan=None):
+    def teacher_heads(self, encoded, teachers, memories, entities, spatial, *, loss_only=False, plan=None,
+                      position_metrics=False):
         from torch_training_inputs import teacher_heads
-        return teacher_heads(self, encoded, teachers, memories, entities, spatial, loss_only=loss_only, plan=plan)
+        return teacher_heads(self, encoded, teachers, memories, entities, spatial, loss_only=loss_only, plan=plan,
+                             position_metrics=position_metrics)
 
     def values(self, hidden):
         p = self.weights

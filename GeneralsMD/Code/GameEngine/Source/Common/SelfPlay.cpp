@@ -368,6 +368,21 @@ void reset(const Json &request)
     }
     require(china >= 0, "Vanilla China faction unavailable");
     require(opponent != "hard_ai" || faction == "random" || botFaction >= 0, "Unknown playable opponent faction");
+    // Policy slots play vanilla China unless policy_factions names one of the China generals the
+    // exporter observes (vanilla, Tank, Nuke) per slot (three-faction evaluation, 15 Nov 2026).
+    int policyFaction[2] = {china, china};
+    const Json policyFactions = request.value("policy_factions", Json::array());
+    require(policyFactions.is_array() && (policyFactions.empty() || policyFactions.size() == 2),
+            "policy_factions must list both slots");
+    for (int slot = 0; slot < (int)policyFactions.size(); ++slot) {
+        const std::string name = policyFactions[slot].get<std::string>();
+        require(name == "FactionChina" || name == "FactionChinaTankGeneral" || name == "FactionChinaNukeGeneral",
+                "Policy slots play vanilla, Tank or Nuke China");
+        policyFaction[slot] = -1;
+        for (int i = 0; i < ThePlayerTemplateStore->getPlayerTemplateCount(); ++i)
+            if (ThePlayerTemplateStore->getNthPlayerTemplate(i)->getName() == AsciiString(name.c_str())) policyFaction[slot] = i;
+        require(policyFaction[slot] >= 0, "Policy faction unavailable");
+    }
     maxFrames = request.value("max_frames", 36000u);
     require(maxFrames > 0 && maxFrames <= 3600000, "Invalid episode frame limit");
     require(!map.empty(), "Map is required");
@@ -393,7 +408,7 @@ void reset(const Json &request)
         botSlots[slot] = opponent == "hard_ai" && slot != learningSide;
         // SLOT_BRUTAL_AI is the UI's Hard difficulty (DIFFICULTY_HARD).
         s->setState(botSlots[slot] ? SLOT_BRUTAL_AI : SLOT_PLAYER, name, slot + 1);
-        s->setColor(slot); s->setStartPos(slot); s->setPlayerTemplate(botSlots[slot] ? botFaction : china); s->setTeamNumber(-1);
+        s->setColor(slot); s->setStartPos(slot); s->setPlayerTemplate(botSlots[slot] ? botFaction : policyFaction[slot]); s->setTeamNumber(-1);
         s->setAccept(); s->setMapAvailability(TRUE);
     }
     Money cash;
@@ -418,6 +433,7 @@ void reset(const Json &request)
     mapPending = true;
     retaliationPending = true;
     episodeSetup = {{"opponent_kind", opponent}, {"opponent_faction", faction}, {"learning_side", learningSide},
+                    {"policy_factions", policyFactions},
                     {"starting_cash", request.value("starting_cash", 10000u)}, {"record_replay", recording}};
     live = true;
 }

@@ -42,6 +42,7 @@ from engine_runtime import disable_power_throttling
 from generals_policy import NeuralPolicy
 from replay_actions import ReplayActionAdapter
 from replay_events import EventValidator, decisions
+from replay_sequences import normalize_demonstration
 
 IGNORED = {'MSG_BEGIN_NETWORK_MESSAGES', 'MSG_LOGIC_CRC', 'MSG_SET_REPLAY_CAMERA'}
 ROWS_READY = 'GAIX {"event":"rows"}\n'
@@ -78,6 +79,18 @@ def wanted_frames(frame, last_decision, finished, cap, cadence, quiet):
         first += cadence
     wanted.append(first)
     return wanted
+
+
+def wanted_native(frame, rate, last_decision, finished, cap, cadence, quiet):
+    """wanted_frames for an engine running at `rate` Hz, in its own frames.
+
+    The schedule runs in canonical 60 Hz frames, as preparation feeds decisions()
+    (replay_sequences.normalize_demonstration); `frame`, `cadence`, `quiet` and the
+    answer are native.
+    """
+    scale = 60//rate
+    return [f//scale for f in wanted_frames(frame*scale, last_decision, finished, cap, cadence*scale,
+                                            lambda f: f % scale == 0 and quiet(f//scale))]
 
 
 class GrowingFile:
@@ -246,8 +259,8 @@ class CaptureController:
             for record in stream_records(self.file, lazy=True, validated=True):
                 kind = record['record']
                 if kind == 'header':
-                    if record.get('quiet_capture') != 'scheduled' or record['ticks_per_second'] != 60:
-                        raise ValueError('Scheduled capture needs a 60 Hz scheduled-capture export')
+                    if record.get('quiet_capture') != 'scheduled' or record['ticks_per_second'] not in (30, 60):
+                        raise ValueError('Scheduled capture needs a 30 or 60 Hz scheduled-capture export')
                     self.header = record
                     self.cadence = max(1, (record['interval_ms']*record['ticks_per_second']+999)//1000)
                 elif kind == 'map':
@@ -286,7 +299,8 @@ class CaptureController:
         if 'observation' in record:
             row['observation'] = record['observation']
         self.last_frame[player] = frame
-        self.players[player].put(row)
+        # decisions() runs in canonical 60 Hz time, as preparation's ReplayRows feeds it.
+        self.players[player].put(normalize_demonstration({**row, 'hold_ticks': None}, self.header['ticks_per_second']))
 
     def quiet(self, player, frame):
         return frame % self.cadence == 0 and frame not in self.commands.get(player, ())
@@ -312,9 +326,21 @@ class CaptureController:
         schedule = self.players.get(player)
         if schedule is None or not self.quiet(player, frame) or self.last_frame[player] >= frame:
             raise ValueError(f'Unexpected capture request for player {player} at frame {frame}')
-        schedule.settled(timeout)
-        return wanted_frames(frame, schedule.last_decision, schedule.done or schedule.finished,
-                             self.cap, self.cadence, lambda f: self.quiet(player, f))
+        try:
+            schedule.settled(timeout)
+        except RuntimeError:
+            if schedule.error is None:
+                raise
+            # A schedule fails on rows preparation cannot use either (e.g. a game that never
+            # loaded its map). Observe every quiet row so the engine plays on: its playback
+            # verdict decides first, and failure() is raised only for a playback that passed.
+            return [frame]
+        return wanted_native(frame, self.header['ticks_per_second'], schedule.last_decision,
+                             schedule.done or schedule.finished, self.cap, self.cadence, lambda f: self.quiet(player, f))
+
+    def failure(self):
+        """The first player schedule's error, once close() has run."""
+        return next((s.error for s in self.players.values() if s.error is not None), None)
 
     def close(self):
         self.finished.set()
@@ -326,9 +352,6 @@ class CaptureController:
         self.file.close()
         if self.error is not None:
             raise RuntimeError('Scheduled capture reader failed') from self.error
-        for schedule in self.players.values():
-            if schedule.error is not None:
-                raise RuntimeError(f'Capture schedule for player {schedule.player} failed') from schedule.error
 
 
 def _relay(process, log, controller):
@@ -384,8 +407,16 @@ def run_engine(command, *, cwd, log_path, timeout, creationflags, controller=Non
     """
     if controller is None:
         with Path(log_path).open('w', encoding='utf-8') as log:
-            return subprocess.run(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                                  timeout=timeout, creationflags=creationflags).returncode
+            process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
+                                       creationflags=creationflags)
+            try:
+                # Windowless engines are otherwise EcoQoS-throttled onto efficiency cores.
+                disable_power_throttling(int(process._handle))
+                return process.wait(timeout=timeout)
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
     process = _start_engine(command, cwd, creationflags)
     expired = threading.Event()
 

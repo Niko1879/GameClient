@@ -30,6 +30,7 @@
 
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+#include "Common/ReplayLogic.h"
 #include "Common/Xfer.h"
 #include "GameClient/Drawable.h"
 #include "GameLogic/Module/PoisonedBehavior.h"
@@ -161,7 +162,9 @@ void PoisonedBehavior::startPoisonedEffects( const DamageInfo *damageInfo )
 	m_poisonDamageAmount = damageInfo->out.m_actualDamageDealt;
 #if !(RETAIL_COMPATIBLE_CRC || PRESERVE_NO_XP_FROM_POISON_KILLS)
 	// TheSuperHackers @bugfix Stubbjax 03/09/2025 Allow poison damage to award xp to the poison source.
-	m_poisonSource = damageInfo->in.m_sourceID;
+	// Replays of releases before the community patch code changes award none (Common/ReplayLogic.h).
+	if (!replayLogic062026())
+		m_poisonSource = damageInfo->in.m_sourceID;
 #endif
 
 	m_poisonOverallStopFrame = now + d->m_poisonDurationData;

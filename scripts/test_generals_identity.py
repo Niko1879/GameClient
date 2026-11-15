@@ -101,7 +101,10 @@ class IdentityHierarchyTests(unittest.TestCase):
         self.assertEqual(self.identity.generals[obj], GENERALS.index('laser'))
         self.assertEqual(encoded['player_identity'], (BASE_FACTIONS.index('China'), GENERALS.index('vanilla')))
         observation['player']['faction'] = 'FactionChinaNukeGeneral'
-        with self.assertRaisesRegex(ValueError, 'vanilla China'):
+        encoded = self.policy.encoder.encode(observation, self.terrain, 6)
+        self.assertEqual(encoded['player_identity'], (BASE_FACTIONS.index('China'), GENERALS.index('nuke')))
+        observation['player']['faction'] = 'FactionChinaInfantryGeneral'
+        with self.assertRaisesRegex(ValueError, 'vanilla, Tank and Nuke China'):
             self.policy.encoder.encode(observation, self.terrain, 6)
 
     def test_shared_production_features_keep_exact_legality_and_dispatch(self):
@@ -123,7 +126,7 @@ class IdentityHierarchyTests(unittest.TestCase):
         observation['own_entities'][1]['production_queue'] = [
             {'remaining_quantity': 1, 'progress': 20, 'unit_type': 'Nuke_ChinaVehicleDozer'}]
         queued = self.policy.encoder.encode(observation, self.terrain, 6)
-        index = queued['queued_types'][queued['ids'][20]]
+        index = queued['queue_units'][queued['ids'][20], 0]
         np.testing.assert_array_equal(self.policy.type_embedding(np.asarray([index])).data[0],
             self.policy.object_embedding(np.asarray([self.identity.objects['Nuke_ChinaVehicleDozer']])).data[0])
 

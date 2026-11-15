@@ -31,7 +31,7 @@ class CatalogTests(unittest.TestCase):
                      archive_sha256=catalog.digest(shard.read_bytes()),index_sha256=catalog.digest(catalog.canonical(index)))
         path = self.root/f'{key}-{number}.json'
         doc = dict(kind='generals_event_dataset',schema=1,complete=True,
-                   config=dict(architecture='generals-relational-v4-event',feature_marker=key),entries=[entry])
+                   config=dict(architecture='generals-relational-v5-event',feature_marker=key),entries=[entry])
         path.write_bytes(catalog.canonical(doc))
         return path,doc
 

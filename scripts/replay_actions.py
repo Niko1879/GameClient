@@ -36,6 +36,11 @@ class ReplayActionAdapter:
         for raw in sample['actions']:
             name = raw['name']
             values = [argument['value'] for argument in raw['arguments']]
+            if name == 'MSG_PURCHASE_SCIENCE':
+                # Science purchases are automated in live play (scripted matchup presets,
+                # re-export fix 2, user 11 Nov 2026): a human purchase is neither a decision
+                # nor unsupported. The bought science still reaches the model as an input.
+                continue
             if 'command_result' in raw:
                 # Upgrades, abilities, garrison and promotions: the engine resolved
                 # the pressed button against the real selection at dispatch.
@@ -87,10 +92,13 @@ class ReplayActionAdapter:
                     else:
                         self.selected = list(dict.fromkeys(self.selected + self.teams[index]))
                     continue
-                if name in ('MSG_ENABLE_RETALIATION_MODE', 'MSG_SET_MINE_CLEARING_DETAIL'):
+                if name in ('MSG_ENABLE_RETALIATION_MODE', 'MSG_SET_MINE_CLEARING_DETAIL',
+                            'MSG_AREA_SELECTION_DEPRECATED'):
                     # A client option posted at game start (live play applies the same
-                    # default), and the UI's preparation for a mine-clearing weapon
-                    # order: settings, not decisions or waits.
+                    # default), the UI's preparation for a mine-clearing weapon order,
+                    # and a deprecated area-selection message the game logic never
+                    # handles (~11 per game; it used to make its tick "unsupported" and
+                    # drop real commands sent alongside it): not decisions or waits.
                     continue
                 if name == 'MSG_SET_RALLY_POINT':
                     if values[0] not in owned:

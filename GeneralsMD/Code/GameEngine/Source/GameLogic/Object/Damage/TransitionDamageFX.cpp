@@ -31,6 +31,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/Xfer.h"
+#include "Common/ReplayLogic.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/FXList.h"
 #include "GameLogic/GameLogic.h"
@@ -387,11 +388,13 @@ void TransitionDamageFX::onBodyDamageStateChange( const DamageInfo* damageInfo,
 				if( lastDamageInfo == nullptr ||
 						getDamageTypeFlag( modData->m_damageParticleTypes, lastDamageInfo->in.m_damageType ) )
 				{
-#if RETAIL_COMPATIBLE_CRC
 					// TheSuperHackers @fix The particle system is now decoupled from the logic crc
 					// and the side effects on the logic random seed values are preserved for retail compatibility.
-					getLocalEffectPos( &modData->m_particleSystem[ newState ][ i ].locInfo, draw, LogicRandomValueClass() );
+#if !RETAIL_COMPATIBLE_CRC
+					// Replays of releases before the particle decoupling spent these logic random values (Common/ReplayLogic.h).
+					if (replayLogic062026())
 #endif
+					getLocalEffectPos( &modData->m_particleSystem[ newState ][ i ].locInfo, draw, LogicRandomValueClass() );
 
 					// create a new particle system based on the template provided
 					ParticleSystem* pSystem = TheParticleSystemManager->createParticleSystem( pSystemT );

@@ -10,11 +10,23 @@ cutoff never needs a rescan. Checks (all thresholds are flags of `report`):
   (which player self-destructed, i.e. surrendered/quit, or none recorded).
 - opening_dozers: a China player queued more than --max-opening-dozers dozers
   in the first --opening-seconds (cancelled queues are netted out).
+- map: the game's map is not official, not a ranked-pack map (by CRC,
+  replay-runtime/retail-104/ranked-maps.json) and not a map of any rated ladder
+  game (by CRC). Joke/4fun maps (no money, casino, cxn, mods) only appear here.
+  Applied by default (user decision, 7 Nov 2026: unrated games are kept, with the
+  model's rated flag off, under the same map rule as GenTool's harvest).
+- slots: the map does not have exactly 2 player slots, or no source verifies its
+  slot count (scripts/map_slots.py: MapCache.ini numPlayers or the .map file's
+  start waypoints; table replay-runtime/map-slots.json, rebuilt by `map-slots`).
+  A competitive 1v1 is played on a 2-slot map (user decision, 10 Nov 2026).
+  "[RANK]" is not evidence: GenTool's ranked pack includes team maps.
 - unrated: the China player has no pre-match Overall rating in the sidecar's
   Matches listing text, i.e. the match was not a rated ladder game (custom
-  lobbies, 4fun settings such as $1M starting cash, stats tracking disabled).
-  Applied by default (user decision, 5 Nov 2026: ranked matches only, where
-  both players are trying to win).
+  lobbies, stats tracking disabled). Reported only since 7 Nov 2026 (applied
+  5-7 Nov: ranked matches only); pass it in --checks to train ranked-only.
+- cash: starting cash is not --starting-cash ($10,000, the ladder setting).
+  Unrated lobbies hold most 4fun cash games ($1M, $50k, $100k: 6,046 of 6,275
+  on 5 Nov), and those can be on normal maps. Applied by default with map.
 - low_rating: that rating is below --min-china-rating (default 0: reported only).
 - extra_trucks: against a non-GLA opponent, a China player queued more than
   --max-trucks-per-center supply trucks from one supply center in the first
@@ -39,13 +51,60 @@ import struct
 import sys
 
 from audit_replay_commands import message_names
+import map_slots
 from engine_runtime import disable_power_throttling
 from harvest_china_replays import parse_replay
 from replay_catalog import replay_key
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT/'replays/vanilla-china'
+# gamereplays.org retail 1.04 archive (scripts/retail_conversion.py): top-level play with no
+# listing, so no ladder rating. User decisions, 6 Nov 2026: one training batch with the ladder
+# data; the experts named in Ratings.txt (and their aliases in player-names.csv) rate 2000,
+# slightly below the current top 25 since play improves over time; everyone else 1700. Each
+# player in each match gets a fixed jitter so the model does not key on exact values.
+ARCHIVE = ROOT/'replays/gamereplays'
+ARCHIVE_EXPERTS = ARCHIVE/'Ratings.txt'
+ARCHIVE_ALIASES = ARCHIVE/'player-names.csv'
+# Second gamereplays.org download (14 Nov 2026: vanilla, Tank and Nuke China 1v1s); same source and rules.
+ARCHIVE3 = ROOT/'replays/gamereplays3'
+EXPERT_RATING, ARCHIVE_RATING, RATING_JITTER = 2000, 1700, 50
+# GenTool's upload archive (scripts/harvest_gentool.py): retail 1.04 games of any level,
+# mostly casual. User, 7 Nov 2026: do not assume these are strong. Skill is unknown, so
+# players are unrated (the model's rated flag is off) unless named in Ratings.txt, and the
+# unrated check does not drop these matches; every other check applies.
+GENTOOL = ROOT/'replays/gentool'
+# Tank/Nuke-general China games from Generals Online (scripts/watch_china_replays.py; 13 Nov 2026): same crawler
+# sidecars as CORPUS, so they scan like it.
+CHINA_GENERALS = ROOT/'replays/china-generals'
+GENTOOL_RATING = None
+
+
+def archive_source(path):
+    """'gamereplays', 'gentool' or None for a replay path."""
+    parent = Path(path).resolve().parent
+    if parent in (ARCHIVE.resolve(), ARCHIVE3.resolve()):
+        return 'gamereplays'
+    return 'gentool' if parent.parent == GENTOOL.resolve() else None
 METRICS = ROOT/'replays/catalog/cleaning-metrics.jsonl'
+# scripts/rating_estimator.py joint: one row per player of every scanned match.
+ESTIMATES = ROOT/'replays/catalog/rating-estimates.jsonl'
+RANKED_MAPS = ROOT/'replay-runtime/retail-104/ranked-maps.json'
+_MAP_PREFIX = re.compile(r'^[0-9A-Fa-f]{2}(?=(?:userdata/)?maps/)', re.I)
+
+
+def map_identity(header):
+    """(map path without the header's 2-hex prefix, '%08X' CRC) of a parsed replay header."""
+    return _MAP_PREFIX.sub('', header['map'].replace('\\', '/')), '%08X' % int(header['map_crc'], 16)
+
+
+def ranked_map_crcs():
+    return set(json.loads(RANKED_MAPS.read_text(encoding='utf-8'))['maps'])
+
+
+def allowed_map(path, crc, allowed):
+    """Shipped with the game (maps/...), or a custom map whose exact CRC is in allowed."""
+    return path.casefold().startswith('maps/') or crc in allowed
 ACTION_CATALOG = ROOT/'replay-runtime/action-catalog.json'
 WIDTHS = (4, 4, 1, 4, 4, 4, 12, 8, 16, 4, 2)  # argument types in Recorder order
 INT_TYPES = {0, 3, 4, 5, 9}  # integer, object, drawable, team, timestamp
@@ -90,6 +149,9 @@ def messages(data, position, names):
 
 def logic_rate(header):
     """Logic frames per second: 60 on current revisions, 30 on old ones."""
+    from random_sides import RETAIL_RELEASES
+    if header['exe_crc'] in RETAIL_RELEASES:
+        return 30
     wall = header['end_time'] - header['start_time']
     return 30 if wall > 0 and header['frames']/wall < 42 else 60
 
@@ -114,6 +176,25 @@ def listing_ratings(text, factions):
             return None
         ratings.append({k.lower().replace(' ', '_'): int(before) for k, before, _ in RATING.findall(part)})
     return ratings
+
+
+def archive_experts():
+    """Every archive name that belongs to an expert in Ratings.txt, aliases included."""
+    import csv
+    experts = {line.strip() for line in ARCHIVE_EXPERTS.read_text(encoding='utf-8-sig').splitlines()
+               if line.strip() and not line.strip().endswith(':')}
+    with ARCHIVE_ALIASES.open(encoding='utf-8-sig', newline='') as stream:
+        aliases = {row['name'] for row in csv.DictReader(stream) if row['alias_of'] in experts}
+    return experts | aliases
+
+
+def archive_rating(name, match_key, slot, experts, default=ARCHIVE_RATING):
+    import random
+    base = EXPERT_RATING if name in experts else default
+    if base is None:
+        return None
+    noise = random.Random(f'{match_key}:{slot}').gauss(0, RATING_JITTER)
+    return round(base + max(-2*RATING_JITTER, min(2*RATING_JITTER, noise)))
 
 
 def sidecar(replay):
@@ -200,6 +281,18 @@ def scan_one(path, tracked=None):
     meta = sidecar(path)
     listing = meta.get('listing_factions')
     ratings = listing_ratings(meta.get('listing_text'), listing) or [None]*len(header['players'])
+    key = replay_key(path)
+    source = archive_source(path)
+    if source:
+        from random_sides import RETAIL_RELEASES, resolved_factions
+        from replay_bootstrap import match_key
+        key = match_key(header, replay_path=None if header['exe_crc'] in RETAIL_RELEASES else path)  # as retail_conversion queues it; GO files carry the match ID
+        experts = archive_experts()
+        default = GENTOOL_RATING if source == 'gentool' else ARCHIVE_RATING
+        ratings = [{'overall': archive_rating(p['name'], key, p['slot'], experts, default)} for p in header['players']]
+        # An unrated archive player stays unrated rather than an invented rating.
+        if header['exe_crc'] in RETAIL_RELEASES:
+            listing = resolved_factions(header)
     rows = []
     for position, slot in enumerate(header['players']):
         player = players[slot['slot']+2]  # PlayerList: neutral, civilian, then slots
@@ -214,9 +307,11 @@ def scan_one(path, tracked=None):
                      'last_order': player.last_order, 'self_destruct': player.self_destruct,
                      'opening_queue': player.opening_queue, 'queues': queues})
     return {'path': str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path),
-            'bytes': len(data), 'match_key': replay_key(path), 'exe_crc': header['exe_crc'], 'ini_crc': header['ini_crc'],
+            'bytes': len(data), 'match_key': key, 'exe_crc': header['exe_crc'], 'ini_crc': header['ini_crc'],
             'frames': header['frames'], 'last_command_frame': last_frame, 'rate': logic_rate(header),
-            'quit_early': header['quit_early'], 'players': rows}
+            'quit_early': header['quit_early'], 'archive': source,
+            'map': map_identity(header)[0], 'map_crc': map_identity(header)[1],
+            'starting_cash': int(header['starting_cash']) if header.get('starting_cash') else None, 'players': rows}
 
 
 def _init_worker():
@@ -231,6 +326,9 @@ def _scan_batch(paths):
 def scan(args):
     """Rescan only new or changed replays (by path and size) unless --full."""
     paths = sorted(Path(args.corpus).glob('*/*.rep'))
+    if Path(args.corpus).resolve() == CORPUS.resolve() and ARCHIVE.is_dir():
+        paths += (sorted(ARCHIVE.glob('*.rep')) + sorted(ARCHIVE3.glob('*.rep')) + sorted(GENTOOL.glob('*/*.rep'))
+                  + sorted(CHINA_GENERALS.glob('*/*.rep')))
     if args.limit:
         paths = paths[:args.limit]
     output = Path(args.output)
@@ -240,13 +338,14 @@ def scan(args):
         with output.open(encoding='utf-8') as stream:
             for line in stream:
                 row = json.loads(line)
-                if 'error' not in row and 'bytes' in row and 'rating' in row['players'][0]:
+                if 'error' not in row and 'bytes' in row and 'starting_cash' in row and 'rating' in row['players'][0]:
                     previous[row['path']] = row
     keep, todo = [], []
     for path in paths:
         relative = str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
         row = previous.get(relative)
-        if row and row['bytes'] == path.stat().st_size:
+        # Archive ratings follow Ratings.txt, so those rows are always recomputed.
+        if row and row['bytes'] == path.stat().st_size and not archive_source(path):
             keep.append(row)
         else:
             todo.append(path)
@@ -271,8 +370,13 @@ def scan(args):
 
 # --- thresholds -----------------------------------------------------------
 
+# Listing names of the sides the policy learns from (13 Nov 2026: vanilla China plus the Tank and Nuke
+# generals; generals_policy.CHINA_FACTIONS). Cleaning checks and match ratings cover all three.
+CHINA_SIDES = ('China', 'China Tank', 'China Nuke')
+
+
 def is_china(player):
-    return player['faction'] == 'China'
+    return player['faction'] in CHINA_SIDES
 
 
 def opponent_native(row, player):
@@ -287,7 +391,8 @@ def player_flags(row, player, opts, names):
     rate = row['rate']
     overall = (player.get('rating') or {}).get('overall')
     if overall is None:
-        flags.append('unrated')
+        if row.get('archive') != 'gentool':
+            flags.append('unrated')
     elif overall < opts.min_china_rating:
         flags.append(f'low_rating:{overall}')
     if is_china(player):
@@ -310,9 +415,30 @@ def player_flags(row, player, opts, names):
     return flags
 
 
-def game_flags(row, opts):
+def ladder_map_crcs(metrics):
+    """CRCs of maps played in rated ladder games (a rated China player, Generals Online corpus)."""
+    crcs = set()
+    with Path(metrics).open(encoding='utf-8') as stream:
+        for line in stream:
+            row = json.loads(line)
+            if 'error' not in row and not row.get('archive') and any(
+                    is_china(p) and (p.get('rating') or {}).get('overall') is not None for p in row['players']):
+                crcs.add(row['map_crc'])
+    return crcs
+
+
+def game_flags(row, opts, allowed_maps=None, slot_table=None):
     flags = []
     rate = row['rate']
+    if allowed_maps is not None and not allowed_map(row['map'], row['map_crc'], allowed_maps):
+        flags.append(f"map:{row['map_crc']}")
+    if slot_table is not None:
+        count = map_slots.slots(slot_table, row['map'], row['map_crc'])
+        if count != 2:
+            flags.append(f"slots:{row['map_crc']}:{'unverified' if count is None else count}")
+    cash = row.get('starting_cash')
+    if cash is not None and cash != getattr(opts, 'starting_cash', 10000):
+        flags.append(f'cash:{cash}')
     for player in row['players']:
         if player['orders'] <= opts.afk_max_orders:
             flags.append(f"afk:slot{player['slot']}:{player['orders']}")
@@ -343,7 +469,7 @@ def verified_revisions(path, names, minimum=5):
             if sum(c.values()) >= minimum and c.most_common(1)[0][0] == dozer}
 
 
-DEFAULTS = dict(checks='afk,early_end,opening_dozers,unrated', afk_max_orders=10, early_end_minutes=2.0,
+DEFAULTS = dict(checks='afk,early_end,opening_dozers,map,slots,cash', starting_cash=10000, afk_max_orders=10, early_end_minutes=2.0,
                 opening_seconds=60.0, max_opening_dozers=3, truck_minutes=6.0, max_trucks_per_center=1,
                 min_china_rating=0)
 
@@ -352,13 +478,15 @@ def evaluate(metrics, opts):
     """Yield (row, China player, flags) per China player; (row, None, None) if unreadable."""
     names = tracked_templates()
     verified = verified_revisions(metrics, names)
+    allowed = ranked_map_crcs() | ladder_map_crcs(metrics)
+    slot_table = map_slots.load()
     with Path(metrics).open(encoding='utf-8') as stream:
         for line in stream:
             row = json.loads(line)
             if 'error' in row:
                 yield row, None, None
                 continue
-            shared = game_flags(row, opts)
+            shared = game_flags(row, opts, allowed, slot_table)
             for player in row['players']:
                 if is_china(player):
                     own = player_flags(row, player, opts, names) if row['ini_crc'] in verified else []
@@ -388,16 +516,63 @@ def selection_filter(metrics=METRICS, **overrides):
     return dropped, scanned, dict(metrics_sha256=sha, options=vars(opts))
 
 
-def player_ratings(metrics=METRICS):
-    """match key -> {player index (str): pre-match Overall rating, or None when unrated}."""
-    ratings = {}
-    with Path(metrics).open(encoding='utf-8') as stream:
+# Estimate used for players without a real rating. User decision 13 Nov 2026: switch to the per-game
+# 'style_estimate' (the joint fit gives an identity one rating across all years, ExCaL 2010 = ExCaL 2026;
+# style accuracy holds across archive eras: winner prediction 62-69% for 2005-2026 games vs 71% for close
+# strong GO games). Landed 15 Nov 2026 with the observation v11 re-export (projectiles, hazards, cues), as
+# the user planned; bundles before it (top20R, the three-faction pilot) used 'joint_estimate'.
+ESTIMATE_FIELD = 'style_estimate'
+
+
+def rating_of(row):
+    """(rating, estimated) for one rating_estimator.py row: the ladder rating when the match had one;
+    else, for a Generals Online player, their own rating found by name (nearest rated game); else the
+    model estimate named by ESTIMATE_FIELD, flagged estimated (gamereplays and GenTool players always)."""
+    if row['rating'] is not None:
+        return row['rating'], False
+    if row['identity'].startswith('go:') and row['name_rating'] is not None:
+        return row['name_rating'], False
+    return row[ESTIMATE_FIELD], True
+
+
+def vanilla_china_matches(estimates=ESTIMATES):
+    """Match keys with a vanilla China player (the faction-mix pilot's --vanilla-from rule)."""
+    found = set()
+    with Path(estimates).open(encoding='utf-8') as stream:
         for line in stream:
             row = json.loads(line)
-            if 'error' not in row:
-                ratings[row['match_key']] = {str(p['player_index']): (p.get('rating') or {}).get('overall')
-                                             for p in row['players']}
+            if row['faction'] == 'China':
+                found.add(row['match_key'])
+    return found
+
+
+def player_ratings(estimates=ESTIMATES):
+    """match key -> {player index (str): {'rating': value, 'estimated': bool}} (re-export fix 7; rule: rating_of).
+    No player is unknown: ESTIMATES covers the whole catalogue (GO, GenTool, gamereplays, gamereplays3)."""
+    ratings = {}
+    with Path(estimates).open(encoding='utf-8') as stream:
+        for line in stream:
+            row = json.loads(line)
+            value, estimated = rating_of(row)
+            ratings.setdefault(row['match_key'], {})[str(row['player_index'])] = {'rating': value, 'estimated': estimated}
     return ratings
+
+
+def china_match_ratings(estimates=ESTIMATES):
+    """match key -> the highest rating among its China-side players, vanilla, Tank or Nuke (rule: rating_of).
+
+    The rating ladder's match rating: the export queue is ordered by it (.cache/repin-qual-v6/rating_order.py)
+    and subset_manifest.match_rating applies the same rule to a bundle's entries."""
+    best = {}
+    with Path(estimates).open(encoding='utf-8') as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row['faction'] not in CHINA_SIDES:
+                continue
+            value, _ = rating_of(row)
+            if value is not None:
+                best[row['match_key']] = max(best.get(row['match_key'], value), value)
+    return best
 
 
 def report(args):
@@ -431,6 +606,14 @@ def report(args):
                                      encoding='utf-8')
 
 
+def write_map_slots(args):
+    table = map_slots.build()
+    Path(args.output).write_text(json.dumps(table, indent=1)+'\n', encoding='utf-8')
+    counts = Counter(table['by_crc'].values())
+    print(json.dumps({'maps': len(table['by_crc']), 'official_names': len(table['official']),
+                      'sources': table['sources'], 'by_slots': dict(sorted(counts.items()))}))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(required=True)
@@ -450,6 +633,9 @@ def main(argv=None):
         if name != 'checks':
             r.add_argument('--'+name.replace('_', '-'), type=type(value), default=value)
     r.set_defaults(func=report)
+    m = sub.add_parser('map-slots', help='Rebuild the map CRC -> slot count table the slots check reads')
+    m.add_argument('--output', default=map_slots.TABLE)
+    m.set_defaults(func=write_map_slots)
     args = parser.parse_args(argv)
     args.func(args)
 

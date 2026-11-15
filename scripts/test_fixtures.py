@@ -20,7 +20,8 @@ VOCABULARY = {'types': ['<unknown>', 'ChinaVehicleDozer', 'ChinaCommandCenter', 
                                 'ChinaVehicleDozer': ['Command_Capture']},
               'command_shortcuts': {'FactionChina': ['Command_ArtilleryBarrage']},
               'promotions': {'FactionChina': ['SCIENCE_ArtilleryBarrage1', 'SCIENCE_Frenzy1']},
-              'upgrades': ['Upgrade_ChinaRadar', 'Upgrade_InfantryCaptureBuilding']}
+              'upgrades': ['Upgrade_ChinaRadar', 'Upgrade_InfantryCaptureBuilding'],
+              'powers': ['SuperweaponArtilleryBarrage', 'SuperweaponCarpetBomb']}
 SMALL = dict(hidden=16, entity_hidden=8, embedding=4, map_hidden=6, scalar_hidden=6, map_side=4, position_bins=16)
 
 
@@ -32,7 +33,8 @@ def task(kind='idle', **changes):
 
 def entity(identifier, name, own, position, visible=True, **changes):
     row = {'id': identifier, 'type': name, 'own': own, 'owner': 2 if own else 3, 'position': position,
-           'health': 100, 'max_health': 100, 'visible': visible, 'last_seen_frame': 1, 'supply_boxes': 0}
+           'health': 100, 'max_health': 100, 'visible': visible, 'last_seen_frame': 1, 'supply_boxes': 0,
+           'firing': False, 'poisoned': False, 'burning': False}
     if own:
         mobile = name != 'ChinaCommandCenter'
         row.update(construction_percent=-1, production_queue=[], task=task(), radius=10,
@@ -60,6 +62,7 @@ def observation_fixture():
                    'known_nonowned_entities': [entity(99, 'Enemy', False, [800, 800, 0]),
                                                entity(100, 'Enemy', False, [850, 850, 0], False)],
                    'visibility_grid': [2] * 1024, 'observation_policy_version': OBSERVATION_VERSION,
+                   'effects': [], 'superweapons': [], 'audio_cues': [],
                    'last_submission': {'available': True, 'kind': 'move', 'actors': [10],
                                        'position': [300, 400, 0], 'result': 'submitted', 'age_seconds': .1},
                    'last_validation': {'available': False}}

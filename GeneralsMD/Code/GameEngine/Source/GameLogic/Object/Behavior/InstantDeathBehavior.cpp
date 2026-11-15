@@ -36,6 +36,7 @@
 #include "Common/ThingTemplate.h"
 #include "Common/INI.h"
 #include "Common/RandomValue.h"
+#include "Common/ReplayLogic.h"
 #include "Common/GameLOD.h"
 #include "Common/Xfer.h"
 #include "GameClient/Drawable.h"
@@ -133,6 +134,18 @@ void InstantDeathBehavior::onDie( const DamageInfo *damageInfo )
 			return;
 		ai->markAsDead();
 	}
+#else
+	// Replays of releases before the multiple-module fix below mark the AI dead first (Common/ReplayLogic.h).
+	if (replayLogic062026())
+	{
+		AIUpdateInterface* ai = getObject()->getAIUpdateInterface();
+		if (ai)
+		{
+			if (ai->isAiInDeadState())
+				return;
+			ai->markAsDead();
+		}
+	}
 #endif
 
 	const InstantDeathBehaviorModuleData* d = getInstantDeathBehaviorModuleData();
@@ -162,7 +175,8 @@ void InstantDeathBehavior::onDie( const DamageInfo *damageInfo )
 #if !RETAIL_COMPATIBLE_CRC
 	// TheSuperHackers @bugfix Stubbjax 23/07/2026 Prevent firing weapons when a scaffold is cancelled
 	// or destroyed. This logic matches the condition in the FireWeaponWhenDeadBehavior module.
-	if (!getObject()->getStatusBits().test(OBJECT_STATUS_UNDER_CONSTRUCTION))
+	// Replays of releases before this fix still fire them (Common/ReplayLogic.h).
+	if (replayLogic062026() || !getObject()->getStatusBits().test(OBJECT_STATUS_UNDER_CONSTRUCTION))
 #endif
 	{
 		listSize = d->m_weapons.size();
@@ -182,7 +196,7 @@ void InstantDeathBehavior::onDie( const DamageInfo *damageInfo )
 #if !RETAIL_COMPATIBLE_CRC
 	// TheSuperHackers @bugfix Stubbjax 21/07/2026 Allow multiple InstantDeathBehaviors to be processed.
   // Multiple FXListDie, CreateObjectDie and FireWeaponWhenDeadBehavior modules are already supported.
-	AIUpdateInterface* ai = getObject()->getAIUpdateInterface();
+	AIUpdateInterface* ai = replayLogic062026() ? nullptr : getObject()->getAIUpdateInterface();
 	if (ai)
 	{
 		// has another AI already handled us. (hopefully another InstantDeathBehavior)

@@ -2,6 +2,7 @@
 import copy
 from contextlib import redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from event_policy import EventActor
+from event_policy import SCIENCE_ORDERS, EventActor
 from event_schedule import delay_mask, native_deadline, step_ticks
 from event_dataset import EventDataset
 from event_store import feature_identity, write_shard
@@ -137,19 +138,78 @@ class EventTests(unittest.TestCase):
         from generals_policy import PLAY_RATING, rating_inputs
         actor = EventActor(self.policy)
         rated = rating_inputs(PLAY_RATING, PLAY_RATING)
-        # Both 'rated' flags set: ranked-only training never shows an unrated side.
-        self.assertEqual(rated[1::2].tolist(), [1, 1])
+        # Per side (value, rated, estimated): live play conditions on two rated sides.
+        self.assertEqual(rated[1::3].tolist(), [1, 1])
+        self.assertEqual(rated[2::3].tolist(), [0, 0])
         np.testing.assert_array_equal(actor.ratings, rated)
         actor.configure_ratings(1500, None)
+        np.testing.assert_array_equal(actor.ratings, rating_inputs(1500, None))
+        actor.reset()  # run_episode resets every actor at game start
         np.testing.assert_array_equal(actor.ratings, rating_inputs(1500, None))
         actor.configure_ratings()
         np.testing.assert_array_equal(actor.ratings, rated)
         actor.reset()
         np.testing.assert_array_equal(actor.ratings, rated)
         trace = ([], {'kind': 'wait', 'delay': 7}, None, Tensor(0), Tensor(0), Tensor(0))
+        # The rating input is off by default (config rating_input): the model then plays unrated.
         with patch.object(self.policy, 'decide', return_value=trace) as decide:
             actor.act(self.obs, self.terrain, 0)
+        self.assertFalse(decide.call_args[0][0]['ratings'].any())
+        actor.reset()
+        with patch.object(self.policy, 'decide', return_value=trace) as decide, \
+                patch.dict(self.policy.config, rating_input=True):
+            actor.act(self.obs, self.terrain, 0)
         np.testing.assert_array_equal(decide.call_args[0][0]['ratings'], rated)
+        # A model trained with GENERALS_RATING_INPUT=1 has no config key; its loader flags the policy instead.
+        actor.reset()
+        with patch.object(self.policy, 'decide', return_value=trace) as decide, \
+                patch.object(self.policy, 'rating_input', True, create=True):
+            actor.act(self.obs, self.terrain, 0)
+        np.testing.assert_array_equal(decide.call_args[0][0]['ratings'], rated)
+
+    def test_science_buyer_waits_for_the_next_science_and_never_skips(self):
+        from event_policy import ScienceBuyer
+        buyer = ScienceBuyer()
+        orders = json.loads(SCIENCE_ORDERS.read_text(encoding='utf-8'))
+        state = lambda owned, purchasable: {'player': {'sciences': owned, 'purchasable_sciences': purchasable}}
+        buyer.configure('FactionGLA')
+        gla = orders['orders']['FactionGLA']
+        self.assertEqual(gla[0], 'Early_SCIENCE_ChinaCarpetBomb')
+        # Rank 1 against GLA: Red Guard is purchasable but not first on the list, so the point is saved.
+        self.assertEqual(buyer(state([], ['SCIENCE_RedGuardTraining', 'SCIENCE_NukeLauncher'])), [])
+        self.assertEqual(buyer(state([], ['SCIENCE_RedGuardTraining', gla[0], gla[1]])),
+                         [{'kind': 'science', 'science': gla[0]}])
+        self.assertEqual(buyer(state(gla[:1], [gla[1], 'SCIENCE_CashHack1'])), [{'kind': 'science', 'science': gla[1]}])
+        self.assertEqual(buyer(state(gla, [])), [])  # list done: nothing more is bought
+        buyer.configure('FactionAmerica')
+        self.assertEqual(buyer(state([], ['SCIENCE_RedGuardTraining'])),
+                         [{'kind': 'science', 'science': 'SCIENCE_RedGuardTraining'}])
+        for unknown in (None, 'random', 'FactionCivilian'):
+            buyer.configure(unknown)
+            self.assertEqual(buyer.order, orders['default'])
+        # Every list is a vanilla China science the deployed vocabulary knows, and none repeats.
+        # (Cloud bundles ship the orders but not the deployed policy.json; the vocabulary check runs locally.)
+        deployed = SCIENCE_ORDERS.parent/'policy.json'
+        known = set(json.loads(deployed.read_text(encoding='utf-8'))['sciences']) if deployed.exists() else None
+        for order in [orders['default'], *orders['orders'].values()]:
+            self.assertEqual(len(order), len(set(order)))
+            if known is not None:
+                self.assertLessEqual(set(order), known)
+
+    def test_actor_buys_sciences_on_every_observation_with_the_model_actions(self):
+        actor = EventActor(self.policy)
+        actor.configure_enemy('FactionAmerica')
+        obs = copy.deepcopy(self.obs)
+        obs['player'].update(sciences=[], purchasable_sciences=['SCIENCE_RedGuardTraining'])
+        buy = {'kind': 'science', 'science': 'SCIENCE_RedGuardTraining'}
+        stop = {'kind': 'stop', 'units': [10]}
+        trace = ([stop], {'kind': 'stop', 'delay': 29}, None, Tensor(0), Tensor(0), Tensor(0))
+        with patch.object(self.policy, 'decide', return_value=trace):
+            self.assertEqual(actor.act(obs, self.terrain, 0), [buy, stop])
+            self.assertEqual(actor.act(obs, self.terrain, 5), [buy])  # a skipped inference still buys
+            obs['player'].update(sciences=['SCIENCE_RedGuardTraining'], purchasable_sciences=[])
+            self.assertEqual(actor.act(obs, self.terrain, 6), [])
+        self.assertEqual(actor.counters['science_purchases'], 2)
 
     def test_uncapped_actor_keeps_learned_delay_after_acceptance_or_rejection(self):
         for delay in (1, 90):
@@ -193,6 +253,43 @@ class EventTests(unittest.TestCase):
             document['entries'].append({**heldout, 'path': 'shards/b.zip', 'match_key': 'test:2', 'split': 'validation'})
         _write_json(root/'dataset.json', document)
         return EventDataset(root/'dataset.json')
+
+    def test_weapon_and_armour_stats_reach_every_row_from_any_observation(self):
+        """Stats arrive once (re-export fix 4), here in an observation no training row uses;
+        the episode table must still carry them to every stored row."""
+        from generals_policy import DAMAGE_TYPES, arms_inputs
+        armed = copy.deepcopy(self.obs)
+        armed['own_entities'][0].update(weapons=[0, -1, -1], armor=0, weapon_bonus=[1.25, 1.33, 1.5])
+        weapon = {'id': 0, 'name': 'TestGun', 'range': 150.0, 'min_range': 0.0, 'damage': 40.0, 'radius': 5.0,
+                  'min_delay_frames': 30, 'max_delay_frames': 50, 'clip_size': 3, 'clip_reload_frames': 120,
+                  'anti_mask': 5, 'damage_type': 2}
+        delivered = copy.deepcopy(armed)
+        delivered['template_stats'] = {'weapons': [weapon], 'armors': [{'id': 0, 'damage_multipliers': [.5]*DAMAGE_TYPES}]}
+        rows = [raw_row(0, armed), raw_row(15, delivered)]
+        rows += [raw_row(f, armed, [{'kind': 'stop', 'units': [10]}]) for f in range(30, 331, 30)]
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = write_shard(root/'shards/a.zip', [game], self.policy, {'match_key': 'test:1', 'path': 'absent'})
+            _write_json(root/'dataset.json', {'kind': 'generals_event_dataset', 'schema': 1, 'config': self.config,
+                'entries': [{**result, 'path': 'shards/a.zip', 'match_key': 'test:1', 'split': 'train'}]})
+            dataset = EventDataset(root/'dataset.json')
+            stored = [row for reference in dataset.chunks('train') for row in dataset.read(reference)]
+        frames = [row['frame'] for row in stored]
+        self.assertNotIn(15, frames)  # the delivering observation is not a training row
+        self.assertGreater(len(stored), 5)
+        for row in stored:
+            encoded = row['encoded']
+            np.testing.assert_allclose(encoded['weapon_stats'][0], [150, 0, 40, 5, 40/60, 3, 2, 5, 2])
+            np.testing.assert_allclose(encoded['armor_stats'][0], [.5]*DAMAGE_TYPES)
+            # Stored rows keep no id map; the armed dozer is the entity carrying weapon id 0.
+            armed_row = int(np.flatnonzero(encoded['weapon_ids'][:, 0] == 0)[0])
+            self.assertEqual(encoded['armor_ids'][armed_row], 0)
+            arms = arms_inputs(encoded)[armed_row]
+            self.assertEqual(arms[0], 1)  # primary weapon present
+            self.assertAlmostEqual(arms[1], np.log1p(150*1.33)/7)  # range x range bonus
+            self.assertAlmostEqual(arms[3], np.log1p(40*1.25)/7)  # damage x damage bonus
+            self.assertAlmostEqual(arms[5], np.log1p((40/60)/1.5)/3)  # mean delay (s) / rate bonus
 
     def test_portable_columns_cursor_and_integrity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -306,6 +403,94 @@ class EventTests(unittest.TestCase):
                 np.testing.assert_array_equal(a.parameters[name].data, b.parameters[name].data)
                 np.testing.assert_array_equal(a_opt.m[name], b_opt.m[name])
                 np.testing.assert_array_equal(a_opt.v[name], b_opt.v[name])
+
+    def test_outliers_name_their_match_and_split_the_loss_by_head(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()), \
+                patch('train_events.within_budget', return_value=True), patch('train_events.OUTLIER_NLL', -1.0):
+            root = Path(temporary)
+            data = self.shard_dataset(root/'data')
+            result = train(SimpleNamespace(dataset=str(data.path), resume=None, device='cpu', epochs=1, max_updates=0,
+                seed=123, lr=3e-4, threads=1, batch_size=3, pair_budget=2_000_000,
+                buffer_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192,
+                output=str(root/'run')))
+            records = [json.loads(line) for line in (root/'run'/'outliers.jsonl').read_text().splitlines()]
+            history = result['history'][0]
+            self.assertEqual(len(records), history['train']['decisions']+history['validation'].get('decisions', 0))
+            self.assertEqual(history['train']['outliers'], history['train']['decisions'])
+            keys = {entry['match_key'] for entry in data.entries}
+            for record in records:
+                self.assertIn(record['match_key'], keys)
+                self.assertIn(record['split'], ('train', 'validation'))
+                self.assertIsNotNone(record['player'])
+                self.assertAlmostEqual(sum(record['terms'].values()), record['nll'], places=4)
+                self.assertIn('kind', record['target'])
+
+    def test_outlier_recheck_blames_corrupted_staged_inputs(self):
+        from training_preparation import prepare_update
+        with tempfile.TemporaryDirectory() as temporary, patch('train_events.OUTLIER_NLL', -1.0):
+            data = self.shard_dataset(Path(temporary))
+            rows = next(data.batches('train', seed=1, epoch=0, batch_size=6))[0]
+            learner = EventLearner(NeuralPolicy(data.config, 5))
+            learner.batch(rows, train=False)
+            clean = {(r['frame'], r['player']): r for r in learner.outliers}
+            learner.outliers.clear()
+            # The device copy differs from the host's, as a broken upload would leave it.
+            prepared = prepare_update(learner.model, rows, learner.pair_budget)
+            for part in prepared['microbatches']:
+                part['staged_values'] = learner.model.stager.stage(
+                    {name: (value*50 if kind == 'float' else value, kind) for name, (value, kind) in part['values'].items()})
+            learner.run(prepared, train=False)
+            self.assertEqual(len(learner.outliers), len(clean))
+            moved = 0
+            for record in learner.outliers:
+                reference = clean[(record['frame'], record['player'])]
+                self.assertAlmostEqual(record['recheck']['unstaged'], reference['nll'], places=4)
+                self.assertAlmostEqual(record['recheck']['fp32'], reference['nll'], places=4)
+                self.assertFalse(record['after_update'])
+                moved += abs(record['nll']-reference['nll']) > 1e-3
+            self.assertGreater(moved, 0)
+
+    def test_init_starts_from_checkpoint_weights_with_a_fresh_optimizer(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()), \
+                patch('train_events.within_budget', return_value=True):
+            root = Path(temporary)
+            data = self.shard_dataset(root/'data')
+            settings = dict(dataset=str(data.path), resume=None, device='cpu', epochs=1, max_updates=0,
+                seed=123, lr=3e-4, threads=1, batch_size=3, pair_budget=2_000_000,
+                buffer_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192)
+            base = train(SimpleNamespace(**settings, output=str(root/'base')))
+            tuned = train(SimpleNamespace(**{**settings, 'lr': 1e-4, 'max_updates': 1, 'init': base['checkpoint'],
+                                             'select_on': '1400+'}, output=str(root/'tuned')))
+            start, start_opt, document = NeuralPolicy.load(root/'tuned'/'initial.npz')
+            trained, _, _ = NeuralPolicy.load(base['checkpoint'])
+            self.assertEqual(start_opt.step_count, 0)
+            self.assertIn('init_sha256', document['metadata']['event_settings'])
+            for name in trained.parameters:
+                np.testing.assert_array_equal(start.parameters[name].data, trained.parameters[name].data)
+            self.assertEqual(tuned['optimizer_updates'], 1)
+            # --validate-only scores the --init weights once, with no update; by_general splits the score.
+            held = self.shard_dataset(root/'held', validation=True)
+            scored = train(SimpleNamespace(**{**settings, 'dataset': str(held.path), 'init': base['checkpoint'], 'validate_only': True,
+                                              'select_on': 'vanilla'}, output=str(root/'scored')))
+            self.assertEqual((scored['status'], scored['optimizer_updates'], len(scored['history'])), ('validated', 0, 1))
+            validation = scored['history'][0]['validation']
+            self.assertGreater(validation['decisions'], 0)
+            self.assertEqual(sum(g['decisions'] for g in validation['by_general'].values()), validation['decisions'])
+            self.assertEqual(list(validation['by_general']), ['vanilla'])
+            self.assertAlmostEqual(scored['history'][0]['selection_score'], validation['by_general']['vanilla']['mean_nll'])
+            with self.assertRaises(ValueError):
+                train(SimpleNamespace(**{**settings, 'dataset': str(held.path), 'validate_only': True}, output=str(root/'noinit')))
+            # Resuming a fine-tune needs the same --init.
+            with self.assertRaises(ValueError):
+                train(SimpleNamespace(**{**settings, 'lr': 1e-4, 'select_on': '1400+',
+                                         'resume': tuned['checkpoint']}, output=str(root/'tuned')))
+            document = json.loads(Path(data.path).read_text())
+            document['config'] = {**document['config'], 'hidden': document['config']['hidden']*2}
+            wider = Path(data.path).with_name('wider.json')
+            wider.write_text(json.dumps(document))
+            with self.assertRaises(ValueError):
+                train(SimpleNamespace(**{**settings, 'dataset': str(wider), 'init': base['checkpoint']},
+                                      output=str(root/'wider')))
 
 
 class MicrobatchTests(unittest.TestCase):

@@ -33,6 +33,7 @@
 #include "Common/GlobalData.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/ReplayLogic.h"
 #include "Common/Radar.h"
 #include "Common/SpecialPower.h"
 #include "Common/Team.h"
@@ -1404,14 +1405,16 @@ void SpecialAbilityUpdate::triggerAbilityEffect()
         const ParticleSystemTemplate *tmp = data->m_disableFXParticleSystem;
         if (tmp)
         {
-#if RETAIL_COMPATIBLE_CRC
           // TheSuperHackers @fix The particle system is now decoupled from the logic crc
           // and the side effects on the logic random seed values are preserved for retail compatibility.
+#if !RETAIL_COMPATIBLE_CRC
+          // Replays of releases before the particle decoupling spent these logic random values (Common/ReplayLogic.h).
+          if (replayLogic062026())
+#endif
           {
             Coord3D offs = {0,0,0};
             target->getGeometryInfo().makeRandomOffsetWithinFootprint( offs, LogicRandomValueClass() );
           }
-#endif
 
           ParticleSystem *sys = TheParticleSystemManager->createParticleSystem(tmp);
           if (sys)

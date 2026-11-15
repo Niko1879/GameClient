@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from generals_policy import ACTION_RESIDUAL_BLOCKS, KINDS
+from generals_policy import ACTION_RESIDUAL_BLOCKS, KINDS, LOGIT_CAP, SELECTED_UNIT_DIVISOR
 from training_preparation import teacher_plan
 
 
@@ -30,7 +30,9 @@ class TensorStager:
         while self.pending and self.pending[0][0].query():
             self.pending.popleft()
 
-    def stage(self, values):
+    def stage(self, values, consumer=None):
+        """Device tensors for tagged arrays; `consumer` is the stream that will use them,
+        when it is not the stream this runs on (StagedUpdates' upload stream)."""
         self.reap()
         if len(self.pending) >= 8:
             self.pending[0][0].synchronize()
@@ -63,6 +65,10 @@ class TensorStager:
                 descriptors.append((name, cursor, array.shape, array.size))
                 cursor += array.size
             device = host.to(self.model.device, non_blocking=self.pin)
+            if consumer is not None:
+                # Allocated on the upload stream but read on `consumer`: the
+                # allocator must not hand this block out again before that use ends.
+                device.record_stream(consumer)
             if self.model.device.type == 'cuda':
                 self.stats['device_copies'] += 1
                 if self.pin:
@@ -82,8 +88,105 @@ class TensorStager:
         return result
 
 
-def categorical(logits, mask, choices, *, details=True, predict=True):
-    """The complete CPU plan checked these masks/choices before device staging."""
+class StagedUpdates:
+    """Prepared updates with their device inputs already uploaded, one update ahead.
+
+    A background thread takes each update from the source (for PreparedReader,
+    the shared-memory copy out of the reader) and stages every microbatch's
+    encoder values and teacher plan on its own CUDA stream; the learner's
+    stream waits for that upload on the GPU, so the main thread neither copies
+    nor waits. On a 5090 these two steps were ~10 ms of a 53 ms update on the
+    main thread (9 Nov). Values, order and kernels are unchanged.
+    """
+    _END = object()
+
+    def __init__(self, source, model, depth=1):
+        import queue
+        import threading
+        self.source, self.model = source, model
+        self.cuda = model.device.type == 'cuda'
+        self.stager = TensorStager(model)  # Its own pending uploads: the learner's stager is not thread-safe.
+        if self.cuda:
+            self.device = torch.device('cuda', model.device.index if model.device.index is not None
+                                       else torch.cuda.current_device())
+            self.upload = torch.cuda.Stream(self.device)
+            self.consumer = torch.cuda.current_stream(self.device)
+        self.items, self.stopped = queue.Queue(depth), threading.Event()
+        self.thread = threading.Thread(target=self._work, name='staged-updates', daemon=True)
+        self.thread.start()
+
+    def _stage(self, update):
+        for part in update['microbatches']:
+            if self.cuda:
+                with torch.cuda.device(self.device), torch.cuda.stream(self.upload):
+                    part['staged_values'] = self.stager.stage(part['values'], self.consumer)
+                    part['plan']['staged'] = self.stager.stage(part['plan']['values'], self.consumer)
+                    part['ready'] = torch.cuda.Event()
+                    part['ready'].record(self.upload)
+            else:
+                part['staged_values'] = self.stager.stage(part['values'])
+                part['plan']['staged'] = self.stager.stage(part['plan']['values'])
+
+    def _put(self, item):
+        import queue
+        while not self.stopped.is_set():
+            try:
+                self.items.put(item, timeout=.1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def _work(self):
+        try:
+            for update, cursor in self.source:
+                if self.stopped.is_set():
+                    return
+                self._stage(update)
+                if not self._put(('item', (update, cursor))):
+                    return
+            self._put(('end', None))
+        except BaseException as error:  # Reaches the consumer, in order.
+            self._put(('error', error))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        kind, value = self.items.get()
+        if kind == 'item':
+            return value
+        if kind == 'error':
+            raise value
+        self.items.put((kind, value))  # Stay exhausted.
+        raise StopIteration
+
+    def close(self):
+        import queue
+        self.stopped.set()
+        while self.thread.is_alive():
+            try:
+                self.items.get(timeout=.1)
+            except queue.Empty:
+                pass
+        self.thread.join()
+        close = getattr(self.source, 'close', None)
+        if close is not None:
+            close()
+
+
+def cap_logits(logits, mask):
+    """generals_policy.cap_logits per row: shifted by the best legal logit (with its gradient), soft-capped to (-cap, 0]."""
+    best = logits.detach().masked_fill(~mask, -torch.inf).argmax(1, keepdim=True)
+    return torch.tanh((logits-logits.gather(1, best))/LOGIT_CAP)*LOGIT_CAP
+
+
+def categorical(logits, mask, choices, *, details=True, predict=True, capped=True):
+    """The complete CPU plan checked these masks/choices before device staging.
+
+    capped=False for the position terms, whose joint map _location already capped."""
+    if capped:
+        logits = cap_logits(logits, mask)
     probabilities = logits.masked_fill(~mask, -torch.inf).log_softmax(dim=1)
     entropy = (-(probabilities.exp()*torch.where(mask, probabilities, torch.zeros_like(probabilities))).sum(dim=1)
                if details else None)
@@ -91,11 +194,62 @@ def categorical(logits, mask, choices, *, details=True, predict=True):
             probabilities.argmax(dim=1) if predict else None)
 
 
-def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss_only=False, plan=None):
-    """Vectorized argument heads; teacher selections determine autoregressive control."""
+def position_errors(logits, cell_mask, cell_choices, offset_choices, config):
+    """(expected, mode) pixel distance from the predicted position distribution to the teacher pixel.
+
+    The distribution is the one the cell and offset terms score: legal cells, then every
+    offset within a cell. expected = sum_w p(w)*|w-teacher|; mode = |argmax pixel - teacher|.
+    """
+    n, fine = config['map_side'], config['position_bins']//config['map_side']
+    device = logits.device
+    joint = logits.float().masked_fill(~cell_mask[:, :, None], -torch.inf).flatten(1).softmax(dim=1)
+    cell, offset = torch.arange(n*n, device=device), torch.arange(fine*fine, device=device)
+    x = ((cell % n)[:, None]*fine+offset % fine).flatten().float()
+    y = (torch.div(cell, n, rounding_mode='floor')[:, None]*fine+torch.div(offset, fine, rounding_mode='floor')).flatten().float()
+    tx = ((cell_choices % n)*fine+offset_choices % fine).float()
+    ty = (torch.div(cell_choices, n, rounding_mode='floor')*fine+torch.div(offset_choices, fine, rounding_mode='floor')).float()
+    distance = torch.hypot(x[None, :]-tx[:, None], y[None, :]-ty[:, None])
+    return (joint*distance).sum(dim=1), distance.gather(1, joint.argmax(dim=1, keepdim=True)).squeeze(1)
+
+
+def soft_logp(logits, mask, weights):
+    """Expected log-probability under Gaussian target weights (training_preparation.soft_targets)."""
+    probabilities = cap_logits(logits, mask).masked_fill(~mask, -torch.inf).log_softmax(dim=1)
+    return (weights*torch.where(mask, probabilities, torch.zeros_like(probabilities))).sum(dim=1)
+
+
+def action_trunk(p, core, gate, all_verbs, dtype):
+    """Decision logits, the autoregressive embedding and the delay logits.
+
+    Fixed structure (16 residual blocks: ~150 small kernels and as many autograd
+    nodes per microbatch), so --compile fuses it into one graph with a dynamic
+    batch (EventLearner sets model.action_trunk); eager runs this as written.
+    """
+    x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])
+    for block in range(ACTION_RESIDUAL_BLOCKS):
+        # torch_policy_v3's normalize: layer norm over the last axis, no affine. Pre-activation,
+        # as generals_policy._action_type: the branch's last step is linear, so it is signed.
+        y = F.relu(F.layer_norm(x, (x.shape[-1],), eps=1e-5)) @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']
+        x = x+F.relu(F.layer_norm(y, (y.shape[-1],), eps=1e-5)) @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b']
+    logits = (F.relu(x) @ p['verb_w'])*torch.sigmoid(gate @ p['verb_gate_w']+p['verb_gate_b'])+p['verb_b']
+    # The autoregressive embedding, then the delay, which every later argument sees.
+    action = F.relu(F.one_hot(all_verbs, len(KINDS)).to(dtype) @ p['ar_verb_w']+p['ar_verb_b'])
+    ar = ((core @ p['ar_core_w'])*torch.sigmoid(gate @ p['ar_core_gate_w']+p['ar_core_gate_b'])
+          + (action @ p['ar_verb_out_w'])*torch.sigmoid(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']))
+    x = F.relu(F.relu(ar @ p['delay_in_w']+p['delay_in_b']) @ p['delay_hidden_w']+p['delay_hidden_b'])
+    return logits, ar, x @ p['delay_w']+p['delay_b']
+
+
+def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss_only=False, plan=None,
+                  position_metrics=False):
+    """Vectorized argument heads; teacher selections determine autoregressive control.
+
+    position_metrics adds outputs['position_errors']: (expected, mode) pixel distances
+    per position row (position_errors), for validation reports.
+    """
     if plan is None:
         plan = teacher_plan(model, encoded, teachers, entities.shape[1])
-    inputs = model.stager.stage(plan['values'])
+    inputs = plan['staged'] if 'staged' in plan else model.stager.stage(plan['values'])
     p, config = model.weights, model.config
     batch, count = plan['batch'], plan['command_count']
     placement = config['placement_mode'] == 'full_mask'
@@ -103,14 +257,11 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     def draw(name, logits):
         mask, choices = inputs[name+'_mask'], inputs[name+'_choices']
         return categorical(logits, mask, choices, details=not loss_only,
-                           predict=not loss_only or name in ('decision', 'event_delay'))
+                           predict=not loss_only or name in ('decision', 'event_delay'),
+                           capped=name not in ('cell', 'offset'))
 
     core, gate = memories[:, :config['hidden']], memories[:, config['hidden']:]
-    x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])
-    for block in range(ACTION_RESIDUAL_BLOCKS):
-        y = F.relu(model.normalize(x @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']))
-        x = x+F.relu(model.normalize(y @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b']))
-    logits = (F.relu(x) @ p['verb_w'])*torch.sigmoid(gate @ p['verb_gate_w']+p['verb_gate_b'])+p['verb_b']
+    logits, ar, delay_logits = getattr(model, 'action_trunk', action_trunk)(p, core, gate, inputs['all_verbs'], model.dtype)
     timing, entropy, decision = draw('decision', logits)
     outputs = {'by_head': {'decision': timing}, 'head_counts': {'decision': np.ones(batch, dtype=int)},
                'predictions': [('decision', np.arange(batch), decision)]}
@@ -118,15 +269,16 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         outputs.update(logp=timing, entropy=entropy, action_kinds=KINDS, token_counts=np.ones(batch, dtype=int),
                        event_prediction=(decision != 0).long(),
                        conditional_prediction=logits[:, 1:].masked_fill(~inputs['conditional_mask'], -torch.inf).argmax(dim=1),
-                       order_probability=1-logits.masked_fill(~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0])
-    # The autoregressive embedding, then the delay, which every later argument sees.
-    action = F.relu(F.one_hot(inputs['all_verbs'], len(KINDS)).to(model.dtype) @ p['ar_verb_w']+p['ar_verb_b'])
-    ar = ((core @ p['ar_core_w'])*torch.sigmoid(gate @ p['ar_core_gate_w']+p['ar_core_gate_b'])
-          + (action @ p['ar_verb_out_w'])*torch.sigmoid(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']))
-    x = F.relu(F.relu(ar @ p['delay_in_w']+p['delay_in_b']) @ p['delay_hidden_w']+p['delay_hidden_b'])
-    lp, ent, prediction = draw('event_delay', x @ p['delay_w']+p['delay_b'])
+                       order_probability=1-cap_logits(logits, inputs['decision_mask']).masked_fill(
+                           ~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0])
+    lp, ent, prediction = draw('event_delay', delay_logits)
     outputs['by_head']['delay'] = lp
     outputs['head_counts']['delay'] = np.ones(batch, dtype=int)
+    # Target smoothing: by_head carries the smoothed terms the gradient follows; exact_by_head
+    # keeps the exact-target terms of the same heads for reported NLL.
+    if 'event_delay_soft' in inputs:
+        outputs['exact_by_head'] = {'delay': lp}
+        outputs['by_head']['delay'] = soft_logp(delay_logits, inputs['event_delay_mask'], inputs['event_delay_soft'])
     if not loss_only:
         outputs['logp'] = outputs['logp']+lp
         outputs['entropy'] = outputs['entropy']+ent
@@ -138,11 +290,15 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     # A censored teacher delay is unknown: later arguments do not see the placeholder.
     ar = ar+(x @ p['delay_embed_out_w']+p['delay_embed_out_b'])*inputs['delay_known'][:, None]
 
-    def record(name, values):
+    def record(name, values, smoothed=None):
         lp, ent, prediction = values
         global_rows, ix = plan['categories'][name], inputs[name+'_global']
-        previous = outputs['by_head'].get(name, torch.zeros(batch, dtype=model.dtype, device=model.device))
-        outputs['by_head'][name] = previous.index_add(0, ix, lp)
+        zeros = torch.zeros(batch, dtype=model.dtype, device=model.device)
+        if smoothed is not None:
+            exact = outputs.setdefault('exact_by_head', {})
+            exact[name] = exact.get(name, zeros).index_add(0, ix, lp)
+        previous = outputs['by_head'].get(name, zeros)
+        outputs['by_head'][name] = previous.index_add(0, ix, lp if smoothed is None else smoothed)
         np.add.at(outputs['head_counts'].setdefault(name, np.zeros(batch, dtype=int)), global_rows, 1)
         if not loss_only:
             outputs['logp'] = outputs['logp'].index_add(0, ix, lp)
@@ -154,7 +310,7 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     keys = entities[command] @ p['entity_key_w']
     func = inputs['func_types'] @ p['func_w']+p['func_b']
     # Teacher selections fix each step's embedding, so the query LSTM runs across them in one pass.
-    chosen = keys[inputs['command_range'][:, None], inputs['selected_indices']]/inputs['entity_counts'][:, None, None]
+    chosen = keys[inputs['command_range'][:, None], inputs['selected_indices']]/SELECTED_UNIT_DIVISOR
     steps = (chosen @ p['unit_ar_w']+p['unit_ar_b']).cumsum(dim=1)
     steps = ar[command][:, None]+torch.cat([torch.zeros_like(steps[:, :1]), steps], dim=1)
     if plan['unit_tokens']:
@@ -180,11 +336,6 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         record('unit', draw('unit', logits[inputs['unit_rows'], inputs['unit_prefixes']]))
     context = steps[inputs['command_range'], inputs['selected_lengths']]
 
-    if len(plan['science_rows']):
-        ix, choices = inputs['science_rows'], inputs['science_choices']
-        table = p['science_embedding']
-        record('science', draw('science', (context[ix] @ p['science_query_w']) @ table.T + p['science_b']))
-        context = context.index_copy(0, ix, context[ix]+table[choices] @ p['science_context_w'])
     if len(plan['command_head_rows']):
         ix, choices = inputs['command_head_rows'], inputs['command_choices']
         table = p['command_embedding']
@@ -203,20 +354,43 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         objects = model.object_embedding(model.identity_template_objects)
         record('template', draw('template', (context[ix] @ p['template_query_w']) @ objects.T + p['template_b']))
         context = context.index_copy(0, ix, context[ix]+objects[choices] @ p['template_context_w'])
+    def angle_head(ix):
+        angle_logits = context[ix] @ p['angle_w']+p['angle_b']
+        record('angle', draw('angle', angle_logits),
+               soft_logp(angle_logits, inputs['angle_mask'], inputs['angle_soft']) if 'angle_soft' in inputs else None)
+
     if placement and len(plan['angle_rows']):
         ix = inputs['angle_rows']
-        record('angle', draw('angle', context[ix] @ p['angle_w']+p['angle_b']))
+        angle_head(ix)
         context = context.index_copy(0, ix, context[ix]+p['build_angle_embedding'][inputs['angle_choices']])
     if len(plan['spatial_rows']):
         ix = inputs['spatial_rows']
         build = (inputs['build_spatial'], inputs['build_features']) if placement and inputs['build_spatial'].numel() else None
         cells, logits = model.location(spatial[command[ix]], context[ix], build)
         # One 256x256 distribution, scored as its map cell and then the offset within it.
-        record('cell', draw('cell', logits.logsumexp(dim=2)))
+        cell_logits = logits.logsumexp(dim=2)
+        cell = draw('cell', cell_logits)
         choices, side = inputs['cell_choices'], config['map_side']
+        if position_metrics:
+            with torch.no_grad():
+                outputs['position_errors'] = position_errors(logits.detach(), inputs['cell_mask'], choices,
+                                                             inputs['offset_choices'], config)
         chosen = cells[inputs['spatial_range'], :, torch.div(choices, side, rounding_mode='floor'), choices % side]
         context = context.index_copy(0, ix, context[ix]+chosen @ p['cell_context_w'])
-        record('offset', draw('offset', logits[inputs['spatial_range'], choices]))
+        offset = draw('offset', logits[inputs['spatial_range'], choices])
+        soft_cell = soft_offset = None
+        if 'position_soft_rows' in inputs:
+            # Sum over target pixels w of q_w*log p(pixel w) splits exactly into a cell term
+            # (sum of q_w*log p(cell of w)) and an offset term (sum of q_w*log p(w | its cell)).
+            r, c, o, w = (inputs['position_soft_'+name] for name in ('rows', 'cells', 'offsets', 'weights'))
+            cell_logp = cell_logits.masked_fill(~inputs['cell_mask'], -torch.inf).log_softmax(dim=1)
+            zeros = torch.zeros(len(cell_logits), dtype=cell_logits.dtype, device=cell_logits.device)
+            soft_cell = zeros.index_add(0, r, w*cell_logp[r, c])
+            # Exact rows (full-mask builds) keep their masked offset term.
+            soft_offset = torch.where(inputs['position_soft_exact'], offset[0],
+                                      zeros.index_add(0, r, w*(logits[r, c, o]-cell_logits[r, c])))
+        record('cell', cell, soft_cell)
+        record('offset', offset, soft_offset)
     if not placement and len(plan['angle_rows']):
-        record('angle', draw('angle', context[inputs['angle_rows']] @ p['angle_w']+p['angle_b']))
+        angle_head(inputs['angle_rows'])
     return outputs

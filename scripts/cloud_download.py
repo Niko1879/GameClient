@@ -32,7 +32,7 @@ def state(ssh, run):
 
 
 def pull(ssh, run, output):
-    # The learner moves latest.npz aside while writing the next checkpoint: fail then, and retry.
+    # The learner swaps the next checkpoint in with two renames: a pull between them fails, and is retried.
     links = ' '.join(f'if [ -e {name} ]; then ln {name} .pull/; fi;' for name in FILES[1:])
     command = (f'set -e; cd {shlex.quote(run)}; rm -rf .pull; mkdir .pull; ln latest.npz .pull/; {links} '
                'tar -cf - -C .pull .')

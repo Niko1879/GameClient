@@ -12,6 +12,9 @@ from replay_catalog import connect, document_bytes, register_prepared
 
 OLD = dict(feature_key='old-key', engine_sha256='old-engine')
 NEW = dict(feature_key='new-key', engine_sha256='new-engine', qualification='sample evidence')
+CONFIG = dict(a=1, architecture='new')
+# Shards keep the live deployment: a side converter's engine is never what a checkpoint plays.
+DEPLOYED = 'deployed-engine'
 
 
 class MigrateShardIdentity(unittest.TestCase):
@@ -49,8 +52,9 @@ class MigrateShardIdentity(unittest.TestCase):
         with zipfile.ZipFile(path) as archive:
             return {name: archive.read(name) for name in archive.namelist() if name != 'index.json'}
 
-    def run_migration(self):
-        return migration.migrate(self.catalog, self.root, OLD['feature_key'], OLD['engine_sha256'], NEW, 2, lambda text: None)
+    def run_migration(self, limit=None):
+        return migration.migrate(self.catalog, self.root, OLD['feature_key'], OLD['engine_sha256'], NEW, 2, CONFIG, DEPLOYED,
+                                 lambda text: None, limit)
 
     def test_only_the_index_changes_and_the_old_identity_is_kept(self):
         before = {path.name: (self.members(path), path.read_bytes()) for path in self.data.glob('*.zip')}
@@ -87,8 +91,9 @@ class MigrateShardIdentity(unittest.TestCase):
                 self.assertEqual(json.loads(archive.read('index.json')), entry['index'])
             document = db.execute('SELECT document_sha256,feature_key FROM prepared_profile WHERE profile_id=?', (profile_id,)).fetchone()
             self.assertEqual(document[1], NEW['feature_key'])
-            self.assertEqual(json.loads(document_bytes(db, document[0]))['deployment'],
-                             dict(engine_sha256=NEW['engine_sha256'], engine_ini_crc=5, ticks_per_second=60))
+            profile = json.loads(document_bytes(db, document[0]))
+            self.assertEqual(profile['deployment'], dict(engine_sha256=DEPLOYED, engine_ini_crc=5, ticks_per_second=60))
+            self.assertEqual(profile['config'], CONFIG)
         db.close()
 
     def test_a_changed_original_stops_before_anything_is_replaced(self):
@@ -117,9 +122,19 @@ class MigrateShardIdentity(unittest.TestCase):
         replacement = self.data/('0.zip'+migration.SUFFIX)
         shutil.copy2(self.data/'0.zip', replacement)
         (self.data/'0.zip').write_bytes(b'original')
-        self.assertEqual(self.run_migration(), (0, 3))
+        self.assertEqual(self.run_migration(), (0, 1))  # the finished swap is verified
         self.assertEqual(hashlib.sha256((self.data/'0.zip').read_bytes()).hexdigest(), sha)
         self.assertFalse(replacement.exists())
+
+    def test_passes_migrate_a_limited_slice_and_rerun_continues(self):
+        # A pass builds every replacement before the swap: the limit bounds its free-space need.
+        self.assertEqual(self.run_migration(limit=2), (2, 2))
+        db = connect(self.catalog)
+        self.assertEqual(sorted(db.execute('SELECT feature_key,count(*) FROM prepared_shard GROUP BY 1').fetchall()),
+                         [(NEW['feature_key'], 2), (OLD['feature_key'], 1)])
+        db.close()
+        self.assertEqual(self.run_migration(limit=2), (1, 1))
+        self.assertEqual(self.run_migration(limit=2), (0, 0))
 
 
 if __name__ == '__main__':

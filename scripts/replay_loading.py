@@ -43,7 +43,7 @@ def load_replays(paths, *, use_metadata_cache=True):
         for key, values in metadata['menus'].items():
             menus.setdefault(key, set()).update(values)
         rate = header['ticks_per_second']
-        if rate not in (30, 60) or header['controlled_faction'] != 'FactionChina':
+        if rate not in (30, 60) or not set(header['controlled_faction'].split(',')) <= {'FactionChina', 'FactionChinaTankGeneral', 'FactionChinaNukeGeneral'}:
             raise ValueError('Expected a vanilla China 30 or 60 Hz export')
         types.update(header['template_catalog'].values())
         for player, length in dict(metadata['players']).items():

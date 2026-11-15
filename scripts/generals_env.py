@@ -87,8 +87,12 @@ class GeneralsEnv:
         return self._response(self.request_id)
 
     def reset(self, map_path, *, seed=1, max_frames=36000, starting_cash=10000,
-              opponent_kind='policy', opponent_faction='random', learning_side=0, record_replay=False):
-        """record_replay writes the episode as the private profile's Last Replay (00000000.rep)."""
+              opponent_kind='policy', opponent_faction='random', learning_side=0, record_replay=False,
+              policy_factions=None):
+        """record_replay writes the episode as the private profile's Last Replay (00000000.rep).
+
+        policy_factions: each slot's China general (vanilla/Tank/Nuke native name) for policy games;
+        None plays vanilla China on both slots."""
         map_path = Path(map_path).resolve()
         if not map_path.is_file():
             raise ValueError(f'Map does not exist: {map_path}')
@@ -97,7 +101,8 @@ class GeneralsEnv:
         result = self._request('reset', map=str(map_path), seed=seed,
                                max_frames=max_frames, starting_cash=starting_cash,
                                opponent_kind=opponent_kind, opponent_faction=opponent_faction,
-                               learning_side=learning_side, record_replay=record_replay)
+                               learning_side=learning_side, record_replay=record_replay,
+                               **({'policy_factions': list(policy_factions)} if policy_factions else {}))
         self.players = result['players']
         self.controlled_players = result['controlled_players']
         self.done = result['terminated'] or result['truncated']
@@ -168,7 +173,8 @@ def placement_options(policies):
 
 
 def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, trajectory=None,
-                opponent_kind='policy', opponent_faction='random', learning_side=0, record_replay=False):
+                opponent_kind='policy', opponent_faction='random', learning_side=0, record_replay=False,
+                policy_factions=None):
     """Each policy implements reset(), act(observation, map_features, frame) and feedback().
 
     Reward is terminal win/loss only; timeout is truncation with zero reward.
@@ -180,15 +186,17 @@ def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, t
     placement = placement_options(policies)
     state = env.reset(map_path, seed=seed, max_frames=max_frames, opponent_kind=opponent_kind,
                       opponent_faction=opponent_faction, learning_side=learning_side,
-                      record_replay=record_replay)
+                      record_replay=record_replay, policy_factions=policy_factions)
     map_features = state['map']
     if len(policies) != len(env.controlled_players):
         raise ValueError('Expected one policy per controlled player')
-    for player, policy in zip(env.controlled_players, policies):
+    for slot, (player, policy) in enumerate(zip(env.controlled_players, policies)):
         policy.reset()
         policy.configure_clock(env.metadata['ticks_per_second'])
-        # Policy opponents are vanilla China; a Hard AI's named faction is its lobby side.
-        policy.configure_enemy('FactionChina' if opponent_kind == 'policy' else opponent_faction)
+        # A policy opponent plays its slot's China general (vanilla unless policy_factions);
+        # a Hard AI's named faction is its lobby side.
+        policy.configure_enemy((policy_factions[1-slot] if policy_factions else 'FactionChina')
+                               if opponent_kind == 'policy' else opponent_faction)
         if policy.policy.config['placement_mode'] == 'full_mask':
             policy.placement_query = lambda builder, template, angle, bins, player=player: env.placement(
                 player, builder, template, angle, bins)

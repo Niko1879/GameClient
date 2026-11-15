@@ -32,6 +32,7 @@
 
 #define DEFINE_WEAPONSLOTTYPE_NAMES
 #include "Common/Player.h"
+#include "Common/ReplayLogic.h"
 #include "Common/ThingFactory.h"
 #include "Common/Xfer.h"
 #include "GameLogic/Object.h"
@@ -141,7 +142,8 @@ UpdateSleepTime AssistedTargetingUpdate::update()
 	const AssistedTargetingUpdateModuleData *d = getAssistedTargetingUpdateModuleData();
 
 	m_laserFromAssisted = TheThingFactory->findTemplate( d->m_laserFromAssistedName );
-	m_laserToTarget = TheThingFactory->findTemplate( d->m_laserToTargetName );
+	// Replays of releases before this fix reuse the from-assisted laser (Common/ReplayLogic.h).
+	m_laserToTarget = TheThingFactory->findTemplate( replayLogic062026() ? d->m_laserFromAssistedName : d->m_laserToTargetName );
 
 	return UPDATE_SLEEP_FOREVER;
 }
@@ -183,7 +185,8 @@ void AssistedTargetingUpdate::loadPostProcess()
 	const AssistedTargetingUpdateModuleData *d = getAssistedTargetingUpdateModuleData();
 
 	m_laserFromAssisted = TheThingFactory->findTemplate( d->m_laserFromAssistedName );
-	m_laserToTarget = TheThingFactory->findTemplate( d->m_laserToTargetName );
+	// Replays of releases before this fix reuse the from-assisted laser (Common/ReplayLogic.h).
+	m_laserToTarget = TheThingFactory->findTemplate( replayLogic062026() ? d->m_laserFromAssistedName : d->m_laserToTargetName );
 
 	// extend base class
 	UpdateModule::loadPostProcess();
