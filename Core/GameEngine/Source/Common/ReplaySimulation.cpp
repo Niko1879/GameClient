@@ -25,7 +25,11 @@
 #include "Common/Recorder.h"
 #if defined(RTS_ZEROHOUR) && RTS_ZEROHOUR
 #include "Common/TrainingExporter.h"
+#include "Common/Player.h"
+#include "Common/PlayerList.h"
 #include "GameClient/MapUtil.h"
+#include "GameLogic/VictoryConditions.h"
+#include "GameNetwork/GameInfo.h"
 #define GENERALS_AI_TRAINING_EXPORT 1
 #endif
 #include "Common/WorkerProcess.h"
@@ -50,6 +54,37 @@ int countProcessesRunning(const std::vector<WorkerProcess>& processes)
 	}
 	return numProcessesRunning;
 }
+
+#ifdef GENERALS_AI_TRAINING_EXPORT
+// GeneralsAI: who won, from the engine's multiplayer victory conditions, read the way
+// GameSpyGameInfo::generateGameResultsPacket reports results. Keyed by the header's slot.
+// victorious/eliminated are only set once a single alliance remains (end_frame > 0);
+// defeated_now is the live check (no victory-counting buildings) at the last frame.
+void printReplayOutcome()
+{
+	printf("ReplayOutcome {\"end_frame\":%u,\"players\":[", TheVictoryConditions->getEndFrame());
+	Bool first = TRUE;
+	for (Int i = 0; i < MAX_SLOTS; ++i)
+	{
+		Player *p = ThePlayerList->getPlayerFromSlotIndex(i);
+		if (!p || p->isPlayerObserver())
+			continue;
+		GameSlot *slot = TheGameInfo ? TheGameInfo->getSlot(i) : nullptr;
+		printf("%s{\"slot\":%d,\"player_index\":%d,\"victorious\":%s,\"eliminated\":%s,\"defeated_now\":%s,"
+			"\"has_objects\":%s,\"disconnected\":%s,\"last_frame_in_game\":%d}",
+			first ? "" : ",", i, p->getPlayerIndex(),
+			TheVictoryConditions->hasAchievedVictory(p) ? "true" : "false",
+			TheVictoryConditions->hasBeenDefeated(p) ? "true" : "false",
+			TheVictoryConditions->hasSinglePlayerBeenDefeated(p) ? "true" : "false",
+			p->hasAnyObjects() ? "true" : "false",
+			(slot && slot->disconnected()) ? "true" : "false",
+			slot ? (Int)slot->lastFrameInGame() : -1);
+		first = FALSE;
+	}
+	printf("]}\n");
+	fflush(stdout);
+}
+#endif
 } // namespace
 
 int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString> &filenames)
@@ -131,6 +166,7 @@ int ReplaySimulation::simulateReplaysInThisProcess(const std::vector<AsciiString
 				TheRecorder->getLastPlaybackCommandFrame(), TheRecorder->reachedPlaybackEOF() ? "true" : "false",
 				static_cast<int>(LOGICFRAMES_PER_SECOND), TheGlobalData->m_iniCRC, map ? map->m_CRC : 0);
 			fflush(stdout);
+			printReplayOutcome();
 			if (!TrainingExporterFinish(completed, TheRecorder->sawCRCMismatch())) numErrors++;
 #endif
 		}
