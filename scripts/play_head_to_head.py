@@ -27,6 +27,7 @@ import cycle_runtime as cycle
 from engine_runtime import PROFILE_ENV, disable_power_throttling, isolation_profile, preflight
 from pipeline_resources import tree
 import run_prepared_training as runner
+from openers import NAMED
 
 MAPS = {'[RANK] TD NoBugsCars ZH v1': 'ed468fe5a5cb4e2145fa0b37bc5d2a1d4eec58b55fba58395deebe9f17dbd083',
         'Tournament Desert': 'db429b884bc593971feb9d545ada1f1d0aea114f2262b052fe46d81f9f034d01'}
@@ -105,6 +106,9 @@ def main():
     parser.add_argument('--b-rating', type=float, help='Rating input of B (default: the live play rating)')
     parser.add_argument('--rating-view', choices=('true', 'mirror'), default='true',
                         help="Opponent rating each side conditions on: the other's (true) or its own (mirror)")
+    parser.add_argument('--a-opener', choices=('none', *sorted(NAMED)), default='none',
+                        help='Strategy input z of A (scripts/openers.py NAMED)')
+    parser.add_argument('--b-opener', choices=('none', *sorted(NAMED)), default='none', help='Strategy input z of B')
     parser.add_argument('--a-rating-input', action='store_true',
                         help='A was trained with the rating input (its run directory holds RATING_INPUT)')
     parser.add_argument('--b-rating-input', action='store_true', help='B was trained with the rating input')
@@ -138,9 +142,11 @@ def main():
                    if (args.a_faction, args.b_faction) != ('FactionChina', 'FactionChina') else {}),
                 ratings=dict(a=args.a_rating, b=args.b_rating, view=args.rating_view,
                              **({'a_input': True} if args.a_rating_input else {}),
-                             **({'b_input': True} if args.b_rating_input else {})))
+                             **({'b_input': True} if args.b_rating_input else {})),
+                **({'openers': dict(a=args.a_opener, b=args.b_opener)}
+                   if (args.a_opener, args.b_opener) != ('none', 'none') else {}))
     previous = cycle.load(output/'meta.json')
-    if previous and (any(previous[k] != meta[k] for k in ('a_sha256', 'b_sha256', 'engine_sha256', 'minutes'))
+    if previous and (any(previous.get(k) != meta.get(k) for k in ('a_sha256', 'b_sha256', 'engine_sha256', 'minutes', 'openers'))
                      or previous.get('ratings', dict(a=None, b=None, view='true')) != meta['ratings']):
         raise SystemExit('Output directory holds a different matchup; use a new --output')
     cycle.save(output/'meta.json', meta)
@@ -196,7 +202,8 @@ def main():
                            '--learning-side', str(game['side']), '--seed', str(game['seed']),
                            '--max-frames', frames, '--ticks', '6', '--output', str(folder),
                            '--rating-view', args.rating_view,
-                           '--faction', args.a_faction, '--opponent-policy-faction', args.b_faction]
+                           '--faction', args.a_faction, '--opponent-policy-faction', args.b_faction,
+                           '--opener', args.a_opener, '--opponent-opener', args.b_opener]
                 if args.a_rating is not None:
                     command += ['--rating', str(args.a_rating)]
                 if args.b_rating is not None:

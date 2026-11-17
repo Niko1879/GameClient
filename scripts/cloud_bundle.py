@@ -180,6 +180,10 @@ def main():
     (output/'data').mkdir(parents=True); (output/'code').mkdir()
     started = time.time()
     doc, key = experiment.selection(args)
+    # Strategy input z: a manifest without openers would train without it, silently.
+    openers = doc['selection']['openers']
+    if openers['with_opener'] < 0.8*openers['players']:
+        raise ValueError(f'Only {openers["with_opener"]} of {openers["players"]} players have an opener')
     doc['config'] = {**doc['config'], **widths}
     from generals_policy import NeuralPolicy
     parameters = sum(value.data.size for value in NeuralPolicy(doc['config'], args.seed).parameters.values())

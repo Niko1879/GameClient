@@ -217,6 +217,7 @@ class TorchPolicyV3(nn.Module):
         enemy = p['base_faction_embedding'][identities[:, 0]]+p['general_embedding'][identities[:, 1]]
         scalar = scalar + enemy @ p['enemy_identity_w']
         scalar = scalar + inputs['ratings'] @ p['ratings_w']
+        scalar = scalar + inputs['opener'] @ p['opener_w']
         scalar = scalar + inputs['player_flags'] @ p['player_flags_w']
         counts = torch.zeros((batch, len(config['types'])), dtype=self.dtype, device=self.device).scatter_add(
             1, inputs['types'], inputs['real'])

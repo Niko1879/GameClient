@@ -80,6 +80,7 @@ def encode_values(spec, encoded):
     # so the key would change the feature identity of every shard (12 Nov: with-rating arm on existing shards).
     # A checkpoint trained this way does not record it; its run directory holds a RATING_INPUT marker instead.
     rated = bool(spec.config.get('rating_input', False)) or os.environ.get('GENERALS_RATING_INPUT') == '1'
+    no_opener = np.zeros(len(spec.config['templates'])+1, dtype=spec.float_dtype)
     # Columns as generals_policy._encode_modalities: stored numeric, extra, derived, then arms_inputs.
     numeric = np.zeros((batch, count, derived_end+ARMS_FEATURES), dtype=spec.float_dtype)
     types = np.zeros((batch, count), dtype=np.int64)
@@ -144,7 +145,10 @@ def encode_values(spec, encoded):
         'available_actions': (np.stack([available_actions(spec, row) for row in encoded]), 'float'),
         'identities': ([row['player_identity'] for row in encoded], 'int64'),
         'enemy_identities': ([row.get('enemy_identity', (0, 0)) for row in encoded], 'int64'),
-        'ratings': (np.stack([np.asarray(row.get('ratings', UNRATED) if rated else UNRATED, dtype=spec.float_dtype) for row in encoded]), 'float')}
+        'ratings': (np.stack([np.asarray(row.get('ratings', UNRATED) if rated else UNRATED, dtype=spec.float_dtype) for row in encoded]), 'float'),
+        # Strategy input z (generals_policy.opener_inputs), set per row by event_dataset; absent means none.
+        'opener': (np.stack([np.asarray(row['opener'], dtype=spec.float_dtype) if 'opener' in row else no_opener
+                             for row in encoded]), 'float')}
     # v11 effect and sound-cue tokens (generals_policy.Encoder._effects), padded per chunk; padding is never a key.
     effects = max(len(row['effect_numeric']) for row in encoded)
     effect_numeric = np.zeros((batch, effects, EFFECT_FEATURES), dtype=spec.float_dtype)
@@ -301,6 +305,7 @@ def prepare_update(spec, rows, pair_budget):
                       'rows': [{'target': row['target'], 'frame': row.get('frame'),
                                 'source_ticks_per_second': row.get('source_ticks_per_second', 60),
                                 'rating': row.get('rating'), 'match_key': row.get('match_key'),
-                                'player': row.get('player'), 'general': acting_general(row)} for row in micro],
+                                'player': row.get('player'), 'general': acting_general(row),
+                                'opener': row.get('opener')} for row in micro],
                       'entity_count': numeric.shape[1]})
     return {'rows': len(rows), 'microbatches': parts}

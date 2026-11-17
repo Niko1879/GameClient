@@ -206,6 +206,9 @@ def selection(args):
                    if r['match_key'] not in protected and r['replay_sha256'] not in protected_shas
                    and r['match_key'] not in taken and r['replay_sha256'] not in taken]
         doc=document(db,selected,policy,model)
+        # Strategy input z per shard player (scripts/openers.py): read from the shards' chunk headers, cached by hash.
+        from openers import attach
+        openers=attach(doc,DATA)
         if rung:
             # The bundle's own per-shard rule (subset_manifest.match_rating) must agree with the cut.
             # A shard's player indices are the engine's; the ratings are keyed by the replay header's slot order.
@@ -220,7 +223,7 @@ def selection(args):
             rung['shards_joined_below_cut']=below
         held=collections.Counter('/'.join(strata[r['match_key']]) for r in selected if r['split']=='validation')
         doc['selection']=dict(seed=args.seed,training=args.training,validation=args.validation,
-            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning,archive=archive,rung=rung,vanilla_from=vanilla,
+            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning,archive=archive,rung=rung,vanilla_from=vanilla,openers=openers,
             validation_strata=dict(length_minutes=LENGTH_BANDS,mean_rating=RATING_BANDS,floor=VALIDATION_FLOOR,
                                    reused=bool(reused),counts=dict(sorted(held.items()))))
         return doc,key

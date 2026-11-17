@@ -10,6 +10,7 @@ from engine_runtime import PROFILE_ENV
 from event_policy import EventActor, ScienceBuyer
 from generals_env import GeneralsEnv, run_episode
 from generals_policy import PLAY_RATING, NeuralPolicy
+from openers import NAMED, named_templates
 from prepared_io import _digest, _write_json
 from replay_bootstrap import check_live_provenance
 
@@ -37,12 +38,14 @@ def evaluate(args):
             return buyer
         actors = [EventActor(policy, args.seed, deterministic=args.deterministic, science=science(args.faction))]
         actors[0].configure_ratings(*rating_view(args.rating, args.opponent_rating, args.rating_view))
+        actors[0].configure_opener(named_templates(policy.config, args.opener))
         if args.opponent_kind == 'policy':
             other, _, _ = NeuralPolicy.load(args.opponent or args.checkpoint)
             other.rating_input = args.opponent_rating_input if args.opponent else args.rating_input
             actors.append(EventActor(other, args.seed+1, deterministic=args.deterministic,
                                      science=science(args.opponent_policy_faction)))
             actors[1].configure_ratings(*rating_view(args.opponent_rating, args.rating, args.rating_view))
+            actors[1].configure_opener(named_templates(other.config, args.opponent_opener))
             if args.learning_side == 1:
                 actors.reverse()
         policy_factions = None
@@ -67,7 +70,8 @@ def evaluate(args):
                    map_sha256=_digest(args.map), seed=args.seed, ticks=args.ticks, deterministic=args.deterministic,
                    factions=dict(checkpoint=args.faction, opponent=args.opponent_policy_faction),
                    ratings=dict(checkpoint=args.rating, opponent=args.opponent_rating, view=args.rating_view,
-                                checkpoint_input=args.rating_input, opponent_input=args.opponent_rating_input))
+                                checkpoint_input=args.rating_input, opponent_input=args.opponent_rating_input),
+                   openers=dict(checkpoint=args.opener, opponent=args.opponent_opener))
     _write_json(output/'summary.json', summary)
     print(json.dumps(summary), flush=True)
     return summary
@@ -94,6 +98,10 @@ def main():
     parser.add_argument('--deterministic', action='store_true')
     parser.add_argument('--rating', type=float, default=PLAY_RATING, help='Rating input of the --checkpoint side')
     parser.add_argument('--opponent-rating', type=float, default=PLAY_RATING, help='Rating input of the --opponent side')
+    parser.add_argument('--opener', choices=('none', *sorted(NAMED)), default='none',
+                        help='Strategy input z of the --checkpoint side (scripts/openers.py NAMED)')
+    parser.add_argument('--opponent-opener', choices=('none', *sorted(NAMED)), default='none',
+                        help='Strategy input z of the --opponent side')
     parser.add_argument('--rating-input', action='store_true',
                         help='The --checkpoint model was trained with the rating input (GENERALS_RATING_INPUT=1)')
     parser.add_argument('--opponent-rating-input', action='store_true',

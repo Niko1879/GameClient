@@ -488,6 +488,12 @@ class EventLearner:
             totals['general:'+general+':decisions'] += 1
             totals['general:'+general+':loss_sum'] += float(loss)
             totals['general:'+general+':correct'] += int(hit)
+        # Strategy input z per row (event_dataset): given, blanked, none (under six buildings), after (window over).
+        # The comparable loss is the blanked/none/after rows; given vs blanked in the opening shows z's use.
+        for status, loss, hit in zip((row.get('opener') or 'unknown' for row in rows), row_losses, hits):
+            totals['opener:'+status+':decisions'] += 1
+            totals['opener:'+status+':loss_sum'] += float(loss)
+            totals['opener:'+status+':correct'] += int(hit)
         timed = np.fromiter((row['frame'] is not None for row in rows), dtype=bool, count=len(rows))
         if timed.any():  # prepared shards record each event's source frame
             minutes = np.array([row['frame']/row.get('source_ticks_per_second', 60)/60
@@ -624,12 +630,17 @@ def summarize(counts):
                          'mean_nll': counts['general:'+name+':loss_sum']/max(1, counts['general:'+name+':decisions']),
                          'decision_accuracy': counts['general:'+name+':correct']/max(1, counts['general:'+name+':decisions'])}
                   for name in generals}
+    statuses = sorted({key.split(':')[1] for key in counts if key.startswith('opener:')})
+    by_opener = {name: {'decisions': counts['opener:'+name+':decisions'],
+                        'mean_nll': counts['opener:'+name+':loss_sum']/max(1, counts['opener:'+name+':decisions']),
+                        'decision_accuracy': counts['opener:'+name+':correct']/max(1, counts['opener:'+name+':decisions'])}
+                 for name in statuses}
     positions = {}
     if any(key.startswith('position:') for key in counts):
         positions = {'position_error': {'by_kind': position_summary(counts, 'position'),
                                         'movement_by_order_length': position_summary(counts, 'position_length')}}
-    return {**{k: v for k, v in counts.items() if not k.startswith(('minute:', 'rating:', 'general:', 'position:', 'position_length:'))},
-            'by_minute': by_minute, 'by_rating': by_rating, 'by_general': by_general, **positions,
+    return {**{k: v for k, v in counts.items() if not k.startswith(('minute:', 'rating:', 'general:', 'opener:', 'position:', 'position_length:'))},
+            'by_minute': by_minute, 'by_rating': by_rating, 'by_general': by_general, 'by_opener': by_opener, **positions,
             'mean_nll': counts['loss_sum']/max(1, counts['decisions']),
             'decision_accuracy': counts['correct']/max(1, counts['decisions']),
             # Validation: the model's expected wait share next to the humans' (calibration of acting vs waiting).

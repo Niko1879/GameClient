@@ -197,6 +197,24 @@ def rating_inputs(own, opponent):
 
 UNRATED = rating_inputs(None, None)
 
+# Strategy input z (scripts/openers.py, 17 Nov 2026): the counts of each production template among a player's
+# first OPENER_BUILDINGS build orders, /OPENER_BUILDINGS, then a given flag; all zero = no opener. Shown only during
+# the first OPENER_WINDOW_SECONDS of game time (95% of top-20% players order their sixth building by 222 s).
+OPENER_BUILDINGS = 6
+OPENER_WINDOW_SECONDS = 240
+
+
+def opener_inputs(config, templates=None, seconds=0.):
+    """Model opener input from a player's first OPENER_BUILDINGS build templates (policy template indices) or
+    None, `seconds` of game time in."""
+    values = np.zeros(len(config['templates'])+1)
+    if templates is not None and seconds < OPENER_WINDOW_SECONDS:
+        if len(templates) != OPENER_BUILDINGS:
+            raise ValueError('An opener is exactly %d build orders' % OPENER_BUILDINGS)
+        np.add.at(values, np.asarray(templates, dtype=np.int64), 1/OPENER_BUILDINGS)
+        values[-1] = 1
+    return values
+
 
 def position_bits(xy):
     """(..., 2) normalized positions as 8 bits per axis."""
@@ -772,6 +790,7 @@ class NeuralPolicy:
         w('player_identity_w', (e, s), .5, generator=identity_rng)
         w('enemy_identity_w', (e, s), .5, generator=identity_rng)
         w('ratings_w', (RATING_FEATURES, s), .5)
+        w('opener_w', (len(config['templates'])+1, s), .5)
         w('unit_counts_w', (len(config['types']), s), .2)
         w('available_actions_w', (kinds, s), .2)
         # scalar_context: what AlphaStar gates its action head and autoregressive embedding with.
@@ -1322,6 +1341,9 @@ class NeuralPolicy:
         scalar = scalar + enemy @ p['enemy_identity_w']
         # Set per game by the dataset or the live actor; absent means both unrated.
         scalar = scalar + Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)) @ p['ratings_w']
+        # Set by the dataset or the live actor (opener_inputs); absent means no opener.
+        if 'opener' in encoded:
+            scalar = scalar + Tensor(np.asarray(encoded['opener'], dtype=float)) @ p['opener_w']
         scalar = scalar + Tensor(encoded['player_flags']) @ p['player_flags_w']
         counts = np.bincount(np.asarray(encoded['types'])[:len(encoded['entities'])], minlength=len(self.config['types']))
         available = Tensor(np.asarray(self.verb_mask(encoded), dtype=float))
