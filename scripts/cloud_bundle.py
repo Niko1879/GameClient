@@ -116,6 +116,11 @@ if [ "$SHM_MB" -lt $(( READERS * WORLD * 100 )) ]; then
   echo "/dev/shm has $SHM_MB MB free; $(( READERS * WORLD )) readers need ~$(( READERS * WORLD * 100 )) MB: raise the container's --shm-size" >&2
   exit 1
 fi
+# Rating input ON (user, 15/17 Nov 2026: it helped the top-20% run). It is no config key (that would change
+# the feature key), so the run directory carries the RATING_INPUT marker play_head_to_head checks.
+export GENERALS_RATING_INPUT=${GENERALS_RATING_INPUT:-1}
+mkdir -p run
+if [ "$GENERALS_RATING_INPUT" = 1 ]; then touch run/RATING_INPUT; fi
 EXTRA=()
 if [ "$COMPILE" = 1 ]; then EXTRA+=(--compile); fi
 exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json --output run \\
