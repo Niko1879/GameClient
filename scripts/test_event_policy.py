@@ -505,6 +505,7 @@ class EventTests(unittest.TestCase):
 class MicrobatchTests(unittest.TestCase):
     def test_microbatches_cover_each_row_once_within_pair_budget(self):
         from train_events import microbatches
+        from training_preparation import MICROBATCH_ROWS
         sizes = np.random.default_rng(3).integers(1, 60, 200)
         rows = [{'id': str(i), 'encoded': {'numeric': np.zeros((int(size), 1))}} for i, size in enumerate(sizes)]
         rows.append({'id': 'large', 'encoded': {'numeric': np.zeros((120, 1))}})
@@ -515,6 +516,11 @@ class MicrobatchTests(unittest.TestCase):
             self.assertTrue(len(group) == 1 or len(group)*largest*largest <= 4000)
         self.assertEqual([len(g) for g in groups if any(r['id'] == 'large' for r in g)], [1])
         self.assertEqual(list(microbatches(rows[:1], 4000)), [rows[:1]])
+        # Small observations under a generous budget: rows are capped, not only pairs (v11 big OOM, 17 Nov).
+        small = [{'id': str(i), 'encoded': {'numeric': np.zeros((20, 1))}} for i in range(512)]
+        groups = list(microbatches(small, 8_000_000))
+        self.assertEqual(sum(map(len, groups)), 512)
+        self.assertLessEqual(max(map(len, groups)), MICROBATCH_ROWS)
 
 
 if __name__ == '__main__':

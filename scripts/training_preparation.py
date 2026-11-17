@@ -17,6 +17,11 @@ from training_legality import cached_legality
 
 # Fitted Radeon encoder cost: per microbatch, per padded token, per padded pair.
 MICROBATCH_COST = (12.8e-3, 2.6e-6, 1.4e-9)
+# Rows per microbatch, whatever the pair budget allows. The budget bounds attention (entities
+# squared), but the 128x128 map encoder and location upsampler grow with rows: early-game rows
+# have ~20 entities, so a whole 512-row batch fit one microbatch and the v11 big model ran out of
+# GPU memory on a 5090 (17 Nov 2026). A split changes only speed: an update's loss is a sum.
+MICROBATCH_ROWS = 128
 
 
 class PreparationSpec:
@@ -51,7 +56,7 @@ def microbatches(rows, pair_budget, cost=MICROBATCH_COST):
     best, cut = np.zeros(len(sizes)+1), np.zeros(len(sizes)+1, dtype=np.int64)
     for end in range(1, len(sizes)+1):
         largest = sizes[end-1]
-        start = max(0, end-max(1, pair_budget//max(largest*largest, 1)))
+        start = max(0, end-min(MICROBATCH_ROWS, max(1, pair_budget//max(largest*largest, 1))))
         costs = best[start:end]+fixed+(end-np.arange(start, end))*largest*(token+pair*largest)
         choice = int(np.argmin(costs))
         best[end], cut[end] = costs[choice], start+choice

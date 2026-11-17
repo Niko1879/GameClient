@@ -992,6 +992,14 @@ def train(args, ranks=None):
         if latest.exists():
             os.replace(latest, output/'previous.npz')
         os.replace(pending, latest)
+        if learner.model.device.type == 'cuda':
+            # GPU headroom since the last checkpoint (17 Nov 2026: v11 big at batch 512 ran out twice).
+            torch = learner.torch
+            print(json.dumps({'checkpoint_update': learner.step_count,
+                              'gpu_peak_mib': round(torch.cuda.max_memory_allocated()/2**20),
+                              'gpu_total_mib': round(torch.cuda.get_device_properties(learner.model.device).total_memory/2**20)}),
+                  flush=True)
+            torch.cuda.reset_peak_memory_stats()
 
     def stopping():
         return stop_requested or (stop_file and stop_file.exists())
