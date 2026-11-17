@@ -221,6 +221,16 @@ def selection(args):
             if len(below)>0.01*len(doc['entries']):raise ValueError(f'{len(below)} selected matches fall below --min-rating by the shard rule (e.g. {below[0]})')
             rung['shards_without_joined_rating']=sum(match_rating(e) is None for e in doc['entries'])
             rung['shards_joined_below_cut']=below
+            # Per player (user, 17 Nov 2026: the top 20% of PLAYERS): in China-vs-China matches the weaker China player
+            # can be below the floor; their episodes are skipped (event_dataset.chunks). A match whose every episode
+            # would go is the known slot/player-index mismatch above (the header rule met the cut), so it is kept.
+            excluded=mismatched=0
+            for e in doc['entries']:
+                players=[str(ep['player']) for ep in e['index']['episodes']]
+                low=[p for p in players if (r:=e.get('ratings',{}).get(p)) is not None and (r['rating'] if isinstance(r,dict) else r)<args.min_rating]
+                if len(low)==len(players):mismatched+=1;continue
+                if low:e['excluded_players']=low;excluded+=len(low)
+            rung.update(players_below_floor_excluded=excluded,matches_kept_as_index_mismatch=mismatched)
         held=collections.Counter('/'.join(strata[r['match_key']]) for r in selected if r['split']=='validation')
         doc['selection']=dict(seed=args.seed,training=args.training,validation=args.validation,
             split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning,archive=archive,rung=rung,vanilla_from=vanilla,openers=openers,

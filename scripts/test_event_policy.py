@@ -254,6 +254,15 @@ class EventTests(unittest.TestCase):
         _write_json(root/'dataset.json', document)
         return EventDataset(root/'dataset.json')
 
+    def test_players_below_the_rating_floor_are_not_supervised(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertTrue(list(self.shard_dataset(root).chunks('train')))
+            document = json.loads((root/'dataset.json').read_text())
+            document['entries'][0]['excluded_players'] = ['2']
+            _write_json(root/'dataset.json', document)
+            self.assertEqual(list(EventDataset(root/'dataset.json').chunks('train')), [])
+
     def test_weapon_and_armour_stats_reach_every_row_from_any_observation(self):
         """Stats arrive once (re-export fix 4), here in an observation no training row uses;
         the episode table must still carry them to every stored row."""

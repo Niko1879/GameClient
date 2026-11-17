@@ -127,7 +127,12 @@ class EventDataset:
         for source, entry in enumerate(self.entries):
             if entry['split'] != split:
                 continue
+            # Players below the selection's rating floor (run_prepared_training.selection, 17 Nov 2026): the floor is
+            # per player, so a weaker China player in a China-vs-China match is not supervised.
+            excluded = set(entry.get('excluded_players', ()))
             for episode in entry['index']['episodes']:
+                if str(episode['player']) in excluded:
+                    continue
                 for descriptor in episode['chunks']:
                     yield source, episode['shared'], descriptor
 
