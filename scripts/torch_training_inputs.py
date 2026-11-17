@@ -212,12 +212,6 @@ def position_errors(logits, cell_mask, cell_choices, offset_choices, config):
     return (joint*distance).sum(dim=1), distance.gather(1, joint.argmax(dim=1, keepdim=True)).squeeze(1)
 
 
-def soft_logp(logits, mask, weights):
-    """Expected log-probability under Gaussian target weights (training_preparation.soft_targets)."""
-    probabilities = cap_logits(logits, mask).masked_fill(~mask, -torch.inf).log_softmax(dim=1)
-    return (weights*torch.where(mask, probabilities, torch.zeros_like(probabilities))).sum(dim=1)
-
-
 def action_trunk(p, core, gate, all_verbs, dtype):
     """Decision logits, the autoregressive embedding and the delay logits.
 
@@ -245,7 +239,8 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     """Vectorized argument heads; teacher selections determine autoregressive control.
 
     position_metrics adds outputs['position_errors']: (expected, mode) pixel distances
-    per position row (position_errors), for validation reports.
+    per position row (position_errors), for validation reports, and outputs['wait_probability']:
+    the model's p(wait) per row (the report's expected wait share).
     """
     if plan is None:
         plan = teacher_plan(model, encoded, teachers, entities.shape[1])
@@ -265,6 +260,10 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     timing, entropy, decision = draw('decision', logits)
     outputs = {'by_head': {'decision': timing}, 'head_counts': {'decision': np.ones(batch, dtype=int)},
                'predictions': [('decision', np.arange(batch), decision)]}
+    if position_metrics:  # Validation: p(wait) per row, for the report's expected wait share.
+        with torch.no_grad():
+            outputs['wait_probability'] = cap_logits(logits, inputs['decision_mask']).masked_fill(
+                ~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0]
     if not loss_only:
         outputs.update(logp=timing, entropy=entropy, action_kinds=KINDS, token_counts=np.ones(batch, dtype=int),
                        event_prediction=(decision != 0).long(),
@@ -274,11 +273,6 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     lp, ent, prediction = draw('event_delay', delay_logits)
     outputs['by_head']['delay'] = lp
     outputs['head_counts']['delay'] = np.ones(batch, dtype=int)
-    # Target smoothing: by_head carries the smoothed terms the gradient follows; exact_by_head
-    # keeps the exact-target terms of the same heads for reported NLL.
-    if 'event_delay_soft' in inputs:
-        outputs['exact_by_head'] = {'delay': lp}
-        outputs['by_head']['delay'] = soft_logp(delay_logits, inputs['event_delay_mask'], inputs['event_delay_soft'])
     if not loss_only:
         outputs['logp'] = outputs['logp']+lp
         outputs['entropy'] = outputs['entropy']+ent
@@ -290,15 +284,11 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
     # A censored teacher delay is unknown: later arguments do not see the placeholder.
     ar = ar+(x @ p['delay_embed_out_w']+p['delay_embed_out_b'])*inputs['delay_known'][:, None]
 
-    def record(name, values, smoothed=None):
+    def record(name, values):
         lp, ent, prediction = values
         global_rows, ix = plan['categories'][name], inputs[name+'_global']
-        zeros = torch.zeros(batch, dtype=model.dtype, device=model.device)
-        if smoothed is not None:
-            exact = outputs.setdefault('exact_by_head', {})
-            exact[name] = exact.get(name, zeros).index_add(0, ix, lp)
-        previous = outputs['by_head'].get(name, zeros)
-        outputs['by_head'][name] = previous.index_add(0, ix, lp if smoothed is None else smoothed)
+        previous = outputs['by_head'].get(name, torch.zeros(batch, dtype=model.dtype, device=model.device))
+        outputs['by_head'][name] = previous.index_add(0, ix, lp)
         np.add.at(outputs['head_counts'].setdefault(name, np.zeros(batch, dtype=int)), global_rows, 1)
         if not loss_only:
             outputs['logp'] = outputs['logp'].index_add(0, ix, lp)
@@ -355,9 +345,7 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         record('template', draw('template', (context[ix] @ p['template_query_w']) @ objects.T + p['template_b']))
         context = context.index_copy(0, ix, context[ix]+objects[choices] @ p['template_context_w'])
     def angle_head(ix):
-        angle_logits = context[ix] @ p['angle_w']+p['angle_b']
-        record('angle', draw('angle', angle_logits),
-               soft_logp(angle_logits, inputs['angle_mask'], inputs['angle_soft']) if 'angle_soft' in inputs else None)
+        record('angle', draw('angle', context[ix] @ p['angle_w']+p['angle_b']))
 
     if placement and len(plan['angle_rows']):
         ix = inputs['angle_rows']
@@ -378,19 +366,8 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
         chosen = cells[inputs['spatial_range'], :, torch.div(choices, side, rounding_mode='floor'), choices % side]
         context = context.index_copy(0, ix, context[ix]+chosen @ p['cell_context_w'])
         offset = draw('offset', logits[inputs['spatial_range'], choices])
-        soft_cell = soft_offset = None
-        if 'position_soft_rows' in inputs:
-            # Sum over target pixels w of q_w*log p(pixel w) splits exactly into a cell term
-            # (sum of q_w*log p(cell of w)) and an offset term (sum of q_w*log p(w | its cell)).
-            r, c, o, w = (inputs['position_soft_'+name] for name in ('rows', 'cells', 'offsets', 'weights'))
-            cell_logp = cell_logits.masked_fill(~inputs['cell_mask'], -torch.inf).log_softmax(dim=1)
-            zeros = torch.zeros(len(cell_logits), dtype=cell_logits.dtype, device=cell_logits.device)
-            soft_cell = zeros.index_add(0, r, w*cell_logp[r, c])
-            # Exact rows (full-mask builds) keep their masked offset term.
-            soft_offset = torch.where(inputs['position_soft_exact'], offset[0],
-                                      zeros.index_add(0, r, w*(logits[r, c, o]-cell_logits[r, c])))
-        record('cell', cell, soft_cell)
-        record('offset', offset, soft_offset)
+        record('cell', cell)
+        record('offset', offset)
     if not placement and len(plan['angle_rows']):
         angle_head(inputs['angle_rows'])
     return outputs

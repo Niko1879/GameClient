@@ -320,91 +320,21 @@ class AgreementTests(unittest.TestCase):
             reference = np.zeros_like(actual) if reference is None else reference
             np.testing.assert_allclose(actual, reference, atol=3e-9, rtol=3e-8, err_msg=name)
 
-    def test_target_smoothing_is_the_expected_exact_log_probability(self):
-        """Smoothed delay/cell/offset terms equal sum_w q_w log p(w), scored by exact-target passes."""
-        from training_preparation import soft_targets
+    def test_order_distance_is_from_the_selected_units_centre(self):
+        """The validation report's order length: pixels from the selected units' centre to the target."""
+        from training_preparation import order_distance
         config, obs, terrain = fixture('fast')
         policy = NeuralPolicy(config, 5)
         rows = examples(policy, obs, terrain)
-        model = TorchPolicyV3(policy, dtype=torch.float64)
-        plain = dict(model.config)
-        encoded = [row['encoded'] for row in rows]
-        trunk = model.events(encoded)
-
-        def heads(targets, smoothing=None):
-            model.config = plain if smoothing is None else dict(plain, target_smoothing=smoothing)
-            with torch.no_grad():
-                return model.teacher_heads(encoded, targets, *trunk)
-
-        targets = [row['target'] for row in rows]
-        smoothing = {'delay': 1.0, 'angle': 1.0, 'position': {'default': .6}}
-        smoothed, exact = heads(targets, smoothing), heads(targets)
-        self.assertEqual(set(smoothed['exact_by_head']), {'delay', 'cell', 'offset', 'angle'})
-        for name, value in smoothed['exact_by_head'].items():  # Exact terms are untouched by smoothing.
-            np.testing.assert_allclose(value.numpy(), exact['by_head'][name].numpy(), atol=1e-12, err_msg=name)
-        # Delay: rescore every tick as the teacher's and weight the exact log-probabilities.
-        ticks = model.config['delay_ticks']
-        by_tick = np.stack([heads([dict(t, delay=index) for t in targets])['by_head']['delay'].numpy()
-                            for index in range(len(ticks))], axis=1)
-        choices = [t.get('delay', 0) for t in targets]  # Target delays are indices into delay_ticks.
-        q = soft_targets(np.ones((len(targets), len(ticks)), bool), choices, 1.0, ticks)
-        np.testing.assert_allclose(smoothed['by_head']['delay'].numpy(), (q*by_tick).sum(axis=1), atol=1e-9)
-        # Position: one row, every pixel of its window rescored as the teacher pixel.
-        n, fine = model.config['map_side'], model.config['position_bins']//model.config['map_side']
-        row = next(i for i, t in enumerate(targets) if 'x' in t and t['kind'] != 'build')
-        total, weights = 0.0, []
-        for dy in range(-3, 4):
-            for dx in range(-3, 4):
-                x, y = targets[row]['x']+dx, targets[row]['y']+dy
-                w = np.exp(-.5*(dx*dx+dy*dy)/.36)
-                if not (0 <= x < 256 and 0 <= y < 256) or w < 1e-4:
-                    continue
-                moved = dict(targets[row], x=x, y=y, cell=(y//fine)*n+x//fine, offset=(y % fine)*fine+x % fine)
-                out = heads([moved if i == row else t for i, t in enumerate(targets)])['by_head']
-                total += w*float(out['cell'][row]+out['offset'][row])
-                weights.append(w)
-        expected = total/sum(weights)
-        actual = float(smoothed['by_head']['cell'][row]+smoothed['by_head']['offset'][row])
-        self.assertAlmostEqual(actual, expected, places=9)
-        self.assertLess(actual, float(exact['by_head']['cell'][row]+exact['by_head']['offset'][row])+5)
-
-    def test_distance_scaled_position_width_is_the_fixed_width_for_that_order(self):
-        """clamp(k*d, min, max), d from the selected units' centre, scores each order like that fixed width."""
-        from training_preparation import order_distance, position_width, validate_smoothing
-        config, obs, terrain = fixture('fast')
-        policy = NeuralPolicy(config, 5)
-        rows = examples(policy, obs, terrain)
-        model = TorchPolicyV3(policy, dtype=torch.float64)
-        plain = dict(model.config)
         encoded = [row['encoded'] for row in rows]
         targets = [row['target'] for row in rows]
-        trunk = model.events(encoded)
-
-        def position_terms(width):
-            model.config = dict(plain, target_smoothing={'position': {'default': width}})
-            with torch.no_grad():
-                out = model.teacher_heads(encoded, targets, *trunk)['by_head']
-            return (out['cell']+out['offset']).numpy()
-
-        scaled = {'per_pixel': .25, 'min': .5, 'max': 1.5}
-        validate_smoothing({'position': {'default': scaled, 'rally': 2}})
-        for bad in ({'per_pixel': .25, 'min': 2, 'max': 1}, {'per_pixel': .25, 'min': .5}, {'per_pixel': -1, 'min': 0, 'max': 1}):
-            with self.assertRaises(ValueError):
-                validate_smoothing({'position': {'default': bad}})
-        self.assertEqual((position_width(scaled, None), position_width(scaled, 1), position_width(scaled, 4),
-                          position_width(scaled, 100), position_width(.7, 100)), (.5, .5, 1., 1.5, .7))
-        spatial = [i for i, t in enumerate(targets) if 'x' in t]  # Fast placement smooths builds too.
-        bins = plain['position_bins']
-        widths = []
+        spatial = [i for i, t in enumerate(targets) if 'x' in t]
+        bins = policy.config['position_bins']
+        self.assertTrue(spatial)
         for i in spatial:
             centre = np.asarray(encoded[i]['numeric'])[targets[i]['selection'], :2].mean(axis=0)*bins
             distance = order_distance(encoded[i], targets[i]['selection'], targets[i], bins)
             self.assertAlmostEqual(distance, float(np.hypot(targets[i]['x']+.5-centre[0], targets[i]['y']+.5-centre[1])))
-            widths.append(position_width(scaled, distance))
-        self.assertGreater(len(set(widths)), 1, 'the fixture should give orders different widths')
-        actual = position_terms(scaled)  # Indexed by batch row.
-        for i, width in zip(spatial, widths):
-            self.assertAlmostEqual(float(actual[i]), float(position_terms(width)[i]), places=10)
         self.assertEqual(order_distance(encoded[spatial[0]], [], targets[spatial[0]], bins), None)
 
     def test_distance_to_click_is_the_predicted_distribution_scored_pixel_by_pixel(self):

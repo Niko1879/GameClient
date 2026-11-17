@@ -103,3 +103,4 @@ __pycache__/
 # Local notes (agent and user) and things set aside during cleanups.
 /notes/
 /.archive/
+/.secrets/

@@ -27,45 +27,6 @@ class PreparationSpec:
         self.reference = reference or NeuralPolicy(config, parameters=False)
 
 
-def validate_smoothing(smoothing):
-    """config['target_smoothing'] (optional): Gaussian widths that let near misses cost little.
-
-    {'delay': ticks, 'angle': angle bins, 'position': {kind or 'default': grid pixels}}; any
-    part may be left out (exact targets there). Position widths are in position_bins pixels
-    (about 10 world units on a 2,700-unit map); a kind without a width, or 0, stays exact.
-    A position width may instead scale with the order's length,
-    {'per_pixel': k, 'min': a, 'max': b}: clamp(k*d, a, b), where d is the pixel distance from
-    the selected units' centre to the target (a when nothing is selected).
-    """
-    if not isinstance(smoothing, dict) or not set(smoothing) <= {'delay', 'angle', 'position'}:
-        raise ValueError('target_smoothing takes delay, angle and position')
-    positions = smoothing.get('position', {})
-    if not isinstance(positions, dict):
-        raise ValueError('target_smoothing position widths are per kind')
-    widths = [smoothing.get('delay', 0), smoothing.get('angle', 0)]
-    for width in positions.values():
-        if isinstance(width, dict):
-            if set(width) != {'per_pixel', 'min', 'max'}:
-                raise ValueError('A distance-scaled width takes per_pixel, min and max')
-            widths += list(width.values())
-            if all(isinstance(w, (int, float)) for w in width.values()) and width['min'] > width['max']:
-                raise ValueError('A distance-scaled width needs min <= max')
-        else:
-            widths.append(width)
-    if not all(isinstance(w, (int, float)) and not isinstance(w, bool) and np.isfinite(w) and 0 <= w <= 16
-               for w in widths):
-        raise ValueError('target_smoothing widths must be numbers in [0, 16]')
-
-
-def position_width(width, distance):
-    """A kind's Gaussian width in pixels: fixed, or clamp(per_pixel*distance, min, max)."""
-    if not isinstance(width, dict):
-        return width
-    if distance is None:
-        return width['min']
-    return min(max(width['per_pixel']*distance, width['min']), width['max'])
-
-
 def order_distance(row, selected, target, bins):
     """Pixel distance from the selected units' centre to a position target; None without units.
 
@@ -76,48 +37,6 @@ def order_distance(row, selected, target, bins):
         return None
     centre = np.asarray(row['numeric'])[np.asarray(selected), :2].mean(axis=0)*bins
     return float(np.hypot(target['x']+.5-centre[0], target['y']+.5-centre[1]))
-
-
-def soft_targets(mask, choices, sigma, values, period=None):
-    """(rows, classes) Gaussian target weights around each choice, over legal classes only."""
-    mask, values = np.asarray(mask, dtype=bool), np.asarray(values, dtype=np.float64)
-    distance = np.abs(values[None, :]-values[np.asarray(choices)][:, None])
-    if period is not None:
-        distance = np.minimum(distance, period-distance)
-    weights = np.exp(-.5*(distance/sigma)**2)*mask
-    weights[weights < 1e-4] = 0  # Beyond ~4.3 sigma: nothing worth a log-probability gather.
-    return weights/weights.sum(axis=1, keepdims=True)
-
-
-def soft_positions(targets, legal_cells, widths, config, exact, distances=None):
-    """Sparse Gaussian targets on the position grid: (row, cell, offset, weight) arrays.
-
-    Rows in `exact` (or whose kind has no width) keep their single teacher pixel. The cell
-    and offset terms of the joint 256x256 distribution are scored from these entries.
-    `distances` (per row, pixels or None) sizes distance-scaled widths.
-    """
-    n, bins = config['map_side'], config['position_bins']
-    fine = bins//n
-    rows, cells, offsets, weights = [], [], [], []
-    for row, (target, legal) in enumerate(zip(targets, legal_cells)):
-        sigma = position_width(widths.get(target['kind'], widths.get('default', 0)),
-                               None if distances is None else distances[row])
-        if row in exact or not sigma:
-            points, w = np.array([[target['x'], target['y']]]), np.ones(1)
-        else:
-            radius = int(np.ceil(4.3*sigma))
-            dx, dy = np.meshgrid(np.arange(-radius, radius+1), np.arange(-radius, radius+1))
-            points = np.stack([target['x']+dx.ravel(), target['y']+dy.ravel()], axis=1)
-            w = np.exp(-.5*((dx.ravel()**2+dy.ravel()**2)/sigma**2))
-            inside = (points >= 0).all(axis=1) & (points < bins).all(axis=1) & (w >= 1e-4)
-            points, w = points[inside], w[inside]
-            cell = (points[:, 1]//fine)*n+points[:, 0]//fine
-            keep = np.asarray(legal, dtype=bool)[cell]
-            points, w = points[keep], w[keep]
-        x, y = points[:, 0], points[:, 1]
-        rows.append(np.full(len(w), row)); cells.append((y//fine)*n+x//fine)
-        offsets.append((y % fine)*fine+x % fine); weights.append(w/w.sum())
-    return np.concatenate(rows), np.concatenate(cells), np.concatenate(offsets), np.concatenate(weights)
 
 
 def microbatches(rows, pair_budget, cost=MICROBATCH_COST):
@@ -279,9 +198,6 @@ def teacher_plan(spec, encoded, teachers, entity_count):
     delay_masks = [delay_mask(config, row.get('event_rate', 60)) for row in encoded]
     choices = [t.get('delay', int(np.flatnonzero(mask)[0])) for t, mask in zip(teachers, delay_masks)]
     categorical('event_delay', delay_masks, choices)
-    smoothing = config.get('target_smoothing') or {}
-    if smoothing.get('delay'):
-        add('event_delay_soft', soft_targets(delay_masks, choices, smoothing['delay'], config['delay_ticks']), 'float')
     add('delay_known', ['delay' in t for t in teachers], 'float')
     add('all_verbs', [KINDS.index(t['kind']) for t in teachers])
     add('conditional_mask', verbs[:, 1:], 'bool')
@@ -349,28 +265,15 @@ def teacher_plan(spec, encoded, teachers, entity_count):
     if len(indices):
         mask, choices = np.ones((len(indices), config['angle_bins']), dtype=bool), [targets[i]['angle'] for i in indices]
         categorical('angle', mask, choices, indices)
-        if smoothing.get('angle'):
-            bins = config['angle_bins']
-            add('angle_soft', soft_targets(mask, choices, smoothing['angle'], np.arange(bins), period=bins), 'float')
     indices = branch('spatial', lambda t: command_target(config, t) == 'position')
     if len(indices):
         add('spatial_range', np.arange(len(indices)))
         categorical('cell', [legal[i]['cell'] for i in indices], [targets[i]['cell'] for i in indices], indices)
         categorical('offset', [legal[i]['offset'] for i in indices], [targets[i]['offset'] for i in indices], indices)
-        # Order lengths (pixels, None without units): distance-scaled widths and the
-        # validation report's distance-to-click bands (train_events.position_report).
+        # Order lengths (pixels, None without units): the validation report's
+        # distance-to-click bands (train_events.position_report).
         distances = [order_distance(rows[i], selected[i], targets[i], config['position_bins']) for i in indices]
         plan['order_distances'] = distances
-        if smoothing.get('position'):
-            # Full-mask builds know legal offsets only inside the teacher's cell: kept exact.
-            exact = {j for j, i in enumerate(indices)
-                     if config['placement_mode'] == 'full_mask' and targets[i]['kind'] == 'build'}
-            entries = soft_positions([targets[i] for i in indices], [legal[i]['cell'] for i in indices],
-                                     smoothing['position'], config, exact, distances)
-            for name, value, dtype in zip(('rows', 'cells', 'offsets', 'weights'), entries,
-                                          ('int64', 'int64', 'int64', 'float')):
-                add('position_soft_'+name, value, dtype)
-            add('position_soft_exact', [j in exact for j in range(len(indices))], 'bool')
         if config['placement_mode'] == 'full_mask':
             build_spatial = [j for j, i in enumerate(indices) if targets[i]['kind'] == 'build']
             add('build_spatial', build_spatial)

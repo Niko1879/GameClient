@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 import signal
+import sys
 import shutil
 import time
 import zipfile
@@ -29,6 +30,8 @@ from training_preparation import MICROBATCH_COST, PreparationSpec, microbatches,
 
 
 PRECISIONS = ('fp32', 'tf32', 'bf16', 'fp16')
+# Share of VRAM the caching allocator may reserve on Windows/HIP (see EventLearner); CUDA needs no cap.
+WINDOWS_HIP_MEMORY_FRACTION = 0.95
 
 # Game-time buckets (minutes) for validation by phase: late-game coverage is thin.
 PHASES = ((0, 5), (5, 10), (10, 15), (15, 20), (20, 30), (30, None))
@@ -233,14 +236,8 @@ def loss_terms(config, target, by_head, counts):
     return terms
 
 
-def event_losses(model, rows, output, *, exact=False):
-    """Equal decision examples; token averages keep large selections bounded.
-
-    exact=True scores the exact teacher targets of heads trained with target smoothing
-    (config['target_smoothing']), so reported NLL stays comparable between runs.
-    """
-    if exact and output.get('exact_by_head'):
-        output = {**output, 'by_head': {**output['by_head'], **output['exact_by_head']}}
+def event_losses(model, rows, output):
+    """Equal decision examples; token averages keep large selections bounded."""
     weights = model.config.get('argument_loss_weights', {})
     factors = {}
     for name in output['by_head']:
@@ -268,15 +265,17 @@ class EventLearner:
         if (reference.config.get('architecture') != ARCHITECTURE or threads < 1 or pair_budget < 1
                 or precision not in PRECISIONS or (precision != 'fp32' and device != 'cuda')):
             raise ValueError('Invalid event learner configuration')
-        if 'target_smoothing' in reference.config:
-            from training_preparation import validate_smoothing
-            validate_smoothing(reference.config['target_smoothing'])
         torch.set_num_threads(threads)
         torch.set_float32_matmul_precision('high' if precision == 'tf32' else 'highest')
         if device == 'cuda':
             torch.backends.cudnn.conv.fp32_precision = 'tf32' if precision == 'tf32' else 'ieee'
             # The unit head's fused LSTM runs through cuDNN, whose RNN default is TF32.
             torch.backends.cudnn.rnn.fp32_precision = 'tf32' if precision == 'tf32' else 'ieee'
+            if os.name == 'nt' and torch.version.hip is not None:
+                # Windows/HIP grants allocations past VRAM from system RAM instead of failing, so the caching
+                # allocator never frees and retries as it does on CUDA: on the 12 GB Radeon it spilled up to 11 GB
+                # (16 Nov 2026) while tensors peaked at 9.3 GB. A cap restores CUDA's free-and-retry behaviour.
+                torch.cuda.set_per_process_memory_fraction(WINDOWS_HIP_MEMORY_FRACTION)
         self.torch, self.reference = torch, reference
         self.ranks = ranks or SingleProcess()
         self.outliers = []  # Extreme-loss decisions since train() last wrote them.
@@ -334,8 +333,9 @@ class EventLearner:
         totals = Counter()
         # Predictions and losses stay on the device until the update is queued,
         # then come back in one transfer: no synchronisation per microbatch.
-        decisions, delays, losses_by_part, heads_by_part, smoothed_sums = [], [], [], [], []
+        decisions, delays, losses_by_part, heads_by_part = [], [], [], []
         position_errors = []  # Validation only: (part, expected, mode) distance-to-click.
+        wait_sums = []  # Validation only: summed p(wait), the expected number of waits.
         # A rank's share of a global batch is divided by the whole batch's rows.
         rows_total = prepared.get('global_rows', prepared['rows'])
         if train:
@@ -356,18 +356,16 @@ class EventLearner:
                                              position_metrics=not train)
                 if 'position_errors' in output:
                     position_errors.append((part, *output['position_errors']))
+                if 'wait_probability' in output:
+                    wait_sums.append(output['wait_probability'].sum())
                 losses = event_losses(model, rows, output)
                 if train:
                     self.scaler.scale(losses.sum()/rows_total).backward()
                 decisions.append(output['predictions'][0][2].detach())
                 delays.append(next(item[2] for item in output['predictions'] if item[0] == 'delay').detach())
-                # Reported NLL, outliers and best-checkpoint selection use exact targets.
-                if output.get('exact_by_head'):
-                    smoothed_sums.append(losses.detach().sum())
-                    losses = event_losses(model, rows, output, exact=True)
                 losses_by_part.append(losses.detach())
-                heads = {**output['by_head'], **output.get('exact_by_head', {})}
-                heads_by_part.append(({name: value.detach() for name, value in heads.items()}, output['head_counts']))
+                heads_by_part.append(({name: value.detach() for name, value in output['by_head'].items()},
+                                      output['head_counts']))
                 # Release the preceding microbatch's graph before allocating
                 # the next one's tensors.
                 del hidden, entities, spatial, output, losses
@@ -389,15 +387,12 @@ class EventLearner:
                 totals['updates'] = 1
         if losses_by_part:
             guesses = torch.cat([torch.stack([d, e]) for d, e in zip(decisions, delays)], dim=1).cpu().numpy()
-            # After the rows: the smoothed-loss total (with target smoothing), then the gradient norm.
-            extra = ([torch.stack(smoothed_sums).sum().reshape(1).to(losses_by_part[0].dtype)] if smoothed_sums else [])
-            values = torch.cat(losses_by_part+extra+([norm.reshape(1).to(losses_by_part[0].dtype)] if norm is not None else []))
+            # After the rows: the gradient norm.
+            values = torch.cat(losses_by_part+([norm.reshape(1).to(losses_by_part[0].dtype)] if norm is not None else []))
         else:  # This rank's share of a small final batch was empty; it still joined the update.
             guesses = np.zeros((2, 0), dtype=np.int64)
             values = norm.reshape(1).float() if norm is not None else torch.zeros(0)
         values = values.cpu().numpy()
-        if smoothed_sums:
-            totals['smoothed_loss_sum'] += float(values[sum(len(p['rows']) for p in prepared['microbatches'])])
         start = 0
         for index, (part, row_losses) in enumerate(zip(prepared['microbatches'], np.split(values, np.cumsum([len(p['rows']) for p in
                                                                                        prepared['microbatches']])))):
@@ -407,6 +402,8 @@ class EventLearner:
             start += len(rows)
             totals['microbatches'] += 1
             totals['entity_pair_work'] += len(rows)*part['entity_count']**2
+        if wait_sums:
+            totals['expected_defers'] += float(torch.stack(wait_sums).sum())
         if position_errors:  # One transfer for the whole update.
             sizes = [len(expected) for _, expected, _ in position_errors]
             errors = torch.stack([torch.cat([e for _, e, _ in position_errors]),
@@ -440,7 +437,7 @@ class EventLearner:
                 hidden, entities, spatial = (value.float() for value in trunk)
                 output = model.teacher_heads(None, [row['target'] for row in rows], hidden, entities, spatial,
                                              loss_only=True, plan=plain['plan'])
-                losses = event_losses(model, rows, output, exact=True)
+                losses = event_losses(model, rows, output)
                 results[name] = losses[torch.as_tensor(extreme, device=losses.device)].float().cpu().numpy()
         return results
 
@@ -634,10 +631,11 @@ def summarize(counts):
     return {**{k: v for k, v in counts.items() if not k.startswith(('minute:', 'rating:', 'general:', 'position:', 'position_length:'))},
             'by_minute': by_minute, 'by_rating': by_rating, 'by_general': by_general, **positions,
             'mean_nll': counts['loss_sum']/max(1, counts['decisions']),
-            # The training objective under target smoothing; mean_nll scores exact targets.
-            **({'mean_smoothed_loss': counts['smoothed_loss_sum']/max(1, counts['decisions'])}
-               if 'smoothed_loss_sum' in counts else {}),
             'decision_accuracy': counts['correct']/max(1, counts['decisions']),
+            # Validation: the model's expected wait share next to the humans' (calibration of acting vs waiting).
+            **({'wait_share': counts['defers']/max(1, counts['decisions']),
+                'expected_wait_share': counts['expected_defers']/max(1, counts['decisions'])}
+               if 'expected_defers' in counts else {}),
             'command_accuracy': counts['commands_correct']/max(1, counts['commands']),
             'delay_mae_ticks': counts['delay_abs_ticks']/max(1, counts['delay_labels'])}
 
@@ -1014,7 +1012,18 @@ def train(args, ranks=None):
                     status = 'resource_limit'
                     return False
                 learner.set_lr(rates.at(learner.step_count))
-                update = learner.run(update_inputs, train=True)
+                try:
+                    update = learner.run(update_inputs, train=True)
+                except learner.torch.OutOfMemoryError:
+                    update = None  # Retried outside the handler, so the traceback's tensors are freed first.
+                if update is None:
+                    # Under the Windows/HIP cap a fragmented cache can refuse an allocation that fits once the
+                    # cached blocks are handed back (16 Nov 2026: 9.0 GB allocated + 2.0 GB cached-but-free, 1.07
+                    # GB asked). One flush and retry; a second refusal is a real shortage and raises.
+                    learner.optimizer.zero_grad(set_to_none=True)
+                    learner.torch.cuda.empty_cache()
+                    print('out of memory: flushed the allocator cache and retried the update', file=sys.stderr, flush=True)
+                    update = learner.run(update_inputs, train=True)
                 counts.update(update); round_counts.update(update)
                 cursor = following
                 interrupted, due = ranks.any(stop_requested, time.monotonic()-checkpoint_time >= args.checkpoint_seconds)
@@ -1033,8 +1042,13 @@ def train(args, ranks=None):
     def validation_round(fraction):
         """Validate, record the round and adjust the schedule; None when interrupted, else improved."""
         nonlocal status, round_counts, resumed_round
-        if learner.model.device.type == 'cuda':
+        cuda = learner.model.device.type == 'cuda'
+        if cuda:
             torch.cuda.synchronize()
+            # Hand training's cached blocks back before validation's differently shaped batches, and validation's
+            # back after it. Windows/HIP never fails an allocation past VRAM: it spills to system RAM (up to 11 GB
+            # on the 12 GB Radeon, 16 Nov 2026), so the caching allocator never frees on its own.
+            torch.cuda.empty_cache()
         train_seconds = time.monotonic()-round_start
         validation_start = time.monotonic()
         validation = Counter()
@@ -1052,6 +1066,9 @@ def train(args, ranks=None):
                 validation.update(learner.run(update_inputs, train=False))
         finally:
             stream.close()
+            if cuda:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
         validation = ranks.merge(validation)
         if not validation['decisions'] and patience:
             raise ValueError('Validation split contains no supervised decisions')

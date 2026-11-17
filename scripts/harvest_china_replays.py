@@ -437,10 +437,13 @@ class Archive:
         previous = self.db.execute("SELECT candidate,status FROM matches WHERE id=?",
                                    (row["match_id"],)).fetchone()
         if previous:
-            known = json.loads(previous[0]).get("replay_url")
+            old = json.loads(previous[0])
+            known = old.get("replay_url")
             if row["replay_url"] is None and known:
                 # Listings no longer carry links: keep the known one and its backoff.
                 row = {**row, "replay_url": known}
+            if old.get("api_replay_url") and "api_replay_url" not in row:
+                row = {**row, "api_replay_url": old["api_replay_url"]}  # from strata_api.py inject
             changed_url = known != row["replay_url"]
             self.db.execute("UPDATE matches SET candidate=? WHERE id=?", (json.dumps(row), row["match_id"]))
             if changed_url and previous[1] == "error":
@@ -517,11 +520,19 @@ class Archive:
         detail = client.request(row["url"]).decode("utf-8")
         version = version_metadata(detail)
         advertised, pack_url = version["crc"], version["data_pack_url"]
-        # The match page is authoritative; a listing link is the fallback.
-        replay_url = next(iter(replay_links(detail)), None) or row["replay_url"]
-        if replay_url is None:
+        # The match page is authoritative; the Strata API link (strata_api.py inject) and then the listing link are
+        # fallbacks, also when an earlier link is gone (404: 16 Nov 2026, some page links 404 while the API's work).
+        links = list(dict.fromkeys(u for u in (next(iter(replay_links(detail)), None), row.get("api_replay_url"),
+                                               row["replay_url"]) if u))
+        if not links:
             raise ValueError("Match page has no replay link yet")
-        data = client.request(replay_url)
+        for number, replay_url in enumerate(links):
+            try:
+                data = client.request(replay_url)
+                break
+            except HTTPError as error:
+                if error.code != 404 or number == len(links)-1:
+                    raise
         header = parse_replay(data)
         if advertised and header["exe_crc"] != advertised:
             raise ValueError(f"Advertised CRC {advertised} differs from replay {header['exe_crc']}")
