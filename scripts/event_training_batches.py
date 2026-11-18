@@ -319,7 +319,8 @@ class PreparedReader:
                 owner, kind, value = results.get(timeout=1)
             except Empty:
                 if not process.is_alive():
-                    raise RuntimeError('Event update reader exited without a result') from None
+                    # Negative: the signal that ended it (-11 a native crash, -9 killed from outside).
+                    raise RuntimeError(f'Event update reader exited without a result (exit code {process.exitcode})') from None
                 continue
             if kind == 'error':
                 raise RuntimeError('Event update reader failed:\n'+value)
