@@ -116,7 +116,10 @@ void changeObservedPlayer(Player* player)
 {
 	TheControlBar->setObserverLookAtPlayer(player);
 
-	const Bool canBeginObservePlayer = TheGlobalData->m_enablePlayerObserver && TheGhostObjectManager->trackAllPlayers();
+	const Bool skirmishObserver = TheGameLogic->isInSkirmishGame() &&
+		ThePlayerList->getLocalPlayer()->isPlayerObserver();
+	const Bool canBeginObservePlayer = (TheGlobalData->m_enablePlayerObserver || skirmishObserver) &&
+		TheGhostObjectManager->trackAllPlayers();
 	const Bool canEndObservePlayer = TheControlBar->getObservedPlayer() != nullptr && TheControlBar->getObserverLookAtPlayer() == nullptr;
 
 	if (canBeginObservePlayer || canEndObservePlayer)
@@ -125,7 +128,8 @@ void changeObservedPlayer(Player* player)
 
 		Player *becomePlayer = player;
 		if (becomePlayer == nullptr)
-			becomePlayer = ThePlayerList->findPlayerWithNameKey(TheNameKeyGenerator->nameToKey("ReplayObserver"));
+			becomePlayer = skirmishObserver ? ThePlayerList->getLocalPlayer() :
+				ThePlayerList->findPlayerWithNameKey(TheNameKeyGenerator->nameToKey("ReplayObserver"));
 		detail::changePlayerCommon(becomePlayer);
 	}
 }

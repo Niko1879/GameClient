@@ -76,6 +76,7 @@ Int GameMain()
 		TheGameEngine->execute();
 	}
 
+	SelfPlayShutdown();
 	// since execute() returned, we are exiting the game
 	delete TheFramePacer;
 	TheFramePacer = nullptr;

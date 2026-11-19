@@ -3988,7 +3988,10 @@ void GameLogic::update()
 	TheFramePacer->setTimeFrozen(TheGameEngine->isTimeFrozen());
 
 	if (TheFramePacer->isTimeFrozen())
+	{
+		SelfPlayPreCommands(TRUE);
 		return;
+	}
 
 	// Note - TerrainLogic update needs to happen after ScriptEngine update, but before object updates.  jba.
 	// This way changes in bridges are noted in the script engine before being cleared in TerrainLogic->update
@@ -4034,6 +4037,11 @@ void GameLogic::update()
 		TheStatsCollector->update();
 	}
 
+	// Menu-driven policy commands are part of the regular skirmish recording.
+	const Bool skirmishActor = SelfPlayIsSkirmishActorActive();
+	if (skirmishActor)
+		SelfPlayPreCommands();
+
 	// Update the Recorder
 	{
 		TheRecorder->UPDATE();
@@ -4041,7 +4049,7 @@ void GameLogic::update()
 
 	// process client commands
 	{
-        SelfPlayPreCommands();
+        if (!skirmishActor) SelfPlayPreCommands();
         SelfPlayRecordCommands();
         TrainingExporterCapturePreCommands();
 		processCommandList(TheCommandList);

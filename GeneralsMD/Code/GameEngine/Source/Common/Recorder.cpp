@@ -474,7 +474,7 @@ void RecorderClass::stopPlayback() {
 void RecorderClass::updateRecord()
 {
 	Bool needFlush = FALSE;
-	static Int lastFrame = -1;
+	UnsignedInt frame = TheGameLogic->getFrame();
 	GameMessage* msg = TheCommandList->getFirstMessage();
 	while (msg != nullptr) {
 		if (msg->getType() == GameMessage::MSG_NEW_GAME &&
@@ -484,7 +484,8 @@ void RecorderClass::updateRecord()
 		{
 			m_originalGameMode = msg->getArgument(0)->integer;
 			DEBUG_LOG(("RecorderClass::updateRecord() - original game is mode %d", m_originalGameMode));
-			lastFrame = 0;
+			// Commands after MSG_NEW_GAME run in the new match's frame zero.
+			frame = 0;
 			GameDifficulty diff = DIFFICULTY_NORMAL;
 			if (msg->getArgumentCount() >= 2)
 				diff = (GameDifficulty)msg->getArgument(1)->integer;
@@ -499,8 +500,7 @@ void RecorderClass::updateRecord()
 		}
 		else if (msg->getType() == GameMessage::MSG_CLEAR_GAME_DATA) {
 			if (m_file != nullptr) {
-				lastFrame = -1;
-				writeToFile(msg);
+				writeToFile(msg, frame);
 				stopRecording();
 				needFlush = FALSE;
 			}
@@ -511,7 +511,7 @@ void RecorderClass::updateRecord()
 				if ((msg->getType() > GameMessage::MSG_BEGIN_NETWORK_MESSAGES) &&
 					(msg->getType() < GameMessage::MSG_END_NETWORK_MESSAGES)) {
 					// Only write the important messages to the file.
-					writeToFile(msg);
+					writeToFile(msg, frame);
 					needFlush = TRUE;
 				}
 			}
@@ -639,7 +639,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 			TheSkirmishGameInfo->setCRCInterval(REPLAY_CRC_INTERVAL);
 			theSlotList = GameInfoToAsciiString(TheSkirmishGameInfo);
 			DEBUG_LOG(("GameInfo String: %s", theSlotList.str()));
-			localIndex = 0;
+			localIndex = TheSkirmishGameInfo->getLocalSlotNum();
 		}
 		else
 		{
@@ -707,7 +707,14 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
  * This will stop the current recording session and close the file. This should always be called at the end of
  * every game.
  */
-void RecorderClass::stopRecording() {
+void RecorderClass::stopRecording(Bool markEnd) {
+	if (markEnd && m_file) {
+		// Playback advances to the final recorded message even when the players
+		// issued no orders near the end. This standard marker is ignored by playback.
+		GameMessage* end = newInstance(GameMessage)(GameMessage::MSG_CLEAR_GAME_DATA);
+		writeToFile(end, TheGameLogic->getFrame());
+		deleteInstance(end);
+	}
 	logGameEnd();
 	if (TheNetwork)
 	{
@@ -774,9 +781,8 @@ void RecorderClass::archiveReplay(AsciiString fileName)
 /**
  * Write this game message to the record file. This also writes the game message's execution frame.
  */
-void RecorderClass::writeToFile(GameMessage* msg) {
+void RecorderClass::writeToFile(GameMessage* msg, UnsignedInt frame) {
 	// Write the frame number for this command.
-	UnsignedInt frame = TheGameLogic->getFrame();
 	m_file->write(&frame, sizeof(frame));
 
 	// Write the command type

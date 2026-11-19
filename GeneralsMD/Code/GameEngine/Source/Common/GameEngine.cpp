@@ -33,6 +33,7 @@
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Common/SelfPlay.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Team.h"
@@ -1023,8 +1024,9 @@ void GameEngine::update()
 			}
 		}
 
+		SelfPlayUpdate();
 		// TheSuperHackers @info Ignores frozen time because the script engine needs updating in the logic update regardless.
-		if (canUpdateGameLogic(FramePacer::IgnoreFrozenTime))
+		if (canUpdateGameLogic(FramePacer::IgnoreFrozenTime) && !SelfPlayWaitingForActor())
 		{
 			TheGameLogic->UPDATE();
 

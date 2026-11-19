@@ -37,6 +37,7 @@
 #include "Common/PlayerTemplate.h"
 #include "Common/QuotedPrintable.h"
 #include "Common/RandomValue.h"
+#include "Common/SelfPlay.h"
 #include "Common/SkirmishBattleHonors.h"
 #include "Common/SkirmishPreferences.h"
 #include "GameLogic/GameLogic.h"
@@ -463,11 +464,23 @@ void reallyDoStart()
 }
 
 Bool sandboxOk = FALSE;
+static Int neuralSlot = -1;
+// The model plays the China generals the exporter observes and it was trained on.
+static Bool neuralFaction(Int playerTemplate)
+{
+	if (playerTemplate < 0 || playerTemplate >= ThePlayerTemplateStore->getPlayerTemplateCount())
+		return FALSE;
+	const AsciiString name = ThePlayerTemplateStore->getNthPlayerTemplate(playerTemplate)->getName();
+	return name == "FactionChina" || name == "FactionChinaTankGeneral" || name == "FactionChinaNukeGeneral";
+}
+static constexpr Int neuralChoice = 5;
+
 static void startPressed()
 {
 
 	BOOL isReady = FALSE;
-	Int playerCount = TheSkirmishGameInfo->getNumPlayers();
+	Int playerCount = TheSkirmishGameInfo->getNumNonObserverPlayers();
+	const Bool observer = TheSkirmishGameInfo->getConstSlot(0)->getPlayerTemplate() == PLAYERTEMPLATE_OBSERVER;
 	AsciiString lowerMap = TheSkirmishGameInfo->getMap();
 	lowerMap.toLower();
 	std::map<AsciiString, MapMetaData>::iterator it = TheMapCache->find(lowerMap);
@@ -475,8 +488,16 @@ static void startPressed()
 	{
 		buttonPushed = FALSE;
 		MessageBoxOk(TheGameText->fetch("GUI:ErrorStartingGame"), TheGameText->fetch("GUI:CantFindMap"), nullptr);
+		return;
 	}
 	MapMetaData mmd = it->second;
+	if (observer && (!mmd.m_isMultiplayer || playerCount < 2))
+	{
+		buttonPushed = FALSE;
+		MessageBoxOk(TheGameText->fetch("GUI:ErrorStartingGame"),
+			UnicodeString(L"An observer needs a skirmish map and at least two active players."), nullptr);
+		return;
+	}
 	if(playerCount > mmd.m_numPlayers)
 	{
 		buttonPushed = FALSE;
@@ -498,6 +519,50 @@ static void startPressed()
 
 	if(isReady)
 	{
+		if (neuralSlot >= 0)
+		{
+			Int rival = -1;
+			for (Int slot = 0; slot < MAX_SLOTS; ++slot)
+			{
+				const GameSlot* other = TheSkirmishGameInfo->getConstSlot(slot);
+				if (slot != neuralSlot && other->isOccupied() && other->getPlayerTemplate() != PLAYERTEMPLATE_OBSERVER)
+					rival = slot;
+			}
+			GameSlot* model = TheSkirmishGameInfo->getSlot(neuralSlot);
+			if (!neuralFaction(model->getPlayerTemplate()))
+			{
+				buttonPushed = FALSE;
+				MessageBoxOk(TheGameText->fetch("GUI:ErrorStartingGame"),
+					UnicodeString(L"Neural AI plays China, Tank General or Nuke General."), nullptr);
+				return;
+			}
+			if (!mmd.m_isMultiplayer || playerCount != 2 || rival < 0 ||
+				(model->getTeamNumber() >= 0 && model->getTeamNumber() == TheSkirmishGameInfo->getConstSlot(rival)->getTeamNumber()))
+			{
+				buttonPushed = FALSE;
+				MessageBoxOk(TheGameText->fetch("GUI:ErrorStartingGame"),
+					UnicodeString(L"Neural AI requires two opposing players on a skirmish map."), nullptr);
+				return;
+			}
+			if (!SelfPlayStartSkirmish(neuralSlot, rival))
+			{
+				buttonPushed = FALSE;
+				MessageBoxOk(TheGameText->fetch("GUI:ErrorStartingGame"),
+					UnicodeString(L"Could not start Neural AI. See neural-ai.log in the game profile."), nullptr);
+				return;
+			}
+			// Represent the model in a replay using the standard human command stream.
+			const Int color = model->getColor(), position = model->getStartPos();
+			const Int team = model->getTeamNumber(), faction = model->getPlayerTemplate();
+			model->setState(SLOT_PLAYER, UnicodeString(L"Neural AI"), neuralSlot + 1);
+			model->setColor(color);
+			model->setStartPos(position);
+			model->setTeamNumber(team);
+			model->setPlayerTemplate(faction);
+			model->setAccept();
+			model->setMapAvailability(TRUE);
+			TheSkirmishGameInfo->setUseStats(FALSE);
+		}
 		reallyDoStart();
 	}
 
@@ -876,12 +941,13 @@ void updateMapStartSpots( GameInfo *myGame, GameWindow *buttonMapStartPositions[
 
 static void handlePlayerSelection(int index)
 {
-  if( index == 0 || index >=MAX_SLOTS)
+  if( !doUpdateSlotList || index == 0 || index >=MAX_SLOTS)
     return;
 
 	GameWindow *combo = comboBoxPlayer[index];
 	Int playerType, selIndex;
 	GadgetComboBoxGetSelectedPos(combo, &selIndex);
+	if (selIndex < 0) return;
   UnicodeString title = GadgetComboBoxGetText(combo);
 	playerType = (Int)GadgetComboBoxGetItemData(combo, selIndex);
 	GameInfo *myGame = TheSkirmishGameInfo;
@@ -891,7 +957,23 @@ static void handlePlayerSelection(int index)
 		GameSlot * slot = myGame->getSlot(index);
     if(!slot)
       return;
-    slot->setState(SlotState(playerType), title);
+		if (playerType == neuralChoice)
+		{
+			if (neuralSlot >= 0 && neuralSlot != index)
+				myGame->getSlot(neuralSlot)->setState(SLOT_BRUTAL_AI, TheGameText->fetch("GUI:HardAI"));
+			neuralSlot = index;
+			slot->setState(SLOT_BRUTAL_AI, title);
+			// Vanilla China by default; China, Tank and Nuke General stay selectable.
+			if (!neuralFaction(slot->getPlayerTemplate()))
+				for (Int i = 0; i < ThePlayerTemplateStore->getPlayerTemplateCount(); ++i)
+					if (ThePlayerTemplateStore->getNthPlayerTemplate(i)->getName() == AsciiString("FactionChina"))
+						slot->setPlayerTemplate(i);
+		}
+		else
+		{
+			if (neuralSlot == index) neuralSlot = -1;
+			slot->setState(SlotState(playerType), title);
+		}
 
 	}
   //skirmishUpdateSlotList();
@@ -954,6 +1036,8 @@ static void handlePlayerTemplateSelection(int index)
 			return;
 
 		slot->setPlayerTemplate(playerTemplate);
+		if (playerTemplate == PLAYERTEMPLATE_OBSERVER)
+			slot->setStartPos(-1);
 	}
   //skirmishUpdateSlotList();
 }
@@ -1125,6 +1209,11 @@ void InitSkirmishGameGadgets()
       GadgetComboBoxSetItemData(comboBoxPlayer[i], 3, (void *)SLOT_MED_AI);
 			GadgetComboBoxAddEntry(comboBoxPlayer[i],TheGameText->fetch("GUI:HardAI"),white);
       GadgetComboBoxSetItemData(comboBoxPlayer[i], 4, (void *)SLOT_BRUTAL_AI);
+			if (SelfPlayHasSkirmishActor())
+			{
+				const Int item = GadgetComboBoxAddEntry(comboBoxPlayer[i], UnicodeString(L"Neural AI"), white);
+				GadgetComboBoxSetItemData(comboBoxPlayer[i], item, (void *)neuralChoice);
+			}
 			GadgetComboBoxSetSelectedPos(comboBoxPlayer[i],0);
 
 		}
@@ -1164,7 +1253,7 @@ void InitSkirmishGameGadgets()
 	{
 		PopulateColorComboBox(i, comboBoxColor, TheSkirmishGameInfo );
 		GadgetComboBoxSetSelectedPos(comboBoxColor[i], 0);
-		PopulatePlayerTemplateComboBox(i, comboBoxPlayerTemplate, TheSkirmishGameInfo, FALSE );
+		PopulatePlayerTemplateComboBox(i, comboBoxPlayerTemplate, TheSkirmishGameInfo, i == 0);
 		PopulateTeamComboBox(i, comboBoxTeam, TheSkirmishGameInfo );
 
 //		if (buttonStartPosition[i])
@@ -1191,6 +1280,10 @@ void skirmishUpdateSlotList()
     UpdateSlotList( TheSkirmishGameInfo, comboBoxPlayer,
 										comboBoxColor, comboBoxPlayerTemplate,
 									  comboBoxTeam, nullptr, buttonStart, buttonMapStartPosition );
+		if (neuralSlot >= 0)
+		{
+			GadgetComboBoxSetSelectedPos(comboBoxPlayer[neuralSlot], neuralChoice, TRUE);
+		}
 		updateMapStartSpots(TheSkirmishGameInfo, buttonMapStartPosition, FALSE);
     doUpdateSlotList = TRUE;
   }
@@ -1291,6 +1384,7 @@ void SkirmishGameOptionsMenuInit( WindowLayout *layout, void *userData )
 	sliderGameSpeedID = TheNameKeyGenerator->nameToKey( "SkirmishGameOptionsMenu.wnd:SliderGameSpeed" );
 
 	sandboxOk = FALSE;
+	neuralSlot = -1;
   doUpdateSlotList = FALSE;
   if( !TheSkirmishGameInfo )
 	{

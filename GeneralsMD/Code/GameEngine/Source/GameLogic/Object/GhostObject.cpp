@@ -30,6 +30,8 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/Xfer.h"
+#include "Common/Player.h"
+#include "Common/PlayerList.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/GhostObject.h"
 #include "GameLogic/Object.h"
@@ -145,7 +147,9 @@ GhostObjectManager::~GhostObjectManager()
 // ------------------------------------------------------------------------------------------------
 void GhostObjectManager::reset()
 {
-	m_trackAllPlayers = TheGlobalData->m_enablePlayerObserver;
+	const Player* local = ThePlayerList ? ThePlayerList->getLocalPlayer() : nullptr;
+	m_trackAllPlayers = TheGlobalData->m_enablePlayerObserver ||
+		(!TheGlobalData->m_headless && TheGameLogic->isInSkirmishGame() && local && local->isPlayerObserver());
 }
 
 // ------------------------------------------------------------------------------------------------

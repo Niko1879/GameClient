@@ -3,6 +3,7 @@
 #include "Common/TrainingExporter.h"
 #include "Common/TrainingCommands.h"
 #include "Common/BuildAssistant.h"
+#include "Common/FramePacer.h"
 #include "Common/GameEngine.h"
 #include "Common/GlobalData.h"
 #include "Common/MessageStream.h"
@@ -16,6 +17,7 @@
 #include "Common/ThingTemplate.h"
 #include "GameClient/ControlBar.h"
 #include "GameClient/ChallengeGenerals.h"
+#include "GameClient/InGameUI.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/TerrainLogic.h"
@@ -33,7 +35,20 @@ namespace {
 using Json = nlohmann::ordered_json;
 bool enabled = false, live = false, awaitingReset = false, mapPending = false, recording = false;
 bool retaliationPending = false;
+bool headed = false, waitingForStep = false, started = false;
+// Headed play holds the simulation until the model's first answer, so its GPU warm-up
+// (first inference, first placement) costs no game time.
+bool firstStepPending = false;
+int humanSlot = -1;
+int matchSlots[2] = {0, 1};
+HANDLE actorJob = nullptr, actorInput = nullptr, actorOutput = nullptr;
+bool actorReady = false;
+ULONGLONG actorStartup = 0;
+Json headedRequest, terminalState;
+std::string pipeInput;
 unsigned nextDecision = 0, maxFrames = 36000;
+unsigned observedFrame = 0;
+Json actionFrame;
 int requestID = 0;
 int playerIndices[2] = {-1, -1};
 bool botSlots[2] = {false, false};
@@ -56,7 +71,36 @@ bool skirmishFaction(const PlayerTemplate *p)
 void send(Json response)
 {
     response["request_id"] = requestID;
-    std::cout << "GAI " << response.dump() << std::endl;
+    std::string line = "GAI " + response.dump() + "\n";
+    if (actorInput) {
+        DWORD written = 0;
+        if (!WriteFile(actorInput, line.data(), static_cast<DWORD>(line.size()), &written, nullptr)
+            || written != line.size()) throw CloseEnvironment();
+    } else {
+        std::cout << line << std::flush;
+    }
+}
+Json pollRequest()
+{
+    constexpr size_t maxRequest = 1024 * 1024;
+    const HANDLE input = actorOutput ? actorOutput : GetStdHandle(STD_INPUT_HANDLE);
+    char buffer[4096];
+    while (pipeInput.find('\n') == std::string::npos) {
+        DWORD available = 0, bytes = 0;
+        if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr))
+            throw CloseEnvironment();
+        if (!available) return nullptr;
+        if (!ReadFile(input, buffer, std::min<DWORD>(available, sizeof(buffer)), &bytes, nullptr) || !bytes)
+            throw CloseEnvironment();
+        pipeInput.append(buffer, bytes);
+        require(pipeInput.size() <= maxRequest, "Request too large");
+    }
+    const size_t end = pipeInput.find('\n');
+    std::string line = pipeInput.substr(0, end);
+    pipeInput.erase(0, end + 1);
+    Json request = Json::parse(line);
+    require(request.is_object(), "Expected request object");
+    return request;
 }
 Json receive()
 {
@@ -107,7 +151,7 @@ GameMessage *message(GameMessage::Type type, int player)
 void stopRecording()
 {
     // Close the file before the final state is sent, so the client can move it.
-    if (recording && TheRecorder->getMode() == RECORDERMODETYPE_RECORD) TheRecorder->stopRecording();
+    if (recording && TheRecorder->getMode() == RECORDERMODETYPE_RECORD) TheRecorder->stopRecording(TRUE);
     recording = false;
     for (GameMessage *m : pendingCRCs) deleteInstance(m);
     pendingCRCs.clear();
@@ -267,7 +311,7 @@ void identifyPlayers()
 {
     for (int slot = 0; slot < 2; ++slot) {
         AsciiString name;
-        name.format("player%d", slot);
+        name.format("player%d", matchSlots[slot]);
         playerIndices[slot] = -1;
         for (int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
             Player *p = ThePlayerList->getNthPlayer(i);
@@ -276,6 +320,8 @@ void identifyPlayers()
         require(playerIndices[slot] >= 0, "Could not identify controlled player");
     }
 }
+bool controlledSlot(int slot) { return !botSlots[slot] && slot != humanSlot; }
+
 Json state()
 {
     identifyPlayers();
@@ -284,7 +330,8 @@ Json state()
     for (int slot = 0; slot < 2; ++slot) {
         const int i = playerIndices[slot];
         dead[slot] = ThePlayerList->getNthPlayer(i)->isPlayerDead();
-        observations[std::to_string(i)] = Json::parse(TrainingObservationJSON(i));
+        if (!actorJob || controlledSlot(slot))
+            observations[std::to_string(i)] = Json::parse(TrainingObservationJSON(i));
     }
     const bool terminated = dead[0] || dead[1];
     const bool truncated = !terminated && TheGameLogic->getFrame() >= maxFrames;
@@ -296,8 +343,9 @@ Json state()
                      {"terminated", terminated}, {"truncated", truncated},
                      {"action_feedback", lastFeedback}};
     response["controlled_players"] = Json::array();
+    if (headed) response["action_frame"] = actionFrame;
     for (int slot = 0; slot < 2; ++slot)
-        if (!botSlots[slot]) response["controlled_players"].push_back(playerIndices[slot]);
+        if (controlledSlot(slot)) response["controlled_players"].push_back(playerIndices[slot]);
     if (mapPending) {
         response["map"] = Json::parse(TrainingMapJSON());
         response["observation_policy"] = Json::parse(TrainingObservationPolicyJSON());
@@ -324,7 +372,7 @@ void step(const Json &request)
         require(it.key() == std::to_string(playerIndices[0]) || it.key() == std::to_string(playerIndices[1]),
                 "Unknown controlled player");
         for (int slot = 0; slot < 2; ++slot)
-            require(!botSlots[slot] || it.key() != std::to_string(playerIndices[slot]), "Cannot command a built-in AI player");
+            require(controlledSlot(slot) || it.key() != std::to_string(playerIndices[slot]), "Cannot command this player");
         require(it.value().is_array() && it.value().size() <= 16, "At most 16 actions per player/step");
     }
     lastFeedback = Json::array();
@@ -349,7 +397,9 @@ void step(const Json &request)
             TrainingObserveValidation(player, feedback.dump());
         }
     }
-    nextDecision = TheGameLogic->getFrame() + ticks;
+    const unsigned frame = TheGameLogic->getFrame();
+    nextDecision = headed ? std::max(frame + 1, observedFrame + ticks) : frame + ticks;
+    actionFrame = frame;
 }
 void reset(const Json &request)
 {
@@ -358,7 +408,8 @@ void reset(const Json &request)
     const std::string opponent = request.value("opponent_kind", std::string("policy"));
     const std::string faction = request.value("opponent_faction", std::string("random"));
     const int learningSide = request.value("learning_side", 0);
-    require(opponent == "policy" || opponent == "hard_ai", "Unknown opponent kind");
+    require(headed ? (opponent == "human" || opponent == "hard_ai") :
+                     (opponent == "policy" || opponent == "hard_ai"), "Unknown opponent kind");
     require(learningSide == 0 || learningSide == 1, "Learning side must be 0 or 1");
     int china = -1, botFaction = PLAYERTEMPLATE_RANDOM;
     for (int i = 0; i < ThePlayerTemplateStore->getPlayerTemplateCount(); ++i) {
@@ -367,7 +418,7 @@ void reset(const Json &request)
         if (skirmishFaction(p) && p->getName() == AsciiString(faction.c_str())) botFaction = i;
     }
     require(china >= 0, "Vanilla China faction unavailable");
-    require(opponent != "hard_ai" || faction == "random" || botFaction >= 0, "Unknown playable opponent faction");
+    require(opponent == "policy" || faction == "random" || botFaction >= 0, "Unknown playable opponent faction");
     // Policy slots play vanilla China unless policy_factions names one of the China generals the
     // exporter observes (vanilla, Tank, Nuke) per slot (three-faction evaluation, 15 Nov 2026).
     int policyFaction[2] = {china, china};
@@ -400,16 +451,30 @@ void reset(const Json &request)
     TheSkirmishGameInfo->init();
     TheSkirmishGameInfo->reset();
     TheSkirmishGameInfo->enterGame();
+    humanSlot = opponent == "human" ? 1 - learningSide : -1;
+    const int observerSlot = headed && opponent == "hard_ai" ? 2 : -1;
     for (int i = 0; i < MAX_SLOTS; ++i) TheSkirmishGameInfo->getSlot(i)->setState(SLOT_CLOSED);
     for (int slot = 0; slot < 2; ++slot) {
         UnicodeString name;
-        name.format(L"Agent%d", slot);
+        if (headed)
+            name = slot == humanSlot ? L"Player" : L"Neural AI";
+        else
+            name.format(L"Agent%d", slot);
         GameSlot *s = TheSkirmishGameInfo->getSlot(slot);
         botSlots[slot] = opponent == "hard_ai" && slot != learningSide;
         // SLOT_BRUTAL_AI is the UI's Hard difficulty (DIFFICULTY_HARD).
         s->setState(botSlots[slot] ? SLOT_BRUTAL_AI : SLOT_PLAYER, name, slot + 1);
-        s->setColor(slot); s->setStartPos(slot); s->setPlayerTemplate(botSlots[slot] ? botFaction : policyFaction[slot]); s->setTeamNumber(-1);
+        s->setColor(slot); s->setStartPos(slot);
+        s->setPlayerTemplate(controlledSlot(slot) ? policyFaction[slot] : botFaction);
+        s->setTeamNumber(-1);
         s->setAccept(); s->setMapAvailability(TRUE);
+    }
+    if (observerSlot >= 0) {
+        GameSlot *s = TheSkirmishGameInfo->getSlot(observerSlot);
+        s->setState(SLOT_PLAYER, UnicodeString(L"Observer"), observerSlot + 1);
+        s->setPlayerTemplate(PLAYERTEMPLATE_OBSERVER);
+        s->setAccept();
+        s->setMapAvailability(TRUE);
     }
     Money cash;
     cash.deposit(request.value("starting_cash", 10000u), FALSE);
@@ -417,7 +482,8 @@ void reset(const Json &request)
     TheSkirmishGameInfo->setMap(map.c_str());
     TheSkirmishGameInfo->setSeed(seed);
     TheSkirmishGameInfo->setUseStats(FALSE);
-    TheSkirmishGameInfo->setLocalIP(opponent == "hard_ai" ? learningSide + 1 : 1);
+    TheSkirmishGameInfo->setLocalIP((observerSlot >= 0 ? observerSlot :
+        humanSlot >= 0 ? humanSlot : opponent == "hard_ai" ? learningSide : 0) + 1);
     TheSkirmishGameInfo->startGame(0);
     TheWritableGlobalData->m_pendingFile = map.c_str();
     TrainingObservationReset();
@@ -426,12 +492,18 @@ void reset(const Json &request)
     m->appendIntegerArgument(GAME_SKIRMISH);
     m->appendIntegerArgument(DIFFICULTY_NORMAL);
     m->appendIntegerArgument(0);
+    if (headed) m->appendIntegerArgument(LOGICFRAMES_PER_SECOND);
     // Let newly spawned objects perform their initialization update before
     // accepting policy orders; a frame-zero dozer order can be overwritten.
     nextDecision = 1;
     lastFeedback = Json::array();
+    actionFrame = nullptr;
     mapPending = true;
     retaliationPending = true;
+    waitingForStep = false;
+    firstStepPending = headed;
+    terminalState = nullptr;
+    headedRequest = nullptr;
     episodeSetup = {{"opponent_kind", opponent}, {"opponent_faction", faction}, {"learning_side", learningSide},
                     {"policy_factions", policyFactions},
                     {"starting_cash", request.value("starting_cash", 10000u)}, {"record_replay", recording}};
@@ -459,16 +531,190 @@ Json actionMenus()
     }
     return menus;
 }
+
+Json handshake()
+{
+    return {{"event", "ready"}, {"protocol_version", 1}, {"headed", headed},
+            {"ticks_per_second", static_cast<int>(LOGICFRAMES_PER_SECOND)},
+            {"engine_ini_crc", TheGlobalData->m_iniCRC},
+            {"observation_policy", Json::parse(TrainingObservationPolicyJSON())}};
+}
+
+void closeActor()
+{
+    if (actorJob) CloseHandle(actorJob);
+    if (actorInput) CloseHandle(actorInput);
+    if (actorOutput) CloseHandle(actorOutput);
+    actorJob = actorInput = actorOutput = nullptr;
+    actorReady = false;
+    live = headed = started = waitingForStep = firstStepPending = false;
+    headedRequest = terminalState = nullptr;
+    pipeInput.clear();
+}
 } // namespace
 
 void SelfPlayConfigure() { enabled = true; }
 Bool SelfPlayIsEnabled() { return enabled; }
+
+Bool SelfPlayHasSkirmishActor()
+{
+    return GetEnvironmentVariableW(L"GENERALS_NEURAL_ACTOR", nullptr, 0) > 1;
+}
+
+Bool SelfPlayIsSkirmishActorActive() { return actorJob != nullptr; }
+Bool SelfPlayWaitingForActor()
+{
+    return (actorJob && started && !actorReady)
+        || (headed && firstStepPending && waitingForStep && headedRequest.is_null());
+}
+
+Bool SelfPlayStartSkirmish(Int modelSlot, Int opponentSlot)
+{
+    const DWORD length = GetEnvironmentVariableW(L"GENERALS_NEURAL_ACTOR", nullptr, 0);
+    if (length <= 1 || length > 32767) return FALSE;
+    std::wstring command(length, L'\0');
+    const DWORD copied = GetEnvironmentVariableW(L"GENERALS_NEURAL_ACTOR", command.data(), length);
+    if (!copied || copied >= length) return FALSE;
+
+    closeActor();
+    SECURITY_ATTRIBUTES inheritable = {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE childInput = nullptr, childOutput = nullptr;
+    AsciiString logPath = TheGlobalData->getPath_UserData();
+    logPath.concat("neural-ai.log");
+    const HANDLE log = CreateFileA(logPath.str(), GENERIC_WRITE, FILE_SHARE_READ, &inheritable,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    PROCESS_INFORMATION child = {};
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdError = log;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    actorJob = CreateJobObjectW(nullptr, nullptr);
+    bool ok = log != INVALID_HANDLE_VALUE && actorJob &&
+        SetInformationJobObject(actorJob, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
+        CreatePipe(&childInput, &actorInput, &inheritable, 1024 * 1024) &&
+        CreatePipe(&actorOutput, &childOutput, &inheritable, 65536) &&
+        SetHandleInformation(actorInput, HANDLE_FLAG_INHERIT, 0) &&
+        SetHandleInformation(actorOutput, HANDLE_FLAG_INHERIT, 0);
+    if (ok) {
+        startup.hStdInput = childInput;
+        startup.hStdOutput = childOutput;
+        ok = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
+                            CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child) &&
+             AssignProcessToJobObject(actorJob, child.hProcess) &&
+             ResumeThread(child.hThread) != static_cast<DWORD>(-1);
+    }
+    if (childInput) CloseHandle(childInput);
+    if (childOutput) CloseHandle(childOutput);
+    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+    if (child.hProcess) {
+        if (!ok) TerminateProcess(child.hProcess, 1);
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+    }
+    if (!ok) {
+        closeActor();
+        return FALSE;
+    }
+    headed = live = mapPending = retaliationPending = firstStepPending = true;
+    actorStartup = GetTickCount64();
+    matchSlots[0] = modelSlot;
+    matchSlots[1] = opponentSlot;
+    const GameSlot *opponent = TheSkirmishGameInfo->getConstSlot(opponentSlot);
+    humanSlot = opponent->isHuman() ? 1 : -1;
+    botSlots[0] = false;
+    botSlots[1] = humanSlot < 0;
+    maxFrames = 3600000;
+    nextDecision = 1;
+    requestID = 0;
+    lastFeedback = Json::array();
+    actionFrame = nullptr;
+    const PlayerTemplate *faction = opponent->getPlayerTemplate() >= 0 ?
+        ThePlayerTemplateStore->getNthPlayerTemplate(opponent->getPlayerTemplate()) : nullptr;
+    episodeSetup = {{"opponent_kind", humanSlot < 0 ? "hard_ai" : "human"}, {"learning_side", 0},
+                    {"opponent_faction", faction ? faction->getName().str() : "random"}};
+    TrainingObservationReset();
+    try {
+        send(handshake());
+    } catch (const CloseEnvironment &) {
+        closeActor();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void SelfPlayShutdown()
+{
+    if (actorJob) closeActor();
+}
+
+void SelfPlayUpdate()
+{
+    if (!headed || TheGameEngine->getQuitting()) return;
+    try {
+        if (actorJob && !actorReady && GetTickCount64() - actorStartup > 60000)
+            throw CloseEnvironment();
+        if (live && started && TheGameLogic->getGameMode() != GAME_SKIRMISH) {
+            if (actorJob) {
+                closeActor();
+                return;
+            }
+            throw CloseEnvironment();
+        }
+        Json request = pollRequest();
+        if (request.is_null()) return;
+        requestID = request.at("request_id").get<int>();
+        const std::string command = request.at("command").get<std::string>();
+        if (actorJob && !actorReady) {
+            require(command == "start", "Expected model startup acknowledgement");
+            actorReady = true;
+            return;
+        }
+        if (command == "close") {
+            stopRecording();
+            send({{"event", "closed"}});
+            throw CloseEnvironment();
+        }
+        if (!live && !started) {
+            require(command == "reset", "Expected reset or close");
+            reset(request);
+        } else if (!terminalState.is_null()) {
+            require(command == "step" && waitingForStep, "Episode has ended");
+            waitingForStep = false;
+            send(terminalState);
+        } else {
+            require(command == "step" && waitingForStep && headedRequest.is_null(), "Expected step or close");
+            headedRequest = std::move(request);
+        }
+    } catch (const CloseEnvironment &) {
+        if (actorJob) {
+            closeActor();
+            TheInGameUI->messageNoFormat(UnicodeString(L"Neural AI stopped. See neural-ai.log in the game profile."));
+        } else {
+            live = false;
+            TheGameEngine->setQuitting(TRUE);
+        }
+    } catch (const std::exception &e) {
+        if (actorJob) {
+            closeActor();
+            TheInGameUI->messageNoFormat(UnicodeString(L"Neural AI protocol error. See neural-ai.log in the game profile."));
+        } else {
+            send({{"event", "error"}, {"message", e.what()}});
+        }
+    }
+}
 
 void SelfPlayRecordCommands()
 {
     // After policy commands are injected and before they execute, matching the
     // frame a normal game records them on. Also records MSG_NEW_GAME and CRCs.
     if (!enabled || !recording) return;
+    if (headed) {
+        // The client propagates CRCs and human input through the regular message stream.
+        TheRecorder->updateRecord();
+        return;
+    }
     // Logic CRCs go to TheMessageStream, which this loop never propagates. A normal
     // client propagates a frame-F CRC into the frame-F+1 command list, and replay
     // playback aligns CRCs on that latency, so hold each one for one frame.
@@ -485,20 +731,52 @@ void SelfPlayRecordCommands()
     TheRecorder->updateRecord();
 }
 
-void SelfPlayPreCommands()
+void SelfPlayPreCommands(Bool endOnly)
 {
-    if (!enabled || !live || !TheGameLogic->isInGame()) return;
+    if (!live || (endOnly && !headed) || TheGameLogic->getGameMode() != GAME_SKIRMISH) return;
+    if (actorJob && !actorReady) {
+        if (!started) TheInGameUI->messageNoFormat(UnicodeString(L"Loading Neural AI..."));
+        started = true;
+        return;
+    }
     const unsigned frame = TheGameLogic->getFrame();
+    if (headed && !terminalState.is_null()) return;
     identifyPlayers();
     const bool ended = ThePlayerList->getNthPlayer(playerIndices[0])->isPlayerDead()
         || ThePlayerList->getNthPlayer(playerIndices[1])->isPlayerDead();
+    if (endOnly && !ended && frame < maxFrames) return;
+    if (headed) {
+        started = true;
+        if (!headedRequest.is_null()) {
+            Json request = std::move(headedRequest);
+            headedRequest = nullptr;
+            firstStepPending = false;
+            if (!ended && frame < maxFrames) {
+                try {
+                    step(request);
+                } catch (const std::exception &e) {
+                    send({{"event", "error"}, {"message", e.what()}});
+                    return;
+                }
+            } else {
+                lastFeedback = Json::array();
+                actionFrame = nullptr;
+            }
+            waitingForStep = false;
+        }
+        if (waitingForStep && frame < maxFrames && !ended) return;
+        if (waitingForStep) {
+            lastFeedback = Json::array();
+            actionFrame = nullptr;
+        }
+    }
     if (frame < nextDecision && frame < maxFrames && !ended) return;
     if (retaliationPending) {
         // A human client posts its retaliation option (on by default) as a game
         // message; replays record it. Controlled slots get that same default.
         retaliationPending = false;
         for (int slot = 0; slot < 2; ++slot) {
-            if (botSlots[slot]) continue;
+            if (!controlledSlot(slot)) continue;
             GameMessage *m = message(GameMessage::MSG_ENABLE_RETALIATION_MODE, playerIndices[slot]);
 #if RETAIL_COMPATIBLE_CRC
             m->appendIntegerArgument(playerIndices[slot]);
@@ -509,6 +787,25 @@ void SelfPlayPreCommands()
     Json response = state();
     const bool over = response["terminated"].get<bool>() || response["truncated"].get<bool>();
     if (over) stopRecording();
+    if (headed) {
+        if (actorJob && over) {
+            closeActor();
+            return;
+        }
+        if (over) terminalState = response;
+        if (!waitingForStep) {
+            try {
+                send(std::move(response));
+                observedFrame = frame;
+            } catch (const CloseEnvironment &) {
+                closeActor();
+                TheInGameUI->messageNoFormat(UnicodeString(L"Neural AI stopped. See neural-ai.log in the game profile."));
+                return;
+            }
+            waitingForStep = !over;
+        }
+        return;
+    }
     send(response);
     if (over) throw LeaveEpisode();
     for (;;) {
@@ -534,24 +831,31 @@ void SelfPlayPreCommands()
 
 Int SelfPlayRun()
 {
-    if (!TheGlobalData->m_headless || !TheGlobalData->m_simulateReplays.empty() || TrainingExporterIsEnabled()) {
-        printf("Self-play requires -headless, without -replay or -exportTraining.\n");
+    if (!TheGlobalData->m_simulateReplays.empty() || TrainingExporterIsEnabled()) {
+        printf("Self-play cannot be combined with -replay or -exportTraining.\n");
         return 1;
     }
+    headed = !TheGlobalData->m_headless;
     Json factions = Json::array();
     for (int i = 0; i < ThePlayerTemplateStore->getPlayerTemplateCount(); ++i) {
         const PlayerTemplate *p = ThePlayerTemplateStore->getNthPlayerTemplate(i);
         // Match normal skirmish/random selection, including locked generals.
         if (skirmishFaction(p)) factions.push_back(p->getName().str());
     }
-    send({{"event", "ready"}, {"protocol_version", 1}, {"playable_factions", factions},
-          {"placement_angle_bins", 16}, {"action_menus", actionMenus()},
-          {"ticks_per_second", static_cast<int>(LOGICFRAMES_PER_SECOND)},
-          {"engine_git_sha", static_cast<const char *>(GitSHA1)}, {"engine_git_dirty", GitUncommittedChanges},
-          {"engine_exe_crc", TheGlobalData->m_exeCRC}, {"engine_ini_crc", TheGlobalData->m_iniCRC},
-          {"template_catalog", Json::parse(TrainingTemplateCatalogJSON())},
-          {"command_catalog", training_commands::catalog()},
-          {"observation_policy", Json::parse(TrainingObservationPolicyJSON())}});
+    Json ready = handshake();
+    ready.update({{"playable_factions", factions}, {"placement_angle_bins", 16}, {"action_menus", actionMenus()},
+                  {"engine_git_sha", static_cast<const char *>(GitSHA1)}, {"engine_git_dirty", GitUncommittedChanges},
+                  {"engine_exe_crc", TheGlobalData->m_exeCRC}, {"template_catalog", Json::parse(TrainingTemplateCatalogJSON())},
+                  {"command_catalog", training_commands::catalog()}});
+    send(std::move(ready));
+    if (headed) {
+        TheFramePacer->enableLogicTimeScale(TRUE);
+        TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+        TheGameEngine->execute();
+        live = false;
+        stopRecording();
+        return 0;
+    }
     try {
         for (;;) {
             try {

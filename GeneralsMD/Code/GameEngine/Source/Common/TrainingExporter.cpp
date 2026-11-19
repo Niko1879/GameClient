@@ -1,5 +1,6 @@
 #include "PreRTS.h"
 #include "Common/TrainingExporter.h"
+#include "Common/SelfPlay.h"
 #include "Common/ReplayLogic.h"
 #include "Common/TrainingCommands.h"
 #include "Common/TrainingSightingMemory.h"
@@ -1444,9 +1445,16 @@ void TrainingObservationReset()
     directScratch.gridCells.clear();
 }
 
+// Event hooks feed live observations too: headless export and self-play, and a model
+// playing in a window (-selfPlay -win or the Skirmish Neural AI slot). Ordinary games skip them.
+static bool observingEvents()
+{
+    return TheGlobalData && (TheGlobalData->m_headless || SelfPlayIsEnabled() || SelfPlayIsSkirmishActorActive());
+}
+
 void TrainingObserveObjectRemoval(const Object *object)
 {
-    if (!TheGlobalData || !TheGlobalData->m_headless || !ThePlayerList || !object) return;
+    if (!observingEvents() || !ThePlayerList || !object) return;
     const unsigned id = static_cast<unsigned>(object->getID());
     for (int player = 0; player < MAX_PLAYER_COUNT; ++player)
         if (training_sightings::retireObserved(sightings[player], directSightings[player], id,
@@ -1456,7 +1464,7 @@ void TrainingObserveObjectRemoval(const Object *object)
 
 void TrainingObserveSpecialPower(const Object *source, const SpecialPowerTemplate *power, const Coord3D *target)
 {
-    if (!TheGlobalData || !TheGlobalData->m_headless || !ThePlayerList || !source || !power) return;
+    if (!observingEvents() || !ThePlayerList || !source || !power) return;
     const Player *owner = source->getControllingPlayer();
     if (!owner) return;
     const unsigned frame = TheGameLogic->getFrame();
@@ -1487,7 +1495,7 @@ void TrainingObserveSpecialPower(const Object *source, const SpecialPowerTemplat
 
 void TrainingObserveCommand(const GameMessage *message, const AIGroup *selection)
 {
-    if (!TheGlobalData->m_headless) return;
+    if (!observingEvents()) return;
     const GameMessage::Type type = message->getType();
     // The contiguous gameplay region excludes all selection/hotkey bookkeeping.
     if (type < GameMessage::MSG_DO_ATTACKSQUAD || type > GameMessage::MSG_ENABLE_RETALIATION_MODE) return;
