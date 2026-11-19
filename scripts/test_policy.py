@@ -7,6 +7,7 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -319,6 +320,40 @@ class AgreementTests(unittest.TestCase):
             actual = parameter.grad.numpy() if parameter.grad is not None else np.zeros_like(policy.parameters[name].data)
             reference = np.zeros_like(actual) if reference is None else reference
             np.testing.assert_allclose(actual, reference, atol=3e-9, rtol=3e-8, err_msg=name)
+
+    def test_live_torch_head_probabilities_and_sampling(self):
+        from torch_live_policy import TorchLivePolicy
+
+        config, observation, terrain = fixture('fast')
+        reference = NeuralPolicy(config, 5)
+        devices = ['cpu', 'cuda'] if os.environ.get('GENERALS_TEST_GPU') == '1' else ['cpu']
+        rows = examples(reference, observation, terrain)
+
+        def run(policy, row, *, teacher=None):
+            distributions = []
+
+            def capture(logits, mask, **draw):
+                masked = np.where(mask, logits.data, -np.inf)
+                probabilities = np.exp(masked - masked.max())
+                distributions.append(probabilities / probabilities.sum())
+                return categorical(logits, mask, **draw)
+
+            with patch('generals_policy.categorical', capture), no_grad():
+                result = policy.decide(row, teacher=teacher, rng=np.random.default_rng(15))
+            return result[:2], distributions
+
+        for device in devices:
+            live = TorchLivePolicy(reference, device=device)
+            for row in rows:
+                row['encoded']['ratings'] = rating_inputs(1900, 1600)
+                for teacher in (row['target'], None):
+                    with self.subTest(device=device, kind=row['target']['kind'], teacher=teacher is not None):
+                        expected, probabilities = run(reference, row['encoded'], teacher=teacher)
+                        actual, actual_probabilities = run(live, row['encoded'], teacher=teacher)
+                        self.assertEqual(actual, expected)
+                        self.assertEqual(len(probabilities), len(actual_probabilities))
+                        for left, right in zip(actual_probabilities, probabilities):
+                            np.testing.assert_allclose(left, right, atol=2e-6, rtol=2e-5)
 
     def test_order_distance_is_from_the_selected_units_centre(self):
         """The validation report's order length: pixels from the selected units' centre to the target."""

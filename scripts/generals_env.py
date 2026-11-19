@@ -1,4 +1,4 @@
-"""Synchronous, two-player headless Generals environment; standard library only."""
+"""Two-player Generals environment with headless and windowed engines."""
 from __future__ import annotations
 
 import json
@@ -8,29 +8,36 @@ from pathlib import Path
 import queue
 import subprocess
 import threading
+from time import perf_counter
 
 
 class EnvironmentError(RuntimeError):
     pass
 
 
+class EngineClosed(EnvironmentError):
+    """The game process exited successfully while the client was waiting."""
+
+
 class GeneralsEnv:
     """One engine process per environment. Policies maintain separate memory per player.
 
     reset() and step() return a joint state; each policy is handed only
-    state['observations'][str(player)]. No game time passes between requests.
+    state['observations'][str(player)]. A headed engine continues to simulate
+    while a policy decides and validates the resulting action at execution time.
     """
-    def __init__(self, executable, *, timeout=60, log_path=None):
+    def __init__(self, executable, *, timeout=60, log_path=None, headed=False):
         self.executable = Path(executable).resolve()
         self.timeout = timeout
         self.players = []
         self.controlled_players = []
         self.done = True
+        self.headed = headed
         self.request_id = 0
         self.responses = queue.Queue()
         self.log = Path(log_path).open('w', encoding='utf-8') if log_path else None
         self.process = subprocess.Popen(
-            [str(self.executable), '-headless', '-selfPlay', '-noshellmap'],
+            [str(self.executable), '-win' if headed else '-headless', '-selfPlay', '-noshellmap'],
             cwd=self.executable.parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
@@ -44,6 +51,8 @@ class GeneralsEnv:
             self.metadata = self._response(0)
             if self.metadata.get('event') != 'ready' or self.metadata.get('protocol_version') != 1:
                 raise EnvironmentError('Unsupported environment handshake')
+            if headed and self.metadata.get('headed') is not True:
+                raise EnvironmentError('Executable does not support headed self-play')
         except BaseException:
             self.close(force=True)
             raise
@@ -60,14 +69,21 @@ class GeneralsEnv:
                     self.log.write(line)
                     self.log.flush()
         finally:
-            self.responses.put(EnvironmentError('Engine output closed'))
+            try:
+                status = self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                status = self.process.poll()
+            self.responses.put(EngineClosed('Game window closed') if status == 0 else
+                               EnvironmentError(f'Engine output closed (exit code {status})'))
 
-    def _response(self, request_id):
+    def _response(self, request_id, *, wait_while_paused=False):
         try:
-            response = self.responses.get(timeout=self.timeout)
+            response = self.responses.get(timeout=None if wait_while_paused else self.timeout)
         except queue.Empty:
             self.close(force=True)
             raise EnvironmentError(f'Engine response timed out after {self.timeout}s') from None
+        if isinstance(response, EngineClosed):
+            raise response
         if isinstance(response, BaseException):
             raise EnvironmentError(str(response))
         if response.get('request_id') != request_id:
@@ -83,8 +99,10 @@ class GeneralsEnv:
             self.process.stdin.write(json.dumps(request, allow_nan=False) + '\n')
             self.process.stdin.flush()
         except (BrokenPipeError, OSError):
+            if self.process.poll() == 0:
+                raise EngineClosed('Game window closed') from None
             raise EnvironmentError('Engine process is unavailable') from None
-        return self._response(self.request_id)
+        return self._response(self.request_id, wait_while_paused=self.headed and command == 'step')
 
     def reset(self, map_path, *, seed=1, max_frames=36000, starting_cash=10000,
               opponent_kind='policy', opponent_faction='random', learning_side=0, record_replay=False,
@@ -96,7 +114,8 @@ class GeneralsEnv:
         map_path = Path(map_path).resolve()
         if not map_path.is_file():
             raise ValueError(f'Map does not exist: {map_path}')
-        if opponent_kind not in ('policy', 'hard_ai') or learning_side not in (0, 1):
+        opponents = ('human', 'hard_ai') if self.headed else ('policy', 'hard_ai')
+        if opponent_kind not in opponents or learning_side not in (0, 1):
             raise ValueError('Invalid opponent kind or learning side')
         result = self._request('reset', map=str(map_path), seed=seed,
                                max_frames=max_frames, starting_cash=starting_cash,
@@ -184,12 +203,15 @@ def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, t
     if env.metadata['observation_policy']['version'] != OBSERVATION_VERSION:
         raise EnvironmentError('Runtime observation version differs from the policy')
     placement = placement_options(policies)
+    if getattr(env, 'headed', False) and any(p.policy.config['placement_mode'] == 'full_mask' for p in policies):
+        raise ValueError('Headed play requires fast build placement')
     state = env.reset(map_path, seed=seed, max_frames=max_frames, opponent_kind=opponent_kind,
                       opponent_faction=opponent_faction, learning_side=learning_side,
                       record_replay=record_replay, policy_factions=policy_factions)
     map_features = state['map']
     if len(policies) != len(env.controlled_players):
         raise ValueError('Expected one policy per controlled player')
+    setup = state.get('setup', {})
     for slot, (player, policy) in enumerate(zip(env.controlled_players, policies)):
         policy.reset()
         policy.configure_clock(env.metadata['ticks_per_second'])
@@ -210,25 +232,55 @@ def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, t
                'execution_settings': placement, 'controlled_players': env.controlled_players,
                'setup': state.get('setup', {})})
         steps = 0
+        decision_ms = []
+        closed = False
+        episode_start = perf_counter()
+        if getattr(env, 'headed', False):
+            # The engine holds the game until the first step: compile GPU kernels now.
+            for p, policy in zip(env.controlled_players, policies):
+                warm_up = getattr(getattr(policy, 'policy', None), 'warm_up', None)
+                if warm_up is not None:
+                    warm_up(policy, state['observations'][str(p)], map_features, state['frame'])
         while not env.done:
-            actions = {p: policy.act(state['observations'][str(p)], map_features, state['frame'])
-                       for p, policy in zip(env.controlled_players, policies)}
+            actions = {}
+            for p, policy in zip(env.controlled_players, policies):
+                before = policy.counters['decisions']
+                start = perf_counter()
+                actions[p] = policy.act(state['observations'][str(p)], map_features, state['frame'])
+                if getattr(env, 'headed', False) and policy.counters['decisions'] != before:
+                    decision_ms.append((perf_counter()-start)*1000)
             advance = step_ticks(policies, state['frame'], ticks, env.metadata['ticks_per_second'])
-            successor = env.step(actions, ticks=advance, placement=placement)
+            try:
+                successor = env.step(actions, ticks=advance, placement=placement)
+            except EngineClosed:
+                if not getattr(env, 'headed', False):
+                    raise
+                closed = True
+                break
             for p, policy in zip(env.controlled_players, policies):
                 policy.feedback([f for f in successor['action_feedback'] if f['player'] == p])
             write({'record': 'transition', 'frame': state['frame'], 'next_frame': successor['frame'],
                    'observations': state['observations'], 'actions': actions,
                    'next_observations': successor['observations'], 'rewards': successor['rewards'],
                    'terminated': successor['terminated'], 'truncated': successor['truncated'],
-                   'action_feedback': successor['action_feedback']})
+                   'action_feedback': successor['action_feedback'],
+                   **({'action_frame': successor['action_frame']} if 'action_frame' in successor else {})})
             state = successor
             steps += 1
         summary = {k: state[k] for k in ('frame', 'rewards', 'terminated', 'truncated')}
-        summary.update(steps=steps, setup=state.get('setup', {}), execution_settings=placement,
+        summary.update(steps=steps, setup=setup, execution_settings=placement,
                        event_scheduling={str(p): dict(policy.counters)
                                          for p, policy in zip(env.controlled_players, policies)})
-        write({'record': 'footer', 'completed': True, **summary})
+        if getattr(env, 'headed', False):
+            summary['gameplay_wall_seconds'] = perf_counter()-episode_start
+        if closed:
+            summary.update(window_closed=True, truncated=True)
+        if decision_ms:
+            values = sorted(decision_ms)
+            summary['decision_ms'] = {'count': len(values), 'first': decision_ms[0],
+                'median': values[len(values)//2], 'p95': values[math.ceil(len(values)*.95)-1],
+                'max': values[-1]}
+        write({'record': 'footer', 'completed': not closed, **summary})
         return summary
     finally:
         if stream:

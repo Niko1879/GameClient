@@ -1381,8 +1381,8 @@ class NeuralPolicy:
         for block in range(ACTION_RESIDUAL_BLOCKS):
             # Pre-activation: the branch ends in a linear layer, so a block can subtract from the
             # stream as well as add (a trailing ReLU made every block's update non-negative).
-            y = x.layer_norm().relu() @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']
-            x = x+(y.layer_norm().relu() @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b'])
+            y = self._sample_normalize(x).relu() @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']
+            x = x+(self._sample_normalize(y).relu() @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b'])
         logits = x.relu() @ p['verb_w']*(gate @ p['verb_gate_w']+p['verb_gate_b']).sigmoid()+p['verb_b']
         return logits, hidden @ p['ar_core_w']*(gate @ p['ar_core_gate_w']+p['ar_core_gate_b']).sigmoid()
 
@@ -1393,6 +1393,16 @@ class NeuralPolicy:
         cell = gates[key:2*key].sigmoid()*state[1]+gates[:key].sigmoid()*gates[2*key:3*key].tanh()
         return gates[3*key:].sigmoid()*cell.tanh(), cell
 
+    _sample_array = staticmethod(Tensor)
+    _sample_concat = staticmethod(concatenate)
+    _sample_normalize = staticmethod(Tensor.layer_norm)
+
+    def _sampling_logits(self, logits):
+        return logits
+
+    def _template_embeddings(self):
+        return self.object_embedding(self.encoder.identity.template_objects)
+
     def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False):
         """One decision: action type, delay, then a command's arguments; DEFER has only the first two."""
         from event_schedule import delay_mask
@@ -1401,6 +1411,7 @@ class NeuralPolicy:
         logp, entropy = Tensor(0), Tensor(0)
         def draw(name, logits, mask, override=None):
             nonlocal logp, entropy
+            logits = self._sampling_logits(logits)
             choice = override if override is not None else (teacher.get(name) if teacher is not None else None)
             if name not in ('cell', 'offset'):  # Position: capped in _location.
                 logits = cap_logits(logits, mask)
@@ -1417,7 +1428,7 @@ class NeuralPolicy:
                     KINDS.index(teacher['kind']) if teacher is not None else None)
         one_hot = np.zeros(len(KINDS))
         one_hot[verb] = 1
-        action = (Tensor(one_hot) @ p['ar_verb_w']+p['ar_verb_b']).relu()
+        action = (self._sample_array(one_hot) @ p['ar_verb_w']+p['ar_verb_b']).relu()
         context = core+action @ p['ar_verb_out_w']*(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']).sigmoid()
         x = (context @ p['delay_in_w']+p['delay_in_b']).relu()
         x = (x @ p['delay_hidden_w']+p['delay_hidden_b']).relu()
@@ -1428,7 +1439,7 @@ class NeuralPolicy:
         if teacher is None or 'delay' in teacher:
             one_hot = np.zeros(len(config['delay_ticks']))
             one_hot[delay] = 1
-            x = (Tensor(one_hot) @ p['delay_embed_in_w']+p['delay_embed_in_b']).relu()
+            x = (self._sample_array(one_hot) @ p['delay_embed_in_w']+p['delay_embed_in_b']).relu()
             x = (x @ p['delay_embed_hidden_w']+p['delay_embed_hidden_b']).relu()
             context = context+x @ p['delay_embed_out_w']+p['delay_embed_out_b']
         kind = KINDS[verb]
@@ -1438,13 +1449,13 @@ class NeuralPolicy:
         keys = entity @ p['entity_key_w']
         func = np.zeros(len(config['types']))
         func[np.asarray(encoded['types'])[actors]] = 1
-        func = Tensor(func) @ p['func_w']+p['func_b']
+        func = self._sample_array(func) @ p['func_w']+p['func_b']
         size = head_sizes(config)[2]
-        state = Tensor(np.zeros(size)), Tensor(np.zeros(size))
+        state = self._sample_array(np.zeros(size)), self._sample_array(np.zeros(size))
         for ordinal in range(limit):
             query = ((context @ p['unit_in_w']+p['unit_in_b']+func).relu() @ p['unit_query_w']+p['unit_query_b'])
             state = self._lstm_step(query, state)
-            scores = concatenate([keys @ state[0], (p['unit_end_key'] @ state[0]).reshape((1,))])
+            scores = self._sample_concat([keys @ state[0], (p['unit_end_key'] @ state[0]).reshape((1,))])
             available = self.selection_mask(encoded, kind, selected, actors)
             actor_mask = np.concatenate([available, [ordinal > 0]])
             actor_mask[selected] = False
@@ -1482,7 +1493,7 @@ class NeuralPolicy:
             menu = config['menus'][production_twin(config, actor['type'])+'|'+kind]
             available = self.production_available(actor, kind)
             choices = [t in menu and t in available for t in config['templates']]
-            embeddings = self.object_embedding(self.encoder.identity.template_objects)
+            embeddings = self._template_embeddings()
             index = draw('template', embeddings @ (context @ p['template_query_w']) + p['template_b'], choices)
             action['template'] = self.production_native(actor, kind, config['templates'][index])
             context = context+embeddings[index] @ p['template_context_w']
@@ -1508,7 +1519,7 @@ class NeuralPolicy:
                 cell_mask, _ = categorical_masks(build_mask, n)
             cells, logits = self._location(spatial, context, build_features)
             # One 256x256 distribution, drawn as its map cell and then the offset within it.
-            cell = draw('cell', logits.logsumexp(axis=1), cell_mask)
+            cell = draw('cell', logits.logsumexp(1), cell_mask)
             context = context+cells[:, cell//n, cell%n] @ p['cell_context_w']
             if build_mask is not None:
                 _, offset_mask = categorical_masks(build_mask, n, cell)

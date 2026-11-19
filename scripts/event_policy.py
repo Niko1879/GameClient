@@ -94,6 +94,17 @@ class ScienceBuyer:
         return []
 
 
+def science_buyer(faction):
+    """The science buyer for a China general's own faction: science-orders.json holds vanilla China's
+    trees, so Tank/Nuke sides buy no sciences (user, 15 Nov 2026)."""
+    if faction == 'FactionChina':
+        return ScienceBuyer()
+    buyer = ScienceBuyer()
+    buyer.orders, buyer.default = {}, []
+    buyer.order = []
+    return buyer
+
+
 class EventActor:
     """One instance per player, sharing immutable weights during collection."""
     def __init__(self, policy, seed=1, deterministic=False, science=None):

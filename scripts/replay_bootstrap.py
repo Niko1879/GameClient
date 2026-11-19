@@ -81,11 +81,16 @@ def verify_entry(entry, *, deep=True):
     return manifest
 
 
-def check_live_provenance(metadata, executable_sha256, deployment):
-    """A checkpoint plays only on the engine, INI and tick rate its training data declared."""
-    require(executable_sha256 == deployment['engine_sha256'], 'Live executable differs from declared deployment')
+def check_live_rules(metadata, deployment):
+    """Check the gameplay rules of a local engine chosen for inference."""
     require(metadata['engine_ini_crc'] == deployment['engine_ini_crc'], 'Live INI differs from declared deployment')
     require(metadata['ticks_per_second'] == deployment['ticks_per_second'], 'Live rate differs from declared deployment')
+
+
+def check_live_provenance(metadata, executable_sha256, deployment):
+    """Check the pinned engine as well as its gameplay rules."""
+    require(executable_sha256 == deployment['engine_sha256'], 'Live executable differs from declared deployment')
+    check_live_rules(metadata, deployment)
 
 
 def data_pack(row, root, download=False):
