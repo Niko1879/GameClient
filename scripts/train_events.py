@@ -338,12 +338,13 @@ class EventLearner:
     def run(self, prepared, *, train, split='train'):
         """One update from event_training_batches.assemble's lanes (training_preparation arrays).
 
-        Three stages, so the LSTM runs every lane at once (plan Â§2): the encoder in microbatches
-        (checkpointed: its activations are recomputed in the backward pass), the core over
-        (lanes, steps), then the heads in microbatches (checkpointed). One backward pass.
+        Stages, so the LSTM runs every lane at once within bounded memory, each microbatch's graph
+        freed before the next: the encoder without autograd; the core over (lanes, steps); the
+        heads, each microbatch backpropagated at once into gradients of its inputs; the core's
+        backward; then each encoder microbatch again, with autograd, driven by the gradients its
+        outputs received. The gradients of one backward pass over the whole update.
         split names the carried lane state (None: start every lane from zero, carry nothing)."""
         torch, model = self.torch, self.model
-        from torch.utils.checkpoint import checkpoint
         from torch_training_inputs import head_losses, loss_factors, teacher_heads
         from training_preparation import head_counts
         if 'lanes' not in prepared:  # A plain prepare_update: every row an independent one-step lane.
@@ -367,7 +368,7 @@ class EventLearner:
         position_errors, wait_sums = [], []  # Validation only.
         norm = None
         with torch.set_grad_enabled(train):
-            encoded, places = [], []
+            encoded, places, encoders, pieces = [], [], [], []
             for part in parts:
                 if 'ready' in part:  # Uploaded by StagedUpdates: a GPU-side wait, not a CPU one.
                     torch.cuda.current_stream(model.device).wait_event(part['ready'])
@@ -381,7 +382,12 @@ class EventLearner:
                     with torch.autocast('cuda', dtype=self.autocast or torch.float16, enabled=self.autocast is not None):
                         out = model.encode_inputs(staged, selection)
                     return out['core_input'], out['keys'], out['summary'], out['map']
-                encoded.append(checkpoint(encode, use_reentrant=False) if train else encode())
+                with torch.no_grad():
+                    out = encode()
+                if train:  # Leaves: the heads and the core leave their gradients here.
+                    out = tuple(value.requires_grad_() for value in out)
+                    encoders.append(encode)
+                encoded.append(out)
                 places.append((model.indices(part['lanes']), model.indices(part['steps'])))
             if parts:
                 lane_index, step_index = (torch.cat(values) for values in zip(*places))
@@ -391,25 +397,23 @@ class EventLearner:
                                          [(h.detach(), c.detach()) for h, c in state])
             if split is not None:
                 self.states[split] = [(h.detach(), c.detach()) for h, c in state]
-            total = None
+            core_values = core.detach() if parts else None
             for part, (lane, step), (_, keys, summary, spatial) in zip(parts, places, encoded):
                 rows, plan = part['rows'], part['plan']
-                rows_core = core[lane, step]
+                rows_core = core_values[lane, step]
                 counts = head_counts(plan)
                 names = ['decision', 'delay']+[name for name in ('unit', 'slot', 'target', 'angle', 'cell', 'offset')
                                                if name in plan['categories']]
                 factors = model.stager.stage(loss_factors(model.config, rows, counts, names))
                 if train:
-                    def heads(rows_core, keys, summary, spatial, plan=plan, rows=rows, factors=factors, names=names):
-                        output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
-                                               loss_only=True)
-                        losses = head_losses(model, rows, output['by_head'], None, factors)
-                        return (losses, output['predictions'][0][2], output['predictions'][1][2],
-                                *[output['by_head'][name] for name in names])
-                    losses, decision, delay, *by_head = checkpoint(heads, rows_core, keys, summary, spatial,
-                                                                   use_reentrant=False)
-                    by_head = dict(zip(names, by_head))
-                    total = losses.sum() if total is None else total+losses.sum()
+                    rows_core.requires_grad_()
+                    output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
+                                           loss_only=True)
+                    losses = head_losses(model, rows, output['by_head'], None, factors)
+                    decision, delay = output['predictions'][0][2], output['predictions'][1][2]
+                    by_head = {name: output['by_head'][name] for name in names}
+                    self.scaler.scale(losses.sum()/rows_total).backward()
+                    pieces.append(rows_core.grad)
                 else:
                     output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
                                            loss_only=True, position_metrics=True)
@@ -424,8 +428,11 @@ class EventLearner:
                 heads_by_part.append({name: value.detach() for name, value in by_head.items()})
                 counts_by_part.append(counts)
             if train:
-                if total is not None:
-                    self.scaler.scale(total/rows_total).backward()
+                if parts:
+                    core.backward(torch.zeros_like(core).index_put_((lane_index, step_index), torch.cat(pieces)))
+                    for encode, leaves in zip(encoders, encoded):
+                        driven = [(out, leaf.grad) for out, leaf in zip(encode(), leaves) if leaf.grad is not None]
+                        torch.autograd.backward(*zip(*driven))
                 if self.ranks.rank == 0:  # Once per update, not once per rank.
                     regularization = model.regularization_loss()
                     if regularization.requires_grad:

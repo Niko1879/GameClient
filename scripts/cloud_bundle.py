@@ -71,7 +71,7 @@ WORLD=${WORLD:-1}  # One GPU (user decision, 9 Nov); WORLD=N for data-parallel r
 # 240 x 64 = 15,360, SCC's final batch (plan Â§3).
 LANES=${LANES:-240}
 UNROLL=${UNROLL:-64}
-PART_LANES=${PART_LANES:-8}  # Reader preparation unit: 512 decisions, the old batch's shared-memory size.
+PART_LANES=${PART_LANES:-16}  # Reader preparation unit: 1,024 decisions, so a 512-row chunk cap fills two chunks.
 CACHE_MIB=${CACHE_MIB:-256}  # Decoded chunks each reader keeps while its lanes read their episodes.
 # Reader processes per rank: each rank's main thread needs a core of its own.
 PER_RANK=$(( ($(nproc) - WORLD) / WORLD ))
@@ -86,17 +86,17 @@ MEM_READERS=$(( (MEM_LIMIT / 1048576 - 16384) / (3584 + CACHE_MIB) / WORLD ))
 CPU_READERS=$(( PER_RANK >= 8 ? 8 : (PER_RANK > 1 ? PER_RANK : 1) ))
 READERS=${READERS:-$(( MEM_READERS < CPU_READERS ? (MEM_READERS > 1 ? MEM_READERS : 1) : CPU_READERS ))}
 PRECISION=${PRECISION:-bf16}
-COMPILE=${COMPILE:-1}  # The encoder; the core LSTM and the heads stay eager and FP32.
+COMPILE=${COMPILE:-0}  # --compile crashed against checkpointing and, with empty groups padded, compiled for 7+ minutes (22 Nov).
 # Validation rounds per epoch; PATIENCE counts rounds. One round scores the 500 validation
 # matches' whole episodes in order.
 VALIDATIONS=${VALIDATIONS:-4}
-PATIENCE=${PATIENCE:-4}  # One epoch without a 0.005 gain (user, 12 Nov: stop soon after validation flattens).
+PATIENCE=${PATIENCE:-0}  # 0: early stopping would end a cosine run at its high-LR plateau.
 # SCC's recipe: 1e-3, then x0.1 after 154M decisions (its 40k steps at batch 3,850); warmup ours.
 WARMUP=${WARMUP:-500}
 LR=${LR:-0.001}
-LR_SCHEDULE=${LR_SCHEDULE:-step}
+LR_SCHEDULE=${LR_SCHEDULE:-cosine}  # Cosine to 0 over EPOCHS; PATIENCE must be 0 (user, 22 Nov).
 LR_STEP_DECISIONS=${LR_STEP_DECISIONS:-154000000}
-EPOCHS=${EPOCHS:-10}  # The cap on pool epochs (plan Â§3).
+EPOCHS=${EPOCHS:-8}  # The cap on pool epochs (plan Â§3).
 # Readers hand parts over in shared memory (~4 slots of >= 16 MiB each).
 SHM_MB=$(df -m /dev/shm | awk 'NR==2 {print $4}')
 if [ "$SHM_MB" -lt $(( READERS * WORLD * 400 )) ]; then
@@ -115,7 +115,7 @@ exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json 
   --device cuda --epochs "$EPOCHS" --early-stopping-patience "$PATIENCE" --validations-per-epoch "$VALIDATIONS" \\
   --min-delta 0.005 --seed TRAIN_SEED --threads 1 \\
   --world-size "$WORLD" --lanes "$LANES" --unroll "$UNROLL" --part-lanes "$PART_LANES" --cache-mib "$CACHE_MIB" \\
-  --pair-budget 8000000 --checkpoint-seconds 600 \\
+  --pair-budget 16000000 --checkpoint-seconds 600 \\
   --lr "$LR" --lr-warmup-updates "$WARMUP" --lr-schedule "$LR_SCHEDULE" --precision "$PRECISION" "${EXTRA[@]}" \\
   --reader-processes "$READERS" --prefetch-batches 2 \\
   --min-free-ram-mib 4096 --max-private-mib 1048576 --min-free-disk-gib 10 \\

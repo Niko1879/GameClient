@@ -14,7 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from generals_policy import (ARCHITECTURE, ATTENTION_LAYERS, GROUPS, LOCATION_BLOCKS, LOGIT_CAP, LSTM_LAYERS,
-                             MAP_RESIDUAL_BLOCKS, SCATTER_SCALE, SCATTER_VOLUME, SELECTED_UNIT_DIVISOR,
+                             MAP_POOL, MAP_RESIDUAL_BLOCKS, MAP_STAGES, SCATTER_SCALE, SCATTER_VOLUME, SELECTED_UNIT_DIVISOR,
                              UNDER_ATTACK_COLUMN, UNIT_GROUPS, group_sources, location_order, location_stages, widths)
 
 
@@ -88,7 +88,7 @@ class TorchPolicyV3(nn.Module):
         return self.device.type
 
     def conv(self, values, name, stride=1, padding=0):
-        return F.conv2d(values, self.weights[name], stride=stride, padding=padding)+self.weights[name+'_b']
+        return F.conv2d(values, self.weights[name], self.weights[name+'_b'].flatten(), stride=stride, padding=padding)
 
     # Encoder (plan §1a-1d), one row per observation.
 
@@ -135,34 +135,39 @@ class TorchPolicyV3(nn.Module):
                             + F.embedding(inputs['effect_powers'], p['power_embedding']) @ p['effect_power_w'] + p['effect_b'])
         return entity, tokens.to(entity.dtype)
 
-    def attend(self, q, k, v, valid):
-        """Masked multi-head attention: (batch, queries, inner) over (batch, sources, inner).
+    def attend(self, q, k, v, some, mask):
+        """Masked multi-head attention of (batch, heads, queries, width) over (batch, heads, sources, width).
 
-        A row whose source group is empty gets zeros, as the reference."""
-        heads, width = self.widths['heads'], self.widths['head_width']
-        batch, queries, sources = q.shape[0], q.shape[1], k.shape[1]
-        q = q.reshape(batch, queries, heads, width).transpose(1, 2)
-        k = k.reshape(batch, sources, heads, width).transpose(1, 2)
-        v = v.reshape(batch, sources, heads, width).transpose(1, 2)
-        mask = valid[:, None, None, :]
-        scores = (q @ k.transpose(-1, -2)/math.sqrt(width)).masked_fill(~mask, -torch.inf)
-        scores = torch.where(mask.any(dim=-1, keepdim=True), scores, torch.zeros_like(scores))
-        weights = scores.softmax(dim=-1)*mask
-        return (weights @ v).transpose(1, 2).reshape(batch, queries, heads*width)
+        mask: (batch, 1, 1, sources), with every entry set for a row whose source group is empty;
+        some: (batch, 1, 1) whether it has any, so such a row gets zeros, as the reference."""
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)*some[..., None].to(q.dtype)
 
     def group_transformer(self, groups, valid):
-        """Per-group features after the plan §1b layers; groups[g] is (batch, n_g, d), valid[g] (batch, n_g)."""
+        """Per-group features after the plan's layers; groups[g] is (batch, n_g, d), valid[g] (batch, n_g).
+
+        One projection per group carries its queries to every source and its keys and values for every
+        query group; each (query group, source group) pair is one fused attention."""
         p, x = self.weights, list(groups)
+        heads, width = self.widths['heads'], self.widths['head_width']
+        G = range(len(GROUPS))
+        some = [value.any(dim=-1)[:, None, None] for value in valid]
+        masks = [(value | ~present[:, 0])[:, None, None] for value, present in zip(valid, some)]
         for layer in range(ATTENTION_LAYERS):
-            normed = [self.layer_norm(value, f'attn{layer}_{GROUPS[g]}_ln') for g, value in enumerate(x)]
+            pair = lambda g, s, kind: p[f'attn{layer}_{GROUPS[g]}_{GROUPS[s]}_{kind}']
+            projected = []
+            for g, value in enumerate(x):
+                batch, n, _ = value.shape
+                weight = torch.cat([pair(g, s, 'q') for s in G]+[pair(q, g, kind) for kind in ('k', 'v') for q in G], dim=1)
+                # (batch, n, [q for each source | k for each query group | v for each query group], heads, width)
+                out = self.layer_norm(value, f'attn{layer}_{GROUPS[g]}_ln') @ weight
+                projected.append(out.reshape(batch, n, 3*len(GROUPS), heads, width).permute(2, 0, 3, 1, 4))
             updated = []
             for g, value in enumerate(x):
                 name, ffn = f'attn{layer}_{GROUPS[g]}', f'ffn{layer}_{GROUPS[g]}'
-                parts = []
-                for s in group_sources(g):
-                    pair = f'{name}_{GROUPS[s]}'
-                    parts.append(self.attend(normed[g] @ p[pair+'_q'], normed[s] @ p[pair+'_k'], normed[s] @ p[pair+'_v'], valid[s]))
-                value = value+torch.cat(parts, dim=-1) @ p[name+'_out_w']+p[name+'_out_b']
+                parts = [self.attend(projected[g][s], projected[s][len(GROUPS)+g], projected[s][2*len(GROUPS)+g], some[s], masks[s])
+                         for s in group_sources(g)]
+                parts = torch.cat(parts, dim=1).transpose(1, 2).flatten(2)  # (batch, n, blocks*heads*width)
+                value = value+parts @ p[name+'_out_w']+p[name+'_out_b']
                 hidden = F.relu(self.layer_norm(value, ffn+'_ln') @ p[ffn+'_in_w']+p[ffn+'_in_b'])
                 updated.append(value+hidden @ p[ffn+'_out_w']+p[ffn+'_out_b'])
             x = updated
@@ -195,26 +200,31 @@ class TorchPolicyV3(nn.Module):
     def encode_map(self, inputs, scattered):
         """(1x1 map (batch, map_out, n, n), embedding): NeuralPolicy._encode_map."""
         p, config = self.weights, self.config
-        side = config['map_side']*SCATTER_SCALE
+        side = config['map_side']*SCATTER_SCALE//MAP_POOL
         batch, area = scattered.shape[0], side*side
         pixels, real = inputs['scatter_pixels'], inputs['real']
         counts = torch.zeros((batch, area), dtype=scattered.dtype, device=self.device).scatter_add(1, pixels, real.to(scattered.dtype))
         shares = SCATTER_VOLUME/counts.gather(1, pixels).clamp_min(SCATTER_VOLUME)*real
-        values = scattered*shares[:, :, None]
+        # map_project is a 1x1 convolution of (planes, image of scattered units), so its image part applies to
+        # each unit's values before they are scattered: the same sums without building the concatenated image.
+        project = p['map_project'][:, :, 0, 0]
+        planes_in = project.shape[1]-scattered.shape[-1]
+        values = (scattered*shares[:, :, None]) @ project[:, planes_in:].T
         image = torch.zeros((batch, area, values.shape[-1]), dtype=values.dtype, device=self.device).scatter_add(
             1, pixels[:, :, None].expand(-1, -1, values.shape[-1]), values)
         image = image.reshape(batch, side, side, -1).permute(0, 3, 1, 2)
         # The same planes as generals_policy.map_planes, built here from compact inputs.
         static = inputs['map_statics'][inputs['map_static_index']].permute(0, 2, 1)
-        visibility = F.one_hot(inputs['map_visibility'], 3).permute(0, 2, 1).to(static.dtype)
+        visibility = inputs['map_visibility']
         planes = torch.zeros((batch, 5*area), dtype=static.dtype, device=self.device).scatter_add(
             1, inputs['map_channels']*area+pixels, real.to(static.dtype))
         planes = (planes[:, :4*area].reshape(batch, 4, area)+1).log()/4
         attacked = (inputs['numeric'][:, :, UNDER_ATTACK_COLUMN]*real).to(static.dtype)
         alert = torch.zeros((batch, area), dtype=static.dtype, device=self.device).scatter_add(1, pixels, attacked).clamp_max(1)[:, None]
         maps = torch.cat([static, visibility, planes, alert], dim=1).reshape(batch, -1, side, side)
-        x = F.relu(self.conv(torch.cat([maps.to(image.dtype), image], dim=1), 'map_project'))
-        for stage in range(3):
+        x = F.relu(F.conv2d(maps.to(image.dtype), p['map_project'][:, :planes_in], p['map_project_b'].flatten())+image)
+        x = x.contiguous(memory_format=torch.channels_last)
+        for stage in range(MAP_STAGES):
             x = F.relu(self.conv(x, f'map_down{stage}', 2, 1))
         for block in range(MAP_RESIDUAL_BLOCKS):
             residual = x
@@ -403,7 +413,7 @@ class TorchPolicyV3(nn.Module):
         y = x
         stages = location_stages(config)
         for stage in range(len(stages)):
-            y = F.conv_transpose2d(y, p[f'location_up{stage}'], stride=2, padding=1)+p[f'location_up{stage}_b']
+            y = F.conv_transpose2d(y, p[f'location_up{stage}'], p[f'location_up{stage}_b'].flatten(), stride=2, padding=1)
             if stage < len(stages)-1:
                 y = F.relu(F.layer_norm(y.flatten(1), (y[0].numel(),), eps=1e-5).reshape(y.shape))
         fine = config['position_bins']//n

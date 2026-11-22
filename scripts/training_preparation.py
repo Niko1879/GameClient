@@ -11,18 +11,20 @@ import os
 import numpy as np
 
 from event_schedule import delay_mask
-from generals_policy import (ARMS_FEATURES, DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, UNIT_GROUPS, UNRATED, NeuralPolicy,
-                             arms_inputs, command_target, count_channels, derived_inputs, unit_groups, visible_scalars,
+from generals_policy import (ARMS_FEATURES, DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, MAP_POOL, SCATTER_SCALE, UNIT_GROUPS,
+                             UNRATED, NeuralPolicy, arms_inputs, coarse_pixels, command_target, count_channels, derived_inputs,
+                             pool_grid, unit_groups, visible_scalars,
                              visible_task_commands)
 from training_legality import cached_legality
 
-# Fitted Radeon encoder cost: per microbatch, per padded token, per padded pair.
-MICROBATCH_COST = (12.8e-3, 2.6e-6, 1.4e-9)
+# Modelled encoder cost: per microbatch, per padded token, per padded pair. The fixed cost is the CPU launch
+# time (5090, 22 Nov 2026: 50 ms beat the Radeon fit's 12.8 ms, 24 real updates in 151 s against 163 s).
+MICROBATCH_COST = (50e-3, 2.6e-6, 1.4e-9)
 # Rows per microbatch, whatever the pair budget allows. The budget bounds attention (entities
-# squared), but the 128x128 map encoder and location upsampler grow with rows: early-game rows
-# have ~20 entities, so a whole 512-row batch fit one microbatch and the v11 big model ran out of
-# GPU memory on a 5090 (17 Nov 2026). A split changes only speed: an update's loss is a sum.
-MICROBATCH_ROWS = 128
+# squared), but the map encoder and location upsampler grow with rows. Measured on a 5090 (22 Nov 2026,
+# AlphaGenerals, 240 lanes): 512 peaks at 9.5 GB; 1,024 is no faster (the GPU is the limit by then).
+# A split changes only speed: an update's loss is a sum.
+MICROBATCH_ROWS = 512
 
 
 class PreparationSpec:
@@ -52,8 +54,12 @@ def microbatches(rows, pair_budget, cost=MICROBATCH_COST):
     individually. An update's loss is a sum, so grouping changes only speed.
     """
     fixed, token, pair = cost
-    ordered = sorted(rows, key=lambda row: len(row['encoded']['numeric']))
-    sizes = [len(row['encoded']['numeric']) for row in ordered]
+    # A row's size bounds every group's width: its entities, or its effect tokens when there are more
+    # (rare, up to 3x its entities; they would set the padding of every row they share a chunk with).
+    def size(row):
+        return max(len(row['encoded']['numeric']), len(row['encoded'].get('effect_numeric', ())))
+    ordered = sorted(rows, key=size)
+    sizes = [size(row) for row in ordered]
     best, cut = np.zeros(len(sizes)+1), np.zeros(len(sizes)+1, dtype=np.int64)
     for end in range(1, len(sizes)+1):
         largest = sizes[end-1]
@@ -75,9 +81,23 @@ def available_actions(spec, row):
     return spec.reference.verb_mask(row)
 
 
+def visibility_shares(visibility, side, dtype):
+    """(batch, 3, pooled area): each visibility category's share of the pooled pixel (map_planes)."""
+    coarse = side//MAP_POOL
+    grid = visibility.reshape(len(visibility), side, side)
+    shares = np.zeros((len(visibility), 3, coarse, coarse), dtype=np.uint8)
+    for category in range(3):
+        present = (grid == category).astype(np.uint8)
+        for y in range(MAP_POOL):
+            for x in range(MAP_POOL):  # Strided sums: far cheaper than a sum over two block axes.
+                shares[:, category] += present[:, y::MAP_POOL, x::MAP_POOL]
+    return (shares.astype(dtype)/MAP_POOL**2).reshape(len(visibility), 3, coarse*coarse)
+
+
 def encode_values(spec, encoded):
     """Pad only this chunk's entity dimension; padding never enters attention/pooling."""
     batch, count = len(encoded), max(len(row['numeric']) for row in encoded)
+    side = spec.config['map_side']*SCATTER_SCALE  # Stored grids; the network reads them pooled (MAP_POOL).
     numeric_size = encoded[0]['numeric'].shape[1] + encoded[0]['extra_numeric'].shape[1]
     derived_end = numeric_size+DERIVED_ENTITY_FEATURES
     # Model-only switch, default off (user decision, 12 Nov 2026): without it every row is
@@ -116,7 +136,7 @@ def encode_values(spec, encoded):
         queue_units[index, :length], queue_upgrades[index, :length] = row['queue_units'], row['queue_upgrades']
         upgrades[index, :length] = row['entity_upgrades']
         commands[index, :length], command_states[index, :length] = row['entity_commands'], row['entity_command_states']
-        pixels[index, :length] = row['cells']
+        pixels[index, :length] = coarse_pixels(row['cells'], side)
         valid[index, :length] = True  # Includes the reference's single empty-entity dummy.
         entities = row['entity_count'] if 'entity_count' in row else len(row['entities'])
         real[index, :entities] = True
@@ -124,7 +144,7 @@ def encode_values(spec, encoded):
         terrain = row['map_static']
         if id(terrain) not in static_ids:
             static_ids[id(terrain)] = len(statics)
-            statics.append(terrain)
+            statics.append(pool_grid(np.asarray(terrain).T, side).T)
         static_index[index] = static_ids[id(terrain)]
         own[index, :length] = row['own']
         cached = row.get('_training_legality')
@@ -143,7 +163,7 @@ def encode_values(spec, encoded):
         'pool_hidden': (enemy & ~visible, 'bool'), 'pool_neutral': (neutral, 'bool'),
         'map_channels': (channels, 'int64'),
         'map_statics': (np.stack(statics), 'float'), 'map_static_index': (static_index, 'int64'),
-        'map_visibility': (np.stack([row['map_visibility'] for row in encoded]).astype(np.int64), 'int64'),
+        'map_visibility': (visibility_shares(np.stack([row['map_visibility'] for row in encoded]), side, spec.float_dtype), 'float'),
         'scalars': (visible_scalars(np.stack([row['scalars'] for row in encoded])), 'float'),
         'entity_upgrades': (upgrades, 'int64'),
         'entity_commands': (commands, 'int64'), 'entity_command_states': (command_states, 'float'),

@@ -101,8 +101,11 @@ ARMS_FEATURES = WEAPON_SLOTS*(1+7+ANTI_BITS+DAMAGE_TYPES)+1+DAMAGE_TYPES
 # A unit counts as under attack on the alert map for this long after taking damage.
 UNDER_ATTACK_TICKS = 120
 ATTENTION_LAYERS = 3
-# The scatter image is this many times map_side per axis, and is downsampled three times.
+# The stored grids are this many times map_side per axis (128). The network reads them pooled MAP_POOL-fold,
+# as SCC's 64x64 map, then halves its image MAP_STAGES times.
 SCATTER_SCALE = 8
+MAP_POOL = 2
+MAP_STAGES = 2
 # Up to this many entities on one scatter pixel add fully; more share that total.
 SCATTER_VOLUME = 4
 MAP_RESIDUAL_BLOCKS = 4
@@ -382,16 +385,33 @@ def count_channels(numeric, count):
     return np.where(own, 0, np.where(~enemy, 3, np.where(visible, 1, 2)))
 
 
-def map_planes(encoded):
-    """(MAP_CHANNELS, side, side): terrain, visibility, entity counts and the under-attack alert."""
+def coarse_pixels(pixels, side, pool=MAP_POOL):
+    """Flat pixels of a (side, side) grid as flat pixels of the grid pooled pool-fold per axis."""
+    pixels = np.asarray(pixels)
+    return pixels//side//pool*(side//pool)+pixels%side//pool
+
+
+def pool_grid(values, side, pool=MAP_POOL):
+    """(..., side*side) averaged over pool x pool blocks: (..., (side//pool)**2)."""
+    values = np.asarray(values)
+    coarse = side//pool
+    return values.reshape(*values.shape[:-1], coarse, pool, coarse, pool).mean(axis=(-3, -1)).reshape(*values.shape[:-1], coarse*coarse)
+
+
+def map_planes(encoded, pool=1):
+    """(MAP_CHANNELS, side, side): terrain, visibility, entity counts and the under-attack alert.
+
+    pool > 1: on a grid pooled pool-fold per axis (terrain and visibility shares averaged, entities recounted)."""
     numeric, pixels = np.asarray(encoded['numeric']), np.asarray(encoded['cells'])
     count = len(encoded['entities']) if 'entities' in encoded else encoded['entity_count']
     visibility = np.asarray(encoded['map_visibility'])
-    side = int(math.isqrt(visibility.size))
+    full = int(math.isqrt(visibility.size))
+    side = full//pool
+    pixels = coarse_pixels(pixels, full, pool)
     planes = np.zeros((MAP_CHANNELS, side*side))
-    planes[:STATIC_MAP_CHANNELS] = np.asarray(encoded['map_static']).T
+    planes[:STATIC_MAP_CHANNELS] = pool_grid(np.asarray(encoded['map_static']).T, full, pool)
     for category in range(3):
-        planes[STATIC_MAP_CHANNELS+category] = visibility == category
+        planes[STATIC_MAP_CHANNELS+category] = pool_grid(visibility == category, full, pool)
     if count:
         counts = np.zeros((4, side*side))
         np.add.at(counts, (count_channels(numeric, count), pixels[:count]), 1)
@@ -876,7 +896,6 @@ class NeuralPolicy:
         c('map_project', scatter, MAP_CHANNELS+scatter, 1)
         c('map_down0', max(1, m//2), scatter, 4)
         c('map_down1', m, max(1, m//2), 4)
-        c('map_down2', m, m, 4)
         for block in range(MAP_RESIDUAL_BLOCKS):
             c(f'map_res{block}_a', m, m, 3)
             c(f'map_res{block}_b', m, m, 3)
@@ -1471,13 +1490,13 @@ class NeuralPolicy:
     def _encode_map(self, encoded, scattered):
         """(1x1 map (map_out, n, n), map embedding): plan Â§1d."""
         p, config = self.parameters, self.config
-        side = config['map_side']*SCATTER_SCALE
+        side = config['map_side']*SCATTER_SCALE//MAP_POOL
         real = np.zeros(len(scattered.data), dtype=bool)
         real[:len(encoded['entities'])] = True
-        pixels = np.asarray(encoded['cells'])
+        pixels = coarse_pixels(encoded['cells'], side*MAP_POOL)
         image = scatter_sum(scattered*Tensor(scatter_weights(pixels, real, side)[:, None]), pixels, side)
-        x = self._conv(concatenate([Tensor(map_planes(encoded)), image]), 'map_project').relu()
-        for stage in range(3):
+        x = self._conv(concatenate([Tensor(map_planes(encoded, MAP_POOL)), image]), 'map_project').relu()
+        for stage in range(MAP_STAGES):
             x = self._conv(x, f'map_down{stage}', 2, 1).relu()
         for block in range(MAP_RESIDUAL_BLOCKS):
             residual = x
