@@ -138,12 +138,16 @@ class IdentityHierarchyTests(unittest.TestCase):
             return -result[4]+result[3]*result[3]*.1
         loss().backward()
         obj = self.identity.objects['ChinaVehicleDozer']
+        # AlphaGenerals: the player identity is a row block of scalar_in_w, and the production
+        # choice is the build entry of the flat action (with its argument heads' embeddings).
+        from generals_policy import scalar_input_slices
+        identity, build = scalar_input_slices(self.config)['player_identity'].start, self.policy.action_choice(target)
         checks = [('family_embedding', (self.identity.families[obj], 0)),
                   ('variant_embedding', (obj, 1)),
                   ('base_faction_embedding', (BASE_FACTIONS.index('China'), 0)),
                   ('general_embedding', (GENERALS.index('vanilla'), 1)),
-                  ('player_identity_w', (0, 1)), ('template_query_w', (0, 1)),
-                  ('template_context_w', (0, 1)), ('template_b', (0,))]
+                  ('scalar_in_w', (identity, 1)), ('action_w', (0, build)), ('action_b', (build,)),
+                  ('position_action_embedding', (build, 1))]
         for name, index in checks:
             parameter = self.policy.parameters[name]
             analytic, original = parameter.grad[index], parameter.data[index]

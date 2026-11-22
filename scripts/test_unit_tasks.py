@@ -14,7 +14,7 @@ from nn_numpy import no_grad
 from replay_events import encoded_events
 from replay_sequences import normalize_demonstration
 from tensor_replay_store import project, encode_columns, decode_columns, TensorRows
-from test_fixtures import fixture, grid, raw_row, task
+from test_fixtures import fixture, grid, raw_row, task, trunk_arrays
 from train_events import EventLearner
 from training_legality import build_legality
 from unit_tasks import TASKS, RELATIONS
@@ -85,8 +85,8 @@ class UnitTaskTests(unittest.TestCase):
         for name in ('task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features', 'task_commands'):
             np.testing.assert_array_equal(original[name], changed[name])
         with no_grad():
-            for a, b in zip(self.policy._trunk(original), self.policy._trunk(changed)):
-                np.testing.assert_array_equal(a.data, b.data)
+            for a, b in zip(trunk_arrays(self.policy._trunk(original)), trunk_arrays(self.policy._trunk(changed))):
+                np.testing.assert_array_equal(a, b)
 
     def test_hidden_target_does_not_resolve_or_import_nonowned_orders(self):
         obs = copy.deepcopy(self.obs)
@@ -124,8 +124,8 @@ class UnitTaskTests(unittest.TestCase):
         after = self.encode(obs)
         self.assertEqual(after['task_numeric'][after['ids'][10], TASKS.index('move')], 1)
         with no_grad():
-            for a, b in zip(self.policy._trunk(before), self.policy._trunk(after)):
-                np.testing.assert_array_equal(a.data, b.data)
+            for a, b in zip(trunk_arrays(self.policy._trunk(before)), trunk_arrays(self.policy._trunk(after))):
+                np.testing.assert_array_equal(a, b)
 
     def test_future_teacher_command_does_not_change_earlier_inputs(self):
         def convert(kind):
@@ -154,8 +154,8 @@ class UnitTaskTests(unittest.TestCase):
         after = self.encode(obs)
         first = learner.model.events([before])
         second = learner.model.events([after])
-        for a, b in zip(first, second):
-            np.testing.assert_array_equal(a.detach().cpu().numpy(), b.detach().cpu().numpy())
+        for a, b in zip(trunk_arrays(first), trunk_arrays(second)):
+            np.testing.assert_array_equal(a, b)
 
     def test_invalid_cargo_or_destination_is_rejected(self):
         for changes in ({'cargo': {'available': True, 'boxes': 9, 'capacity': 1}},
@@ -212,14 +212,18 @@ class UnitTaskTests(unittest.TestCase):
         learner.model.legality_key = key
         for batch in (rows, portable):
             encoded = [row['encoded'] for row in batch]
-            h, entities, spatial = learner.model.events(encoded)
-            output = learner.model.teacher_heads(encoded, [row['target'] for row in batch], h, entities, spatial)
+            output = learner.model.teacher_heads(encoded, [row['target'] for row in batch], *learner.model.events(encoded))
             with no_grad():
                 expected = [float(self.policy.decide(row['encoded'], None, teacher=row['target'])[4].data) for row in rows]
             np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
         learner.batch(portable, train=True)
-        for name in ('task_w', 'task_builder_w', 'task_command_w', 'task_validation_w', 'task_validation_target_w'):
+        for name in ('task_w', 'task_builder_w', 'task_validation_target_w'):
             self.assertGreater(float(learner.model.weights[name].grad.abs().sum().cpu()), 0, name)
+        # AlphaGenerals: the command and validation receipts are row blocks of scalar_in_w.
+        from generals_policy import scalar_input_slices
+        for name in ('task_command', 'task_validation'):
+            rows = scalar_input_slices(self.policy.config)[name]
+            self.assertGreater(float(learner.model.weights['scalar_in_w'].grad[rows].abs().sum().cpu()), 0, name)
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary)/'checkpoint.npz'
             learner.save(checkpoint, {})

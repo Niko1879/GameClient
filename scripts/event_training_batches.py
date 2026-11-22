@@ -1,10 +1,11 @@
 """Bounded prefetch that preserves the event sampler's order and cursors.
 
-`PrefetchedBatches` decodes rows on a thread. `PreparedReader` runs a separate
-process (no PyTorch) that decodes shards and builds each update's CPU arrays:
-microbatches, padded inputs and teacher plans. The learner process then only
-stages and runs them, so CPU preparation overlaps GPU work without contending
-for the learner's interpreter lock. Readers change speed only, never content.
+`PrefetchedBatches` decodes rows on a thread. `PreparedReader` runs separate
+processes (no PyTorch) that decode shards and build the CPU arrays of each
+update's lane parts (sequence training, notes/plan.md §2): microbatches, padded
+inputs and teacher plans. The learner process then only stages and runs them,
+so CPU preparation overlaps GPU work without contending for the learner's
+interpreter lock. Readers change speed only, never content.
 """
 from __future__ import annotations
 
@@ -180,30 +181,66 @@ class _Slots:
         self.blocks = []
 
 
-def prepare_share(spec, rows, pair_budget, share=None):
-    """One rank's part of a global batch: every world-th row, from row `rank`.
+# Decoded chunks each reader keeps (EventDataset.episode_rows): a lane reads each chunk of its episode once.
+CACHE_BYTES = 256*1024*1024
 
-    Batches are sorted by entity count, so strided shares keep the ranks' work
-    similar. A contiguous split by entity count was slower (2 x 5090, 9 Nov:
-    0.72x at global batch 256): ranks run in lockstep, so the rank holding the
-    large observations set the pace. Losses are divided by the global row count,
-    so the ranks' summed gradients equal the single-process gradient of the
-    whole batch, for any partition.
-    """
-    if share is None:
-        return prepare_update(spec, rows, pair_budget)
-    rank, world = share
-    update = prepare_update(spec, rows[rank::world], pair_budget)
-    update['global_rows'] = len(rows)
+
+def lane_parts(dataset, split, *, seed, epoch, lanes, steps, part_lanes, shuffle=True, cursor=0, share=None):
+    """(update, part, its lanes, the update's schedule) for every part a rank prepares, from update `cursor`.
+
+    An update is `lanes` lanes of `steps` consecutive decisions (EventDataset.lane_schedule),
+    prepared in parts of `part_lanes` lanes: one part is about one memory-free batch of old
+    (8 x 64 = 512 rows). With share=(rank, world), a rank takes every world-th part; the ranks'
+    LSTMs then hold disjoint lanes, and losses are divided by the whole update's rows."""
+    if part_lanes < 1 or lanes % part_lanes:
+        raise ValueError('Lanes must be a whole number of parts')
+    rank, world = share or (0, 1)
+    parts = lanes//part_lanes
+    if parts % world:
+        raise ValueError('Parts must divide evenly between ranks')
+    for update, schedule in enumerate(dataset.lane_schedule(split, seed=seed, epoch=epoch, lanes=lanes, steps=steps,
+                                                            shuffle=shuffle)):
+        if update < cursor:
+            continue
+        for part in range(rank, parts, world):
+            yield update, part, range(part*part_lanes, (part+1)*part_lanes), schedule
+
+
+def prepare_part(spec, dataset, split, item, pair_budget, cache_bytes):
+    """One part's CPU arrays: its rows' microbatches with each row's lane and step, and the part's
+    reset and present masks."""
+    update, part, lanes, schedule = item
+    rows = dataset.lane_rows(split, schedule, lanes, cache_bytes)
+    prepared = prepare_update(spec, rows, pair_budget) if rows else {'rows': 0, 'microbatches': []}
+    episode, _, reset = schedule
+    prepared.update(update=update, part=part, first_lane=lanes.start, resets=reset[lanes.start:lanes.stop],
+                    present=episode[lanes.start:lanes.stop] >= 0, update_rows=int((episode >= 0).sum()))
+    return prepared
+
+
+def assemble(parts, steps):
+    """A rank's update from its parts in order: lanes renumbered locally, resets and present masks stacked.
+
+    rows: this rank's rows; global_rows: the whole update's (the loss divisor)."""
+    update = {'rows': sum(part['rows'] for part in parts), 'global_rows': parts[0]['update_rows'], 'steps': steps,
+              'resets': np.concatenate([part['resets'] for part in parts]),
+              'present': np.concatenate([part['present'] for part in parts]), 'microbatches': []}
+    update['lanes'] = len(update['resets'])
+    offset = 0
+    for part in parts:
+        for micro in part['microbatches']:
+            micro['lanes'] = micro['lanes']-part['first_lane']+offset
+            update['microbatches'].append(micro)
+        offset += len(part['resets'])
     return update
 
 
 def _serve(manifest, digest, spec_options, pair_budget, requests, results, free, slots, active, worker, workers,
            share=None):
-    """Reader process `worker` of `workers`: it prepares windows worker, worker+workers, ...
+    """Reader process `worker` of `workers`: of a rank's parts it prepares numbers worker, worker+workers, ...
 
     One long-lived dataset per process, so shards are verified once per run.
-    Updates' arrays go through shared-memory slots, the skeleton through `results`.
+    Parts' arrays go through shared-memory slots, the skeleton through `results`.
     """
     from engine_runtime import disable_power_throttling
     from event_dataset import EventDataset
@@ -234,34 +271,26 @@ def _serve(manifest, digest, spec_options, pair_budget, requests, results, free,
                     pass
             return None
 
-        def send_update(update, cursor):
-            slot = claim()
-            if slot is None:
-                return False
-            arrays = []
-            skeleton = _pack(update, arrays)
-            name, size = memory.write(slot, arrays)
-            if send((serial, 'item', (skeleton, cursor, slot, name, size))):
-                return True
-            free.put(slot)
-            return False
-
         while (request := requests.get()) is not None:
             serial, split, settings = request
-            cursor = settings.pop('cursor', (0, 0))
-            windows = dataset.windows(split, seed=settings['seed'], epoch=settings['epoch'],
-                                      buffer_bytes=settings.get('buffer_bytes', 64*1024*1024))
-            for window in range(cursor[0], len(windows)):
-                if window % workers != worker:
+            cache = settings.pop('cache_bytes')
+            for number, item in enumerate(lane_parts(dataset, split, share=share, **settings)):
+                if number % workers != worker:
                     continue
-                start = cursor[1] if window == cursor[0] else 0
-                for rows, position in dataset.window_batches(windows[window], seed=settings['seed'],
-                        epoch=settings['epoch'], window=window, batch_size=settings.get('batch_size', 256), start=start):
-                    if active.value != serial or not send_update(prepare_share(spec, rows, pair_budget, share),
-                                                                 (window, position)):
-                        break
-                if active.value != serial or not send((serial, 'window', window)):
+                if active.value != serial:
                     break
+                part = prepare_part(spec, dataset, split, item, pair_budget, cache)
+                slot = claim()
+                if slot is None:
+                    break
+                arrays = []
+                skeleton = _pack(part, arrays)
+                name, size = memory.write(slot, arrays)
+                if not send((serial, 'item', (skeleton, slot, name, size))):
+                    free.put(slot)
+                    break
+            else:
+                send((serial, 'end', None))
     except BaseException:
         results.put((serial, 'error', traceback.format_exc()))
     finally:
@@ -271,25 +300,24 @@ def _serve(manifest, digest, spec_options, pair_budget, requests, results, free,
 
 
 class PreparedReader:
-    """Prepared updates from reader processes, in exactly the sampler's order.
+    """Prepared lane parts from reader processes, assembled into updates in the schedule's order.
 
-    Shuffle windows are independent (event_dataset.EventDataset.windows), so
-    `processes` readers take windows in turn and the learner consumes window w
-    from reader w % processes. At most `depth` updates wait per reader. One
-    stream is active at a time; abandoning one retires its serial, readers stop
-    at their next update and leftovers are discarded by the following stream.
+    Reader w prepares a rank's parts w, w+processes, ... (lane_parts order), at most `depth`
+    waiting each; the learner takes part k from reader k % processes. One stream is active at
+    a time; abandoning one retires its serial, readers stop at their next part and leftovers
+    are discarded by the following stream.
     """
     def __init__(self, dataset, spec, pair_budget, depth=1, processes=1, share=None):
         if depth < 1 or processes < 1:
             raise ValueError('Positive prefetch depth and reader count required')
         context = multiprocessing.get_context('spawn')
-        self.dataset = dataset
+        self.dataset, self.share = dataset, share
         self.active, self.serial = context.Value('q', 0, lock=False), 0
         options = dict(float_dtype=spec.float_dtype, device_type=spec.device_type)
         self.readers, self.blocks = [], {}
         for worker in range(processes):
             requests, results, free = context.Queue(), context.Queue(depth), context.Queue()
-            # Queued updates, one being written and one being copied here.
+            # Queued parts, one being written and one being copied here.
             process = context.Process(target=_serve, name=f'event-update-reader-{worker}', daemon=True,
                 args=(str(dataset.path), dataset.digest, options, pair_budget,
                       requests, results, free, depth+2, self.active, worker, processes, share))
@@ -297,8 +325,8 @@ class PreparedReader:
             self.readers.append((process, requests, results, free))
 
     def _receive(self, worker, value):
-        """Copy an update out of its reader's slot, then return the slot."""
-        skeleton, cursor, slot, name, size = value
+        """Copy a part out of its reader's slot, then return the slot."""
+        skeleton, slot, name, size = value
         free = self.readers[worker][3]
         key = worker, slot
         if key not in self.blocks or self.blocks[key].name != name:
@@ -310,7 +338,7 @@ class PreparedReader:
         private[:] = np.frombuffer(view, dtype=np.uint8)
         view.release()
         free.put(slot)
-        return _unpack(skeleton, private), cursor
+        return _unpack(skeleton, private)
 
     def _next(self, worker, serial):
         process, _, results, free = self.readers[worker]
@@ -327,30 +355,31 @@ class PreparedReader:
             if owner == serial:
                 return kind, self._receive(worker, value) if kind == 'item' else value
             if kind == 'item':
-                free.put(value[2])  # Abandoned stream: discard and recycle its slot.
+                free.put(value[1])  # Abandoned stream: discard and recycle its slot.
 
     def stream(self, split, **settings):
-        """(prepared update, following cursor) pairs in the sampler's order."""
+        """(update, following cursor) pairs in the schedule's order."""
         if not self.readers:
             raise RuntimeError('Event update reader is closed')
         self.serial += 1
         serial = self.serial
         self.active.value = serial
-        cursor = tuple(settings.get('cursor', (0, 0)))
-        windows = len(self.dataset.windows(split, seed=settings['seed'], epoch=settings['epoch'],
-                                           buffer_bytes=settings.get('buffer_bytes', 64*1024*1024)))
+        settings = {'cache_bytes': CACHE_BYTES, **settings}
         for _, requests, _, _ in self.readers:
             requests.put((serial, split, dict(settings)))
+        rank, world = self.share or (0, 1)
+        count = settings['lanes']//settings['part_lanes']//world
+        number, parts = 0, []
         try:
-            for window in range(cursor[0], windows):
-                worker = window % len(self.readers)
-                while True:
-                    kind, value = self._next(worker, serial)
-                    if kind == 'window':
-                        if value != window:
-                            raise RuntimeError('Event update readers lost window order')
-                        break
-                    yield value
+            while True:
+                kind, value = self._next(number % len(self.readers), serial)
+                if kind == 'end':
+                    return
+                number += 1
+                parts.append(value)
+                if len(parts) == count:
+                    yield assemble(parts, settings['steps']), parts[0]['update']+1
+                    parts = []
         finally:
             if self.active.value == serial:
                 self.active.value = 0
@@ -380,10 +409,19 @@ class PreparedReader:
         self.close()
 
 
-def prepared(dataset, split, *, spec, pair_budget, reader=None, share=None, **settings):
-    """Prepared updates from `reader` (built with the same share), or prepared inline when it is None."""
+def prepared(dataset, split, *, spec, pair_budget, reader=None, share=None, cache_bytes=None, **settings):
+    """(update, following cursor) from `reader` (built with the same share), or prepared inline when it is None.
+
+    settings: seed, epoch, lanes, steps, part_lanes, shuffle and cursor (lane_parts)."""
+    cache_bytes = cache_bytes or CACHE_BYTES
     if reader is not None:
-        yield from reader.stream(split, **settings)
+        yield from reader.stream(split, cache_bytes=cache_bytes, **settings)
         return
-    for rows, cursor in dataset.batches(split, **settings):
-        yield prepare_share(spec, rows, pair_budget, share), cursor
+    rank, world = share or (0, 1)
+    count = settings['lanes']//settings['part_lanes']//world
+    parts = []
+    for item in lane_parts(dataset, split, share=share, **settings):
+        parts.append(prepare_part(spec, dataset, split, item, pair_budget, cache_bytes))
+        if len(parts) == count:
+            yield assemble(parts, settings['steps']), item[0]+1
+            parts = []

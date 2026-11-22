@@ -10,7 +10,7 @@ from shutil import copy2
 from engine_runtime import PROFILE_ENV, isolation_profile
 from event_policy import EventActor, science_buyer
 from generals_env import GeneralsEnv, run_episode
-from generals_policy import PLAY_RATING, NeuralPolicy
+from generals_policy import PLAY_RATING
 from openers import NAMED, named_templates
 from prepared_io import _digest, _write_json
 from replay_bootstrap import check_live_provenance, check_live_rules
@@ -37,11 +37,12 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
                 copy2(source, destination/source.name)
             args.map = str(destination/source_map.name)
         os.environ[PROFILE_ENV] = str(profile.resolve())
-    policy, _, checkpoint = NeuralPolicy.load(args.checkpoint)
+    # AlphaGenerals or, until its adoption, a memory-free checkpoint through the _old modules.
+    from policy_checkpoints import live_policy, load_policy
+    policy, _, checkpoint = load_policy(args.checkpoint)
     policy.rating_input = args.rating_input
     if args.headed:
-        from torch_live_policy import TorchLivePolicy
-        policy = TorchLivePolicy(policy)
+        policy = live_policy(policy)
     with GeneralsEnv(args.exe, log_path=output/'engine.log', headed=args.headed) as env:
         engine_sha256 = _digest(args.exe)
         deployment = checkpoint['metadata']['deployment']
@@ -55,7 +56,7 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
         actors[0].configure_ratings(*rating_view(args.rating, args.opponent_rating, args.rating_view))
         actors[0].configure_opener(named_templates(policy.config, args.opener))
         if args.opponent_kind == 'policy':
-            other, _, _ = NeuralPolicy.load(args.opponent or args.checkpoint)
+            other, _, _ = load_policy(args.opponent or args.checkpoint)
             other.rating_input = args.opponent_rating_input if args.opponent else args.rating_input
             actors.append(EventActor(other, args.seed+1, deterministic=args.deterministic,
                                      science=science(args.opponent_policy_faction)))

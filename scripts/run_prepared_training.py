@@ -449,7 +449,7 @@ def run(args):
                 checkpoint_stop=RUN/'checkpoint-stop.json';checkpoint_stop.unlink(missing_ok=True)
                 command=[sys.executable,'-B',ROOT/'scripts/train_events.py','train','--dataset',MANIFEST,'--output',RUN,
                     '--device',plan['device'],'--epochs',str(plan['max_epochs']),'--early-stopping-patience',str(plan['patience']),
-                    '--seed',str(plan['seed']),'--threads','1','--batch-size','256','--buffer-mib','512',
+                    '--seed',str(plan['seed']),'--threads','1','--lanes','32','--unroll','64','--part-lanes','8','--cache-mib','256',
                     '--pair-budget','8000000','--checkpoint-seconds','600','--min-free-ram-mib','1024',
                     '--max-private-mib','8192','--stop-file',checkpoint_stop,
                     '--lr-decay',str(plan.get('lr_decay',1.0)),'--min-lr',str(plan.get('min_lr',0.0))]

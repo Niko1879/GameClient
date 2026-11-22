@@ -11,8 +11,9 @@ import os
 import numpy as np
 
 from event_schedule import delay_mask
-from generals_policy import (ARMS_FEATURES, COMMAND_KINDS, DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, KINDS, UNRATED, NeuralPolicy, command_target,
-                             arms_inputs, count_channels, derived_inputs, visible_scalars, visible_task_commands)
+from generals_policy import (ARMS_FEATURES, DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, UNIT_GROUPS, UNRATED, NeuralPolicy,
+                             arms_inputs, command_target, count_channels, derived_inputs, unit_groups, visible_scalars,
+                             visible_task_commands)
 from training_legality import cached_legality
 
 # Fitted Radeon encoder cost: per microbatch, per padded token, per padded pair.
@@ -179,13 +180,27 @@ def encode_values(spec, encoded):
     values['task_commands'] = visible_task_commands(np.stack([row['task_commands'] for row in encoded])), 'float'
     for name, dtype in (('task_command_templates', 'int64'), ('task_command_template_present', 'bool')):
         values[name] = np.stack([row[name] for row in encoded]), dtype
+    # Unit groups (generals_policy.unit_groups) as gather indices into each row's tokens: its
+    # entities (padded to `count`), then its effect tokens. Padding is never a group member.
+    groups = unit_groups(own, owners, real)
+    members = [[np.flatnonzero(groups[index] == group) for index in range(batch)] for group in range(UNIT_GROUPS)]
+    members.append([count+np.arange(len(row['effect_numeric'])) for row in encoded])
+    for group, rows in zip(range(len(GROUPS)), members):
+        width = max(1, max(len(item) for item in rows))
+        index, present = np.zeros((batch, width), dtype=np.int64), np.zeros((batch, width), dtype=bool)
+        for position, item in enumerate(rows):
+            index[position, :len(item)], present[position, :len(item)] = item, True
+        values[f'group{group}_index'], values[f'group{group}_valid'] = (index, 'int64'), (present, 'bool')
     return values, numeric
 
 
 def teacher_plan(spec, encoded, teachers, entity_count):
-    config = spec.config
+    """Teacher-forced head inputs: masks, choices and the rows each argument head scores.
+
+    The selected action is one flat categorical (generals_policy.action_vocabulary) masked by
+    NeuralPolicy.action_mask over the stored kind mask; every argument head reads it."""
+    config, reference = spec.config, spec.reference
     masks = [cached_legality(spec, row, teacher) for row, teacher in zip(encoded, teachers)]
-    verbs = np.stack([mask['verb'] for mask in masks])
     values, categories = {}, {}
 
     def add(name, value, dtype='int64'):
@@ -203,42 +218,41 @@ def teacher_plan(spec, encoded, teachers, entity_count):
             add(name+'_global', global_rows)
             categories[name] = global_rows
 
-    categorical('decision', verbs, [KINDS.index(t['kind']) for t in teachers])
+    actions = [reference.action_choice(t) for t in teachers]
+    categorical('decision', [reference.action_mask(row, mask['verb']) for row, mask in zip(encoded, masks)], actions)
+    add('actions', actions)
     delay_masks = [delay_mask(config, row.get('event_rate', 60)) for row in encoded]
     choices = [t.get('delay', int(np.flatnonzero(mask)[0])) for t, mask in zip(teachers, delay_masks)]
     categorical('event_delay', delay_masks, choices)
-    add('delay_known', ['delay' in t for t in teachers], 'float')
-    add('all_verbs', [KINDS.index(t['kind']) for t in teachers])
-    add('conditional_mask', verbs[:, 1:], 'bool')
     command_rows = np.asarray([i for i, target in enumerate(teachers) if target['kind'] != 'wait'], dtype=np.int64)
     add('command_rows', command_rows)
     plan = {'values': values, 'categories': categories, 'command_rows': command_rows,
-            'command_count': len(command_rows), 'batch': len(teachers)}
+            'command_count': len(command_rows), 'batch': len(teachers), 'unit_tokens': 0}
+    for name in ('slot', 'target', 'angle', 'spatial'):
+        plan[name+'_rows'] = np.zeros(0, dtype=np.int64)
+    # The encoder's [Mean, Max] summary reads every command row's selection.
+    selected = [masks[i]['selected'] for i in command_rows]
+    plan['selected'] = selected
+    longest = max([1, *map(len, selected)])
+    selected_indices = np.zeros((len(command_rows), longest), dtype=np.int64)
+    for i, selection in enumerate(selected):
+        selected_indices[i, :len(selection)] = selection
+    add('selected_indices', selected_indices)
+    add('selected_lengths', list(map(len, selected)))
     if not len(command_rows):
         return plan
     rows = [encoded[i] for i in command_rows]
     targets = [teachers[i] for i in command_rows]
     legal = [masks[i] for i in command_rows]
-    func = np.zeros((len(rows), len(config['types'])), dtype=np.float32)
-    for i, (row, entry) in enumerate(zip(rows, legal)):
-        func[i, np.asarray(row['types'])[np.asarray(entry['actor'], dtype=bool)]] = 1
-    add('func_types', func, 'float')
-    selected = [entry['selected'] for entry in legal]
-    plan['selected'] = selected
-    longest = max(1, max(map(len, selected)))
-    selected_indices = np.zeros((len(rows), longest), dtype=np.int64)
     unit_rows, unit_prefixes, unit_masks, unit_choices = [], [], [], []
-    for i, (row, entry, selection) in enumerate(zip(rows, legal, selected)):
-        selected_indices[i, :len(selection)] = selection
+    for i, (row, entry) in enumerate(zip(rows, legal)):
         real_count = len(row['numeric'])
         for ordinal, (mask, choice) in enumerate(zip(entry['unit_masks'], entry['unit_choices'])):
             padded = np.zeros(entity_count+1, dtype=bool)
             padded[:real_count], padded[-1] = mask[:-1], mask[-1]
             unit_rows.append(i); unit_prefixes.append(ordinal); unit_masks.append(padded)
             unit_choices.append(entity_count if choice == real_count else choice)
-    add('selected_indices', selected_indices)
     add('command_range', np.arange(len(rows)))
-    add('selected_lengths', list(map(len, selected)))
     add('unit_rows', unit_rows); add('unit_prefixes', unit_prefixes)
     # A microbatch without unit tokens skips the unit head.
     if unit_rows:
@@ -251,12 +265,6 @@ def teacher_plan(spec, encoded, teachers, entity_count):
         plan[name+'_rows'] = indices
         return indices
 
-    # 'command_rows' already names the non-DEFER rows; this head's rows use another key.
-    indices = np.asarray([i for i, target in enumerate(targets) if target['kind'] in COMMAND_KINDS], dtype=np.int64)
-    add('command_head_rows', indices)
-    plan['command_head_rows'] = indices
-    if len(indices):
-        categorical('command', [legal[i]['command'] for i in indices], [targets[i]['command'] for i in indices], indices)
     indices = branch('slot', lambda t: t['kind'] == 'cancel_production')
     if len(indices):
         categorical('slot', [legal[i]['slot'] for i in indices], [targets[i]['slot'] for i in indices], indices)
@@ -266,10 +274,6 @@ def teacher_plan(spec, encoded, teachers, entity_count):
         for j, i in enumerate(indices):
             padded[j, :len(legal[i]['target'])] = legal[i]['target']
         categorical('target', padded, [targets[i]['target'] for i in indices], indices)
-    indices = branch('template', lambda t: t['kind'] in ('build', 'train'))
-    if len(indices):
-        categorical('template', [legal[i]['template'] for i in indices],
-                    [targets[i]['template'] for i in indices], indices)
     indices = branch('angle', lambda t: t['kind'] == 'build')
     if len(indices):
         mask, choices = np.ones((len(indices), config['angle_bins']), dtype=bool), [targets[i]['angle'] for i in indices]
@@ -291,6 +295,16 @@ def teacher_plan(spec, encoded, teachers, entity_count):
     return plan
 
 
+def head_counts(plan):
+    """Scored tokens per row and head: the loss averages each argument head over its tokens."""
+    batch = plan['batch']
+    counts = {'decision': np.ones(batch, dtype=int), 'delay': np.ones(batch, dtype=int)}
+    for name, rows in plan['categories'].items():
+        if name != 'decision':
+            np.add.at(counts.setdefault(name, np.zeros(batch, dtype=int)), rows, 1)
+    return counts
+
+
 def acting_general(row):
     """The acting player's general ('vanilla', 'tank', 'nuke', ...), for reporting only (train_events by_general)."""
     from generals_identity import GENERALS
@@ -307,6 +321,9 @@ def prepare_update(spec, rows, pair_budget):
         teachers = [row['target'] for row in micro]
         parts.append({'values': values, 'numeric': numeric,
                       'plan': teacher_plan(spec, encoded, teachers, numeric.shape[1]),
+                      # Sequence training: each row's lane and step in its update (plan §2).
+                      'lanes': np.asarray([row.get('lane', -1) for row in micro], dtype=np.int64),
+                      'steps': np.asarray([row.get('step', -1) for row in micro], dtype=np.int64),
                       'rows': [{'target': row['target'], 'frame': row.get('frame'),
                                 'source_ticks_per_second': row.get('source_ticks_per_second', 60),
                                 'rating': row.get('rating'), 'match_key': row.get('match_key'),

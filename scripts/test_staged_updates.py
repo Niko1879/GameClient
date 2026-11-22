@@ -30,7 +30,7 @@ class StagedUpdateTests(unittest.TestCase):
         spec = PreparationSpec(self.data.config, self.data.key, float_dtype=learner.model.float_dtype,
                                device_type=learner.model.device_type)
         return prepared(self.data, 'train', spec=spec, pair_budget=2_000_000, reader=reader,
-                        seed=3, epoch=0, batch_size=3)
+                        seed=3, epoch=0, lanes=2, steps=2, part_lanes=1)
 
     def train(self, staged, reader=False):
         learner = EventLearner(NeuralPolicy(self.data.config, 5), device=DEVICE)
@@ -43,7 +43,7 @@ class StagedUpdateTests(unittest.TestCase):
             totals = [learner.run(update, train=True) for update, _ in stream]
             if staged:
                 stream.close()
-            validation = [learner.run(update, train=False) for update, _ in self.updates(learner)]
+            validation = [learner.run(update, train=False, split='validation') for update, _ in self.updates(learner)]
         finally:
             if source is not None:
                 source.close()

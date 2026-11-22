@@ -35,9 +35,8 @@ def default_config(vocabulary, placement_mode='fast'):
               'promotions': vocabulary['promotions'], 'upgrades': vocabulary['upgrades'], 'powers': vocabulary['powers'],
               'sciences': sorted({name for names in vocabulary['promotions'].values() for name in names}),
               'architecture': ARCHITECTURE, 'observation_policy_version': OBSERVATION_VERSION,
-              # Widths are model-only and never change shard columns.
-              'hidden': 1408, 'entity_hidden': 256, 'embedding': 64, 'attention_heads': 2,
-              'map_side': 16, 'map_hidden': 128, 'scalar_hidden': 256, 'max_group': 64,
+              # Widths are model-only and never change shard columns; the rest are generals_policy.WIDTHS.
+              'embedding': 64, 'map_side': 16, 'map_hidden': 128, 'max_group': 64,
               'position_bins': 256, 'angle_bins': 16,
               'event_max_delay': 120, 'delay_ticks': list(range(1, 121)), 'event_observation_ms': 100,
               'variant_l2': 1e-4, 'delay_loss_weight': .2,
@@ -127,6 +126,8 @@ class EventActor:
         self.enemy_identity = (0, 0)
         self.counters = Counter()
         self.last = {}
+        # The policy's core LSTM state, carried from this player's previous decision (None: game start).
+        self.memory = None
         # The game's weapon/armour stats (generals_policy.TemplateTable), built from every observation.
         self.templates = None
 
@@ -188,8 +189,8 @@ class EventActor:
                 raise ValueError('Placement-aware event actor needs a placement-capable environment')
             encoded['placement_query'] = self.placement_query
         with no_grad():
-            actions, trace, _, value, logp, entropy = self.policy.decide(
-                encoded, rng=self.rng, deterministic=self.deterministic)
+            actions, trace, self.memory, value, logp, entropy = self.policy.decide(
+                encoded, self.memory, rng=self.rng, deterministic=self.deterministic)
         self.previous_frame = frame
         self.next_decision_frame = frame + self.policy.config['delay_ticks'][trace['delay']]
         self.counters['decisions'] += 1

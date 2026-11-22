@@ -1,4 +1,4 @@
-"""Train the memory-free event policy on prepared event shards."""
+"""Train the AlphaGenerals event policy on prepared event shards, one episode per lane (notes/plan.md §2)."""
 from __future__ import annotations
 
 import argparse
@@ -26,7 +26,7 @@ from event_training_batches import PreparedReader, prepared as prepared_batches
 from generals_policy import ARCHITECTURE, NeuralPolicy
 from nn_numpy import Adam
 from prepared_io import _digest, _write_json
-from training_preparation import MICROBATCH_COST, PreparationSpec, microbatches, prepare_update
+from training_preparation import PreparationSpec, prepare_update
 
 
 PRECISIONS = ('fp32', 'tf32', 'bf16', 'fp16')
@@ -110,6 +110,9 @@ class SingleProcess:
     def same(self, value):
         return value
 
+    def gather(self, value):
+        return [value]
+
     def reduce_gradients(self, parameters):
         pass
 
@@ -123,10 +126,10 @@ class SingleProcess:
 class DistributedRanks(SingleProcess):
     """Data-parallel ranks on one host (scripts/train_events.py --world-size).
 
-    Every rank reads the same global batches and prepares every world-th row
-    (event_training_batches.prepare_share); losses are divided by the global
-    row count and gradients summed, so N ranks compute the single-process
-    update of the same batch up to floating-point summation order. Control
+    Every rank follows the same lane schedule and prepares every world-th part
+    of each update (event_training_batches.lane_parts), so its LSTM holds its own
+    lanes; losses are divided by the whole update's rows and gradients summed, so
+    N ranks compute the single-process update up to floating-point summation order. Control
     decisions (stop, resources, checkpoints) and counters go through a CPU
     gloo group, so they never wait for the GPU.
     """
@@ -258,8 +261,8 @@ class EventLearner:
     def __init__(self, reference, optimizer=None, *, device='cpu', threads=1, pair_budget=8_000_000,
                  precision='fp32', compile_encoder=False, ranks=None):
         # fp32: strict IEEE matmul/convolution. tf32: NVIDIA TensorFloat-32 for
-        # FP32 matmul/convolution. fp16/bf16: autocast of the trunk with FP32
-        # master weights; fp16 adds dynamic loss scaling.
+        # FP32 matmul/convolution. fp16/bf16: autocast of the encoder with FP32
+        # master weights; fp16 adds dynamic loss scaling. The core LSTM and the heads stay FP32.
         import torch
         from torch_policy_v3 import TorchPolicyV3
         if (reference.config.get('architecture') != ARCHITECTURE or threads < 1 or pair_budget < 1
@@ -282,17 +285,13 @@ class EventLearner:
         self.model = TorchPolicyV3(reference, device=device, dtype=torch.float32)
         self.parameter_list = list(self.model.parameters())
         if compile_encoder:
-            # Fuses the entity/map encoder, where most launched ops are (+12-25%
-            # on an RTX 5070 Ti); heads stay eager. Dynamic shapes: every
-            # microbatch has its own batch and entity counts.
+            # Fuses the encoder, where most launched ops are; the core and heads stay eager.
+            # Dynamic shapes: every microbatch has its own row and entity counts.
             import importlib.util
             if device != 'cuda' or torch.version.hip is not None or importlib.util.find_spec('triton') is None:
                 raise ValueError('--compile needs an NVIDIA CUDA device with Triton')
             stride_order_with_shape_env()
             self.model.encode_inputs = torch.compile(self.model.encode_inputs, dynamic=True)
-            # The heads' fixed-structure trunk too: the rest of the heads branch on the plan.
-            from torch_training_inputs import action_trunk
-            self.model.action_trunk = torch.compile(action_trunk, dynamic=True)
         self.pair_budget = pair_budget
         # FP16 autocast keeps FP32 master weights and Adam state; dynamic loss
         # scaling skips updates whose scaled gradients overflow.
@@ -304,6 +303,8 @@ class EventLearner:
         # Radeon (3 of 12 runs), for ~0.5 ms of a 150 ms update.
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.mirror.lr, foreach=True)
         self.step_count = self.mirror.step_count
+        # The core LSTM state each lane carries into its next unroll, per split (plan Â§2).
+        self.states = {}
         if self.step_count:
             steps = getattr(self.mirror, 'parameter_steps', None)
             if steps is None or set(steps) != set(self.model.weights):
@@ -322,55 +323,109 @@ class EventLearner:
         return StagedUpdates(stream, self.model)
 
     def batch(self, rows, *, train):
-        """Prepare in-process, then run one update (or a validation pass) over rows."""
+        """One update (or validation pass) over independent decisions: each row is a one-step lane
+        at its episode's start (tests and tools; training reads whole episodes)."""
         cached = rows[0]['encoded'].get('_training_legality')
         self.model.legality_key = cached['key'] if cached else None
-        return self.run(prepare_update(self.model, rows, self.pair_budget), train=train)
+        update = prepare_update(self.model, [{**row, 'lane': i, 'step': 0} for i, row in enumerate(rows)], self.pair_budget)
+        update.update(lanes=len(rows), steps=1, resets=np.ones((len(rows), 1), dtype=bool),
+                      present=np.ones((len(rows), 1), dtype=bool))
+        return self.run(update, train=train, split=None)
 
-    def run(self, prepared, *, train):
-        """One update from training_preparation.prepare_update's arrays."""
+    def reset_lanes(self, split):
+        self.states.pop(split, None)
+
+    def run(self, prepared, *, train, split='train'):
+        """One update from event_training_batches.assemble's lanes (training_preparation arrays).
+
+        Three stages, so the LSTM runs every lane at once (plan Â§2): the encoder in microbatches
+        (checkpointed: its activations are recomputed in the backward pass), the core over
+        (lanes, steps), then the heads in microbatches (checkpointed). One backward pass.
+        split names the carried lane state (None: start every lane from zero, carry nothing)."""
         torch, model = self.torch, self.model
+        from torch.utils.checkpoint import checkpoint
+        from torch_training_inputs import head_losses, loss_factors, teacher_heads
+        from training_preparation import head_counts
+        if 'lanes' not in prepared:  # A plain prepare_update: every row an independent one-step lane.
+            prepared, offset = dict(prepared), 0
+            for part in prepared['microbatches']:
+                part['lanes'] = np.arange(offset, offset+len(part['rows'])); part['steps'] = np.zeros(len(part['rows']), dtype=np.int64)
+                offset += len(part['rows'])
+            prepared.update(lanes=offset, steps=1, resets=np.ones((offset, 1), dtype=bool), present=np.ones((offset, 1), dtype=bool))
+            split = None
         totals = Counter()
-        # Predictions and losses stay on the device until the update is queued,
-        # then come back in one transfer: no synchronisation per microbatch.
-        decisions, delays, losses_by_part, heads_by_part = [], [], [], []
-        position_errors = []  # Validation only: (part, expected, mode) distance-to-click.
-        wait_sums = []  # Validation only: summed p(wait), the expected number of waits.
-        # A rank's share of a global batch is divided by the whole batch's rows.
+        lanes, steps = prepared['lanes'], prepared['steps']
+        # A rank's share of a global update is divided by the whole update's rows.
         rows_total = prepared.get('global_rows', prepared['rows'])
         if train:
             self.optimizer.zero_grad(set_to_none=True)
+        state = self.states.get(split) if split is not None else None
+        if state is None or state[0][0].shape[0] != lanes:
+            state = model.initial_state(lanes)
+        parts = prepared['microbatches']
+        decisions, delays, losses_by_part, heads_by_part, counts_by_part = [], [], [], [], []
+        position_errors, wait_sums = [], []  # Validation only.
+        norm = None
         with torch.set_grad_enabled(train):
-            for part in prepared['microbatches']:
-                rows = part['rows']
+            encoded, places = [], []
+            for part in parts:
                 if 'ready' in part:  # Uploaded by StagedUpdates: a GPU-side wait, not a CPU one.
                     torch.cuda.current_stream(model.device).wait_event(part['ready'])
-                # FP16 covers the trunk, where nearly all the work is; the small
-                # argument heads and losses stay FP32.
-                with torch.autocast('cuda', dtype=self.autocast or torch.float16, enabled=self.autocast is not None):
-                    trunk = model.events(prepared=part)
-                hidden, entities, spatial = (value.float() for value in trunk)
-                del trunk
-                output = model.teacher_heads(None, [row['target'] for row in rows], hidden,
-                                             entities, spatial, loss_only=True, plan=part['plan'],
-                                             position_metrics=not train)
-                if 'position_errors' in output:
-                    position_errors.append((part, *output['position_errors']))
-                if 'wait_probability' in output:
-                    wait_sums.append(output['wait_probability'].sum())
-                losses = event_losses(model, rows, output)
+                staged = part['staged_values'] if 'staged_values' in part else model.stager.stage(part['values'])
+                plan = part['plan']
+                if 'staged' not in plan:
+                    plan['staged'] = model.stager.stage(plan['values'])
+                selection = tuple(plan['staged'][name] for name in ('command_rows', 'selected_indices', 'selected_lengths'))
+
+                def encode(staged=staged, selection=selection):
+                    with torch.autocast('cuda', dtype=self.autocast or torch.float16, enabled=self.autocast is not None):
+                        out = model.encode_inputs(staged, selection)
+                    return out['core_input'], out['keys'], out['summary'], out['map']
+                encoded.append(checkpoint(encode, use_reentrant=False) if train else encode())
+                places.append((model.indices(part['lanes']), model.indices(part['steps'])))
+            if parts:
+                lane_index, step_index = (torch.cat(values) for values in zip(*places))
+                inputs = torch.cat([item[0] for item in encoded]).to(model.dtype)
+                grid = inputs.new_zeros((lanes, steps, inputs.shape[-1])).index_put((lane_index, step_index), inputs)
+                core, state = model.core(grid, model.indices(prepared['resets']).bool(),
+                                         [(h.detach(), c.detach()) for h, c in state])
+            if split is not None:
+                self.states[split] = [(h.detach(), c.detach()) for h, c in state]
+            total = None
+            for part, (lane, step), (_, keys, summary, spatial) in zip(parts, places, encoded):
+                rows, plan = part['rows'], part['plan']
+                rows_core = core[lane, step]
+                counts = head_counts(plan)
+                names = ['decision', 'delay']+[name for name in ('unit', 'slot', 'target', 'angle', 'cell', 'offset')
+                                               if name in plan['categories']]
+                factors = model.stager.stage(loss_factors(model.config, rows, counts, names))
                 if train:
-                    self.scaler.scale(losses.sum()/rows_total).backward()
-                decisions.append(output['predictions'][0][2].detach())
-                delays.append(next(item[2] for item in output['predictions'] if item[0] == 'delay').detach())
+                    def heads(rows_core, keys, summary, spatial, plan=plan, rows=rows, factors=factors, names=names):
+                        output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
+                                               loss_only=True)
+                        losses = head_losses(model, rows, output['by_head'], None, factors)
+                        return (losses, output['predictions'][0][2], output['predictions'][1][2],
+                                *[output['by_head'][name] for name in names])
+                    losses, decision, delay, *by_head = checkpoint(heads, rows_core, keys, summary, spatial,
+                                                                   use_reentrant=False)
+                    by_head = dict(zip(names, by_head))
+                    total = losses.sum() if total is None else total+losses.sum()
+                else:
+                    output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
+                                           loss_only=True, position_metrics=True)
+                    by_head = output['by_head']
+                    losses = head_losses(model, rows, by_head, None, factors)
+                    decision, delay = output['predictions'][0][2], output['predictions'][1][2]
+                    if 'position_errors' in output:
+                        position_errors.append((part, *output['position_errors']))
+                    wait_sums.append(output['wait_probability'].sum())
+                decisions.append(decision.detach()); delays.append(delay.detach())
                 losses_by_part.append(losses.detach())
-                heads_by_part.append(({name: value.detach() for name, value in output['by_head'].items()},
-                                      output['head_counts']))
-                # Release the preceding microbatch's graph before allocating
-                # the next one's tensors.
-                del hidden, entities, spatial, output, losses
-            norm = None
+                heads_by_part.append({name: value.detach() for name, value in by_head.items()})
+                counts_by_part.append(counts)
             if train:
+                if total is not None:
+                    self.scaler.scale(total/rows_total).backward()
                 if self.ranks.rank == 0:  # Once per update, not once per rank.
                     regularization = model.regularization_loss()
                     if regularization.requires_grad:
@@ -389,16 +444,15 @@ class EventLearner:
             guesses = torch.cat([torch.stack([d, e]) for d, e in zip(decisions, delays)], dim=1).cpu().numpy()
             # After the rows: the gradient norm.
             values = torch.cat(losses_by_part+([norm.reshape(1).to(losses_by_part[0].dtype)] if norm is not None else []))
-        else:  # This rank's share of a small final batch was empty; it still joined the update.
+        else:  # This rank's share of a small final update was empty; it still joined the update.
             guesses = np.zeros((2, 0), dtype=np.int64)
             values = norm.reshape(1).float() if norm is not None else torch.zeros(0)
         values = values.cpu().numpy()
         start = 0
-        for index, (part, row_losses) in enumerate(zip(prepared['microbatches'], np.split(values, np.cumsum([len(p['rows']) for p in
-                                                                                       prepared['microbatches']])))):
+        for index, (part, row_losses) in enumerate(zip(parts, np.split(values, np.cumsum([len(p['rows']) for p in parts])))):
             rows = part['rows']
             self._count(totals, rows, guesses[0, start:start+len(rows)], guesses[1, start:start+len(rows)], row_losses)
-            self._outliers(totals, part, row_losses, heads_by_part[index], train)
+            self._outliers(totals, part, row_losses, (heads_by_part[index], counts_by_part[index]), train)
             start += len(rows)
             totals['microbatches'] += 1
             totals['entity_pair_work'] += len(rows)*part['entity_count']**2
@@ -418,39 +472,12 @@ class EventLearner:
                 totals['skipped_updates'] = 1
         return totals
 
-    def _recheck(self, part, extreme):
-        """The extreme rows' losses recomputed now from the host's copy of the inputs.
-
-        'unstaged' repeats the run's precision without StagedUpdates' uploads; 'fp32'
-        drops autocast too. Equal to the recorded loss: the data. Normal again
-        unstaged: the staged inputs. Normal only in fp32: reduced precision. A training
-        update has already been applied, so small differences are expected there.
-        """
-        torch, model = self.torch, self.model
-        plain = {key: value for key, value in part.items() if key not in ('staged_values', 'ready')}
-        plain['plan'] = {key: value for key, value in part['plan'].items() if key != 'staged'}
-        rows, results = part['rows'], {}
-        with torch.no_grad():
-            for name, dtype in (('unstaged', self.autocast), ('fp32', None)):
-                with torch.autocast('cuda', dtype=dtype or torch.float16, enabled=dtype is not None):
-                    trunk = model.events(prepared=plain)
-                hidden, entities, spatial = (value.float() for value in trunk)
-                output = model.teacher_heads(None, [row['target'] for row in rows], hidden, entities, spatial,
-                                             loss_only=True, plan=plain['plan'])
-                losses = event_losses(model, rows, output)
-                results[name] = losses[torch.as_tensor(extreme, device=losses.device)].float().cpu().numpy()
-        return results
-
     def _outliers(self, totals, part, row_losses, heads, train):
-        """Record decisions above OUTLIER_NLL; their head terms leave the device only then."""
+        """Record decisions above OUTLIER_NLL with their per-head terms."""
         rows = part['rows']
         extreme = np.flatnonzero(~(row_losses[:len(rows)] <= OUTLIER_NLL))  # NaN counts as extreme
         if not len(extreme):
             return
-        try:
-            recheck = self._recheck(part, extreme)
-        except Exception as error:  # noqa: BLE001 - a report must never stop training
-            recheck = {'error': f'{type(error).__name__}: {error}'}
         by_head, counts = heads
         values = {name: value[extreme].float().cpu().numpy() for name, value in by_head.items()}
         for slot, row in enumerate(extreme):
@@ -462,10 +489,7 @@ class EventLearner:
                                   'match_key': source.get('match_key'), 'player': source.get('player'), 'frame': frame,
                                   'minute': None if frame is None else frame/source.get('source_ticks_per_second', 60)/60,
                                   'rating': source.get('rating'), 'nll': float(row_losses[row]),
-                                  'terms': terms, 'target': _plain(source['target']),
-                                  'recheck': {name: (float(value[slot]) if not isinstance(value, str) else value)
-                                              for name, value in recheck.items()},
-                                  'after_update': bool(train)})
+                                  'terms': terms, 'target': _plain(source['target']), 'after_update': bool(train)})
             totals['outliers'] += 1
             totals['outlier_loss_sum'] += float(row_losses[row])
 
@@ -533,7 +557,13 @@ class EventLearner:
         for group in self.optimizer.param_groups:
             group['lr'] = lr
 
-    def save(self, path, metadata):
+    def lane_arrays(self):
+        """This process's training lanes' LSTM state: {'lane_h0': (lanes, W), 'lane_c0': ..., ...}."""
+        return {f'lane_{kind}{layer}': value.detach().cpu().numpy() for layer, pair in enumerate(self.states.get('train', ()))
+                for kind, value in zip('hc', pair)}
+
+    def save(self, path, metadata, lanes=None):
+        """lanes: every training lane's state (global_lanes); this process's own by default."""
         def host(tensor):
             return tensor.detach().cpu().numpy()
         weights, first, second, steps = {}, {}, {}, {}
@@ -552,7 +582,20 @@ class EventLearner:
             metadata = {**metadata, 'event_grad_scaler': self.scaler.state_dict()}
         document = {'config': self.reference.config, 'optimizer_step': self.step_count, 'optimizer_lr': self.lr,
                     'metadata': {**metadata, 'event_rng': rng, 'event_optimizer_steps': steps}}
-        write_checkpoint(path, document, weights, first, second)
+        write_checkpoint(path, document, weights, first, second, self.lane_arrays() if lanes is None else lanes)
+
+    def restore_lanes(self, path, part_lanes=1):
+        """This rank's training lanes' LSTM state from a checkpoint (none saved: lanes start from zero)."""
+        torch = self.torch
+        with np.load(path, allow_pickle=False) as archive:
+            if 'lane_h0' not in archive:
+                return
+            arrays = {name: archive[name] for name in archive.files if name.startswith('lane_')}
+        rank, world = self.ranks.share or (0, 1)
+        arrays = rank_lanes(arrays, part_lanes, rank, world)
+        self.states['train'] = [tuple(torch.tensor(arrays[f'lane_{kind}{layer}'], dtype=self.model.dtype,
+                                                   device=self.model.device) for kind in 'hc')
+                                for layer in range(len(arrays)//2)]
 
     def restore_scaler(self, metadata):
         if self.fp16:
@@ -683,8 +726,9 @@ class LearningRate:
     Three independent parts, multiplied:
     - warmup: a linear ramp over the first `warmup` updates (Adam's second moments are
       empty then, and the clipped first steps are the least reliable of the run);
-    - schedule: 'constant', or 'cosine' from the peak to min_lr over `horizon` updates,
-      for runs with a planned length;
+    - schedule: 'constant'; 'cosine' from the peak to min_lr over `horizon` updates,
+      for runs with a planned length; or 'step': x step_factor from update `horizon` on
+      (SCC's recipe: 1e-3, then 1e-4, notes/plan.md §3);
     - plateau: `decay` each time `patience` consecutive validation rounds fail to improve
       on the best score, then `cooldown` rounds that are not counted. One bad round is
       usually a loss spike, not a plateau (v10 round 3, 11 Nov 2026), so patience
@@ -692,14 +736,15 @@ class LearningRate:
     min_lr floors the decayed rate, not the warmup ramp. The rate is a pure function of
     the update count and state(), so a resume continues it exactly.
     """
-    SCHEDULES=('constant','cosine')
+    SCHEDULES=('constant','cosine','step')
 
-    def __init__(self,peak,*,warmup=0,schedule='constant',horizon=0,min_lr=0.0,decay=1.0,patience=2,cooldown=0,state=None):
+    def __init__(self,peak,*,warmup=0,schedule='constant',horizon=0,min_lr=0.0,decay=1.0,patience=2,cooldown=0,
+                 step_factor=0.1,state=None):
         if (not math.isfinite(peak) or peak<=0 or schedule not in self.SCHEDULES or not 0<=min_lr<=peak or not 0<decay<=1
                 or any(type(v) is not int or v<0 for v in (warmup,horizon,cooldown)) or type(patience) is not int or patience<1
-                or (schedule=='cosine' and horizon<1)):
+                or (schedule in ('cosine','step') and horizon<1) or not 0<step_factor<=1):
             raise ValueError('Invalid learning-rate schedule')
-        self.peak,self.warmup,self.schedule,self.horizon=peak,warmup,schedule,horizon
+        self.peak,self.warmup,self.schedule,self.horizon,self.step_factor=peak,warmup,schedule,horizon,step_factor
         self.min_lr,self.decay,self.patience,self.cooldown=min_lr,decay,patience,cooldown
         self.scale,self.bad_rounds,self.cooling=1.0,0,0
         if state:
@@ -710,6 +755,7 @@ class LearningRate:
         parts={}
         if self.warmup:parts['warmup']=self.warmup
         if self.schedule!='constant':parts.update(schedule=self.schedule,horizon=self.horizon)
+        if self.schedule=='step':parts['step_factor']=self.step_factor
         if self.decay!=1.0:parts.update(decay=self.decay,patience=self.patience,cooldown=self.cooldown)
         if parts:parts['min_lr']=self.min_lr
         return parts or None
@@ -719,6 +765,8 @@ class LearningRate:
         rate=self.peak
         if self.schedule=='cosine':
             rate=self.min_lr+(self.peak-self.min_lr)*.5*(1+math.cos(math.pi*min(1.0,step/self.horizon)))
+        elif self.schedule=='step' and step>=self.horizon:
+            rate=self.peak*self.step_factor
         rate=max(self.min_lr,rate*self.scale)
         return rate*min(1.0,(step+1)/self.warmup) if self.warmup else rate
 
@@ -742,27 +790,35 @@ class LearningRate:
         return dict(scale=self.scale,bad_rounds=self.bad_rounds,cooling=self.cooling)
 
 
-def updates_per_epoch(dataset,seed,batch_size,buffer_bytes):
-    """Training updates in epoch 0 from the shard index alone; later epochs differ by a few (window boundaries)."""
-    return sum(math.ceil(sum(reference[2]['rows'] for reference in window)/batch_size)
-               for window in dataset.windows('train',seed=seed,epoch=0,buffer_bytes=buffer_bytes))
+def global_lanes(shares, part_lanes):
+    """Every lane's state in global lane order from each rank's own (event_training_batches.lane_parts:
+    rank r holds parts r, r+world, ... in order)."""
+    world = len(shares)
+    if not shares[0]:
+        return {}
+    result = {}
+    for name in shares[0]:
+        parts = sum(len(share[name]) for share in shares)//part_lanes
+        result[name] = np.concatenate([shares[part % world][name][(part//world)*part_lanes:(part//world+1)*part_lanes]
+                                       for part in range(parts)])
+    return result
 
 
-def batch_fill(dataset,seed,batch_size,buffer_bytes):
-    """Mean rows per training update divided by the requested batch size (epoch 0, from the shard index).
-
-    A batch is cut from one shuffle window (event_dataset.window_batches), and a window's
-    last batch is whatever rows remain. When the window holds only about one batch, the
-    requested size is never reached or every full batch is followed by a small remainder:
-    v10 asked for 512 and averaged 292 rows per update at a 64 MiB window. Near 1 means
-    the window holds many batches; raise --buffer-mib until it does.
-    """
-    rows=sum(reference[2]['rows'] for window in dataset.windows('train',seed=seed,epoch=0,buffer_bytes=buffer_bytes)
-             for reference in window)
-    return rows/max(1,updates_per_epoch(dataset,seed,batch_size,buffer_bytes))/batch_size
+def rank_lanes(arrays, part_lanes, rank, world):
+    """One rank's lanes (its parts, in order) from global_lanes' arrays."""
+    result = {}
+    for name, value in arrays.items():
+        parts = len(value)//part_lanes
+        result[name] = np.concatenate([value[part*part_lanes:(part+1)*part_lanes] for part in range(rank, parts, world)])
+    return result
 
 
-def write_checkpoint(path, document, weights, first, second):
+def updates_per_epoch(dataset,seed,lanes,steps,epoch=0):
+    """Training updates in an epoch: the lane schedule's length (index only, no decoding)."""
+    return sum(1 for _ in dataset.lane_schedule('train',seed=seed,epoch=epoch,lanes=lanes,steps=steps))
+
+
+def write_checkpoint(path, document, weights, first, second, extra=None):
     """Write learner state as NeuralPolicy.load reads it: float32 as trained, uncompressed.
 
     The hashes are NeuralPolicy.weight_hash/identity_hash, which load verifies
@@ -781,6 +837,7 @@ def write_checkpoint(path, document, weights, first, second):
     arrays = {'metadata': np.asarray(json.dumps(document, allow_nan=False))}
     for prefix, values in (('p_', weights), ('m_', first), ('v_', second)):
         arrays.update({prefix+name: value for name, value in values.items()})
+    arrays.update(extra or {})
     temporary = path.with_name(path.name+'.part')
     with temporary.open('wb') as stream:
         np.savez(stream, **arrays)
@@ -809,10 +866,10 @@ def restore_best_checkpoint(resume,best,stopper,metadata):
     else:raise ValueError('Best checkpoint is missing/stale and cannot be recovered from this resume point')
 
 
-def validation_marks(dataset,seed,epoch,buffer_bytes,validations):
-    """Shuffle windows before whose first batch the epoch's mid-epoch validations run."""
+def validation_marks(dataset,seed,epoch,lanes,steps,validations):
+    """Updates before which the epoch's mid-epoch validations run."""
     if validations==1:return []
-    count=len(dataset.windows('train',seed=seed,epoch=epoch,buffer_bytes=buffer_bytes))
+    count=updates_per_epoch(dataset,seed,lanes,steps,epoch)
     return sorted({math.ceil(k*count/validations) for k in range(1,validations)}-{0,count})
 
 
@@ -837,7 +894,8 @@ def train(args, ranks=None):
     best = output/'best.npz'
     if (latest.exists() or best.exists()) and not args.resume:
         raise ValueError('Output already has a checkpoint; use --resume explicitly')
-    settings = {'seed': args.seed, 'batch_size': args.batch_size, 'buffer_bytes': args.buffer_mib*1024*1024,
+    settings = {'seed': args.seed, 'lanes': args.lanes, 'unroll': args.unroll, 'part_lanes': args.part_lanes,
+                'cache_bytes': args.cache_mib*1024*1024,
                 'pair_budget': args.pair_budget, 'device': args.device, 'threads': args.threads, 'lr': args.lr,
                 'prefetch_batches': getattr(args, 'prefetch_batches', 1),
                 'reader_processes': getattr(args, 'reader_processes', 1),
@@ -858,23 +916,19 @@ def train(args, ranks=None):
         # The planned run: every epoch of the ceiling, or the update limit when that is sooner.
         if not args.epochs and not args.max_updates:
             raise ValueError('A cosine schedule needs --epochs, --max-updates or --lr-horizon-updates')
-        lr_horizon=(args.epochs*updates_per_epoch(dataset,args.seed,args.batch_size,settings['buffer_bytes'])
+        lr_horizon=(args.epochs*updates_per_epoch(dataset,args.seed,args.lanes,args.unroll)
                     if args.epochs else args.max_updates)
         if args.max_updates:lr_horizon=min(lr_horizon,args.max_updates)
+    if lr_schedule=='step':
+        # SCC's decay point, given in decisions (154M in plan §3), as whole updates of lanes x unroll.
+        if not getattr(args,'lr_step_decisions',0):raise ValueError('A step schedule needs --lr-step-decisions')
+        lr_horizon=max(1,round(args.lr_step_decisions/(args.lanes*args.unroll)))
     rate_options=dict(warmup=getattr(args,'lr_warmup_updates',0),schedule=lr_schedule,
-                      horizon=lr_horizon if lr_schedule=='cosine' else 0,min_lr=min_lr,decay=lr_decay,
-                      patience=getattr(args,'lr_patience',2),cooldown=getattr(args,'lr_cooldown',0))
+                      horizon=lr_horizon if lr_schedule in ('cosine','step') else 0,min_lr=min_lr,decay=lr_decay,
+                      patience=getattr(args,'lr_patience',2),cooldown=getattr(args,'lr_cooldown',0),
+                      step_factor=getattr(args,'lr_step_factor',0.1))
     rates=LearningRate(args.lr,**rate_options)
     if rates.settings():settings['lr_schedule']=rates.settings()
-    # Refuse a run whose shuffle window cannot supply the requested batch size (batch_fill).
-    minimum_fill=getattr(args,'min_batch_fill',0)
-    if minimum_fill:
-        fill=batch_fill(dataset,args.seed,args.batch_size,settings['buffer_bytes'])
-        if leader:print(json.dumps({'batch_fill':fill,'batch_size':args.batch_size,'buffer_mib':args.buffer_mib}),flush=True)
-        if fill<minimum_fill:
-            raise ValueError(f'Updates would average {fill*args.batch_size:.0f} rows, not the requested {args.batch_size}: '
-                             f'the {args.buffer_mib} MiB shuffle window holds too few rows. Raise --buffer-mib '
-                             f'(or lower --batch-size); --min-batch-fill 0 disables this check')
     # Early stopping, LR decay and best.npz follow this validation score (SELECT_ON).
     select_on=getattr(args,'select_on','all')
     if select_on not in SELECT_ON:raise ValueError('Unknown validation selection '+str(select_on))
@@ -886,10 +940,11 @@ def train(args, ranks=None):
     if init:settings['init_sha256']=_digest(Path(init))
     stopper=EarlyStopping(patience,min_delta)
     if (args.epochs<0 or (args.epochs==0 and patience==0)
-            or min(args.checkpoint_seconds, args.buffer_mib, args.batch_size, args.threads, args.pair_budget) <= 0
+            or min(args.checkpoint_seconds, args.cache_mib, args.lanes, args.unroll, args.part_lanes, args.threads,
+                   args.pair_budget) <= 0
             or not math.isfinite(args.checkpoint_seconds) or args.max_updates < 0 or args.seed < 0
             or not 0 <= settings['prefetch_batches'] <= 2 or settings['reader_processes'] < 1
-            or type(validations) is not int or validations < 1 or args.batch_size < ranks.world):
+            or type(validations) is not int or validations < 1 or args.lanes % (args.part_lanes*ranks.world)):
         raise ValueError('Invalid run budget')
     if (not math.isfinite(args.lr) or args.lr <= 0 or args.min_free_ram_mib < 1
             or args.max_private_mib < 1 or not 0 < lr_decay <= 1 or not 0 <= min_lr <= args.lr
@@ -897,14 +952,14 @@ def train(args, ranks=None):
         raise ValueError('Invalid optimizer/model/resource configuration')
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     # validations_done: this epoch's mid-epoch rounds already run.
-    epoch, cursor, validations_done, previous = 0, (0, 0), 0, {}
+    epoch, cursor, validations_done, previous = 0, 0, 0, {}
     if args.resume:
         reference, optimizer, document = NeuralPolicy.load(args.resume)
         previous = document['metadata']
         if previous['event_dataset_sha256'] != dataset.digest or previous['event_settings'] != settings:
             raise ValueError('Resume requires identical data, sampler, optimizer and runtime settings')
         epoch = previous['event_cursor']['epoch']
-        cursor = tuple(previous['event_cursor']['position'])
+        cursor = previous['event_cursor']['position']
         validations_done = previous['event_cursor']['validations']
         stopper=EarlyStopping(patience,min_delta,previous.get('event_early_stopping'))
         rates=LearningRate(args.lr,**rate_options,state=previous.get('event_lr_state'))
@@ -936,6 +991,7 @@ def train(args, ranks=None):
     if previous:
         learner.restore_rng(previous)
         learner.restore_scaler(previous)
+        learner.restore_lanes(args.resume, args.part_lanes)
     source_proofs = [entry['index']['source'] for entry in dataset.entries]
     sources = Path(__file__).parent
     names = ('train_events.py', 'event_resources.py', 'event_training_batches.py', 'event_policy.py',
@@ -952,7 +1008,7 @@ def train(args, ranks=None):
     metadata['event_match_partitions'] = {e['match_key']: e['split'] for e in dataset.entries}
     metadata['event_resource_limits'] = guard
     if not previous and leader:
-        metadata['event_cursor'] = {'epoch': 0, 'position': [0, 0], 'validations': 0}
+        metadata['event_cursor'] = {'epoch': 0, 'position': 0, 'validations': 0}
         learner.save(output/'initial.npz', metadata)
         with zipfile.ZipFile(output/'sources.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
             for name in names:
@@ -975,7 +1031,7 @@ def train(args, ranks=None):
 
     def checkpoint():
         """Every rank calls this at the same update; rank 0 writes."""
-        metadata['event_cursor'] = {'epoch': epoch, 'position': list(cursor), 'validations': validations_done}
+        metadata['event_cursor'] = {'epoch': epoch, 'position': cursor, 'validations': validations_done}
         metadata['event_history'] = history
         metadata['event_round_counts'] = dict(ranks.merge(round_counts))
         metadata['event_early_stopping'] = stopper.state()
@@ -985,10 +1041,11 @@ def train(args, ranks=None):
             with open(output/name, 'a') as stream:
                 stream.writelines(json.dumps(record)+'\n' for record in learner.outliers)
             learner.outliers.clear()
+        lanes = global_lanes(ranks.gather(learner.lane_arrays()), args.part_lanes)
         if not leader:
             return
         # latest.npz stays in place until its successor is complete.
-        learner.save(pending, metadata)
+        learner.save(pending, metadata, lanes)
         if latest.exists():
             os.replace(latest, output/'previous.npz')
         os.replace(pending, latest)
@@ -1005,20 +1062,20 @@ def train(args, ranks=None):
         return stop_requested or (stop_file and stop_file.exists())
 
     def train_segment(mark):
-        """Train from the cursor until shuffle window `mark` (None: the epoch's end).
+        """Train from the cursor until update `mark` (None: the epoch's end).
 
         True when the epoch's data ran out; otherwise stopped at the mark, or
-        with the reason in status. The batch that reaches the mark is left for
-        the stream reopened after validation, as a resume would leave it.
+        with the reason in status. The update at the mark is left for the
+        stream reopened after validation, as a resume would leave it.
         """
         nonlocal cursor, status, checkpoint_time
         stream = learner.staged(prepared_batches(dataset, 'train', spec=spec, pair_budget=args.pair_budget,
-                reader=reader, seed=args.seed, epoch=epoch, batch_size=args.batch_size,
-                buffer_bytes=settings['buffer_bytes'], cursor=cursor, **share))
+                reader=reader, seed=args.seed, epoch=epoch, lanes=args.lanes, steps=args.unroll, part_lanes=args.part_lanes,
+                cache_bytes=settings['cache_bytes'], cursor=cursor, **share))
         try:
             for update_inputs, following in stream:
-                # following names the batch's own shuffle window.
-                if mark is not None and following[0] >= mark:
+                # following is the update after this one.
+                if mark is not None and following-1 >= mark:
                     return False
                 resources = snapshot(output, learner.model)
                 interrupted, short = ranks.any(stopping(), not within_budget(resources, **guard))
@@ -1071,9 +1128,11 @@ def train(args, ranks=None):
         train_seconds = time.monotonic()-round_start
         validation_start = time.monotonic()
         validation = Counter()
+        # Whole validation episodes in order, every lane from a zero state (plan §2).
+        learner.reset_lanes('validation')
         stream = learner.staged(prepared_batches(dataset, 'validation', spec=spec, pair_budget=args.pair_budget,
-                reader=reader, seed=args.seed, epoch=0, batch_size=args.batch_size,
-                buffer_bytes=settings['buffer_bytes'], **share))
+                reader=reader, seed=args.seed, epoch=0, lanes=args.lanes, steps=args.unroll, part_lanes=args.part_lanes,
+                cache_bytes=settings['cache_bytes'], shuffle=False, **share))
         try:
             for update_inputs, _ in stream:
                 resources = snapshot(output, learner.model)
@@ -1082,7 +1141,7 @@ def train(args, ranks=None):
                     status = 'interrupted' if interrupted else 'resource_limit'
                     resource_log.append({'seconds': time.monotonic()-start, **resources})
                     return None
-                validation.update(learner.run(update_inputs, train=False))
+                validation.update(learner.run(update_inputs, train=False, split='validation'))
         finally:
             stream.close()
             if cuda:
@@ -1110,7 +1169,7 @@ def train(args, ranks=None):
     def publish(improved):
         """Checkpoint right after a round; that cursor identifies the round for best-copy recovery."""
         nonlocal checkpoint_time, round_start
-        history[-1]['cursor'] = {'epoch': epoch, 'position': list(cursor), 'validations': validations_done}
+        history[-1]['cursor'] = {'epoch': epoch, 'position': cursor, 'validations': validations_done}
         saving = time.monotonic()
         checkpoint(); checkpoint_time = time.monotonic()
         if improved and leader:copy_checkpoint(latest,best)
@@ -1135,7 +1194,7 @@ def train(args, ranks=None):
             if args.max_updates and learner.step_count >= args.max_updates:
                 status = 'update_limit'
                 break
-            marks = validation_marks(dataset, args.seed, epoch, settings['buffer_bytes'], validations)
+            marks = validation_marks(dataset, args.seed, epoch, args.lanes, args.unroll, validations)
             exhausted = False
             # Mid-epoch rounds: train to each mark, then validate there.
             while status == 'completed' and not exhausted and not stopper.stopped:
@@ -1151,7 +1210,7 @@ def train(args, ranks=None):
             improved = validation_round(1.0)
             if improved is None:
                 break
-            epoch += 1; cursor = (0, 0); validations_done = 0
+            epoch += 1; cursor = 0; validations_done = 0
             publish(improved)
     finally:
         if reader is not None:
@@ -1277,7 +1336,10 @@ def main():
     run.add_argument('--lr-cooldown', type=int, default=0, help='Validation rounds not counted after a plateau decay')
     run.add_argument('--lr-warmup-updates', type=int, default=0, help='Linear ramp to --lr over this many updates')
     run.add_argument('--lr-schedule', choices=LearningRate.SCHEDULES, default='constant',
-                     help='cosine: from --lr to --min-lr over the planned run (--epochs, or --lr-horizon-updates)')
+                     help='cosine: from --lr to --min-lr over the planned run (--epochs, or --lr-horizon-updates); '
+                          'step: x --lr-step-factor after --lr-step-decisions')
+    run.add_argument('--lr-step-decisions', type=int, default=0, help='Step schedule: decisions trained before the decay')
+    run.add_argument('--lr-step-factor', type=float, default=0.1, help='Step schedule: the rate\'s factor after the step')
     run.add_argument('--lr-horizon-updates', type=int, default=0, help='Cosine length in updates; 0 takes it from --epochs')
     run.add_argument('--min-lr', type=float, default=0.0, help='Floor of the cosine and of plateau decays')
     run.add_argument('--prefetch-batches', type=int, default=1,
@@ -1291,16 +1353,15 @@ def main():
     run.add_argument('--min-free-disk-gib', type=int, default=80)
     run.add_argument('--max-gpu-mib', type=int, default=9216, help='Stop and checkpoint above this allocation')
     run.add_argument('--threads', type=int, default=1)
-    run.add_argument('--batch-size', type=int, default=256,
-                     help='Global batch: with --world-size N each rank trains on every N-th row')
+    run.add_argument('--lanes', type=int, default=240,
+                     help='Episodes trained side by side; an update is lanes x unroll decisions (global, split between ranks)')
+    run.add_argument('--unroll', type=int, default=64, help='Consecutive decisions per lane and update (truncated BPTT)')
+    run.add_argument('--part-lanes', type=int, default=8, help='Lanes per reader part (preparation and transfer unit)')
     run.add_argument('--world-size', type=int, default=1,
                      help='Data-parallel ranks on this host, one GPU each (gloo on CPU for testing)')
     run.add_argument('--pair-budget', type=int, default=8_000_000)
-    run.add_argument('--buffer-mib', type=int, default=64,
-                     help='Shuffle window; batches are cut from one window, so it must hold many batches')
-    run.add_argument('--min-batch-fill', type=float, default=0.9,
-                     help='Refuse to start when updates would average less than this share of --batch-size '
-                          '(the shuffle window is too small); 0 disables')
+    run.add_argument('--cache-mib', type=int, default=256,
+                     help='Decoded chunks each reader keeps, so a lane reads each chunk of its episode once')
     run.add_argument('--checkpoint-seconds', type=float, default=600)
     run.add_argument('--stop-file', help='Checkpoint and exit at an update boundary when this file exists')
     run.add_argument('--min-free-ram-mib', type=int, default=4096)

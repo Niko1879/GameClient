@@ -17,7 +17,7 @@ def entry(key, split, ratings, players=(1,)):
 
 class SubsetTests(unittest.TestCase):
     def setUp(self):
-        self.document = {'config': {'hidden': 8, 'map_side': 16}, 'selection': {'seed': 1}, 'entries': [
+        self.document = {'config': {'widths': {'core': 8}, 'map_side': 16}, 'selection': {'seed': 1}, 'entries': [
             entry('v-low', 'validation', {'1': rated(900), '2': rated(1000)}),
             entry('t-low', 'train', {'1': rated(900), '2': rated(2000)}),          # A strong opponent does not count.
             entry('t-high', 'train', {'1': rated(1500), '2': rated(1300)}),
@@ -49,8 +49,9 @@ class SubsetTests(unittest.TestCase):
                 subset(self.document, **options)
 
     def test_widths_change_only_model_widths(self):
-        result = subset(self.document, widths={'hidden': 32})
-        self.assertEqual(result['config'], {'hidden': 32, 'map_side': 16})
+        # Network widths are generals_policy.WIDTHS, overridden through the model-only 'widths' entry.
+        result = subset(self.document, widths={'widths': {'core': 32}})
+        self.assertEqual(result['config'], {'widths': {'core': 32}, 'map_side': 16})
         self.assertEqual(len(result['entries']), 6)
         with self.assertRaises(ValueError):
             subset(self.document, widths={'map_side': 8})

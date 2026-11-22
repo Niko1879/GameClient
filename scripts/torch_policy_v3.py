@@ -1,7 +1,8 @@
-"""Batched PyTorch event policy over the NumPy reference parameters and inputs.
+"""Batched PyTorch AlphaGenerals policy over the NumPy reference parameters and inputs.
 
-Weights retain the reference parameter names and layout, so checkpoints are shared
-with the deployed NumPy policy. Padding never enters attention or pooling.
+Weights keep the reference parameter names and layout, so checkpoints are shared with
+generals_policy.NeuralPolicy, whose one-observation equations these batch
+(test_alphagenerals holds them equal). Padding never enters attention or pooling.
 """
 from __future__ import annotations
 
@@ -12,16 +13,18 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from generals_policy import (ATTENTION_LAYERS, ARCHITECTURE, LOCATION_BLOCKS, LOGIT_CAP, MAP_RESIDUAL_BLOCKS, SCATTER_SCALE,
-                             SCATTER_VOLUME, UNDER_ATTACK_COLUMN, location_order, location_stages)
+from generals_policy import (ARCHITECTURE, ATTENTION_LAYERS, GROUPS, LOCATION_BLOCKS, LOGIT_CAP, LSTM_LAYERS,
+                             MAP_RESIDUAL_BLOCKS, SCATTER_SCALE, SCATTER_VOLUME, SELECTED_UNIT_DIVISOR,
+                             UNDER_ATTACK_COLUMN, UNIT_GROUPS, group_sources, location_order, location_stages, widths)
 
 
 class TorchPolicyV3(nn.Module):
     def __init__(self, reference, *, device='cpu', dtype=torch.float64):
         super().__init__()
         if reference.config.get('architecture') != ARCHITECTURE:
-            raise ValueError('PyTorch learner requires the event policy')
+            raise ValueError('PyTorch learner requires the AlphaGenerals policy')
         self.reference, self.config = reference, reference.config
+        self.widths = widths(self.config)
         self.weights = nn.ParameterDict(OrderedDict((name, nn.Parameter(torch.tensor(
             value.data, dtype=dtype, device=device))) for name, value in reference.parameters.items()))
         identity = reference.encoder.identity
@@ -29,6 +32,8 @@ class TorchPolicyV3(nn.Module):
             self.register_buffer('identity_' + name, torch.tensor(
                 getattr(identity, name), dtype=torch.long, device=device))
         self.register_buffer('location_order', torch.tensor(location_order(self.config).reshape(-1), dtype=torch.long, device=device))
+        # The kind of each flat action (reports compare kinds).
+        self.register_buffer('action_kinds', torch.tensor(reference.actions[:, 0], dtype=torch.long, device=device))
         from torch_training_inputs import TensorStager
         self.stager = TensorStager(self)
         self.legality_key = None
@@ -65,11 +70,14 @@ class TorchPolicyV3(nn.Module):
         if not self.config.get('variant_l2', 0):
             return torch.zeros((), dtype=self.dtype, device=self.device)
         return sum(self.weights[name].square().sum() for name in
-                   ('general_embedding', 'variant_embedding', 'template_b')) * self.config['variant_l2']
+                   ('general_embedding', 'variant_embedding')) * self.config['variant_l2']
 
     @staticmethod
     def normalize(value):
         return F.layer_norm(value, (value.shape[-1],), eps=1e-5)
+
+    def layer_norm(self, value, name):
+        return F.layer_norm(value, (value.shape[-1],), self.weights[name+'_g'], self.weights[name+'_b'], eps=1e-5)
 
     @property
     def float_dtype(self):
@@ -79,82 +87,18 @@ class TorchPolicyV3(nn.Module):
     def device_type(self):
         return self.device.type
 
-    def encode_batch(self, encoded):
-        """Pad only this chunk's entity dimension; padding never enters attention/pooling."""
-        from training_preparation import encode_values
-        values, _ = encode_values(self, encoded)
-        return self.encode_inputs(self.stager.stage(values))
-
     def conv(self, values, name, stride=1, padding=0):
         return F.conv2d(values, self.weights[name], stride=stride, padding=padding)+self.weights[name+'_b']
 
-    def encode_map(self, inputs, entity):
-        """(skips: (batch, 5, m, n, n), embedding): AlphaStar's scatter and spatial encoder."""
-        p, config = self.weights, self.config
-        n, side = config['map_side'], config['map_side']*SCATTER_SCALE
-        batch, area = entity.shape[0], side*side
-        pixels, real = inputs['scatter_pixels'], inputs['real']
-        counts = torch.zeros((batch, area), dtype=entity.dtype, device=self.device).scatter_add(1, pixels, real.to(entity.dtype))
-        shares = SCATTER_VOLUME/counts.gather(1, pixels).clamp_min(SCATTER_VOLUME)*real
-        values = F.relu(entity @ p['scatter_w'])*shares[:, :, None]
-        image = torch.zeros((batch, area, values.shape[-1]), dtype=values.dtype, device=self.device).scatter_add(
-            1, pixels[:, :, None].expand(-1, -1, values.shape[-1]), values)
-        image = image.reshape(batch, side, side, -1).permute(0, 3, 1, 2)
-        # The same planes as generals_policy.map_planes, built here from compact inputs.
-        static = inputs['map_statics'][inputs['map_static_index']].permute(0, 2, 1)
-        visibility = F.one_hot(inputs['map_visibility'], 3).permute(0, 2, 1).to(static.dtype)
-        planes = torch.zeros((batch, 5*area), dtype=static.dtype, device=self.device).scatter_add(
-            1, inputs['map_channels']*area+pixels, real.to(static.dtype))
-        planes = (planes[:, :4*area].reshape(batch, 4, area)+1).log()/4
-        attacked = (inputs['numeric'][:, :, UNDER_ATTACK_COLUMN]*real).to(static.dtype)
-        alert = torch.zeros((batch, area), dtype=static.dtype, device=self.device).scatter_add(1, pixels, attacked).clamp_max(1)[:, None]
-        maps = torch.cat([static, visibility, planes, alert], dim=1).reshape(batch, -1, side, side)
-        x = F.relu(self.conv(torch.cat([maps.to(image.dtype), image], dim=1), 'map_project'))
-        for stage in range(3):
-            x = F.relu(self.conv(x, f'map_down{stage}', 2, 1))
-        skips = [x]
-        for block in range(MAP_RESIDUAL_BLOCKS):
-            residual = x
-            x = self.conv(F.relu(x), f'map_res{block}_a', padding=1)
-            x = self.conv(F.relu(x), f'map_res{block}_b', padding=1)+residual
-            skips.append(x)
-        embedded = F.relu(F.relu(x).flatten(1) @ p['map_fc']+p['map_fc_b'])
-        return torch.stack(skips, dim=1), embedded
+    # Encoder (plan §1a-1d), one row per observation.
 
-    def location(self, spatial, context, build=None):
-        """(cell features (rows, m, n, n), logits (rows, n*n, offsets)) for position arguments."""
-        p, config = self.weights, self.config
-        rows, n, m = spatial.shape[0], config['map_side'], config['map_hidden']
-        x = F.relu(torch.cat([spatial[:, MAP_RESIDUAL_BLOCKS],
-                              (context @ p['location_context_w']).reshape(rows, 4, n, n)], dim=1))
-        x = F.relu(self.conv(x, 'location_input'))
-        film = (context @ p['location_film_w']+p['location_film_b'])[:, :, None, None]
-        for block in range(LOCATION_BLOCKS):
-            residual = F.relu(self.conv(x, f'location_block{block}_a'))
-            y = self.conv(residual, f'location_block{block}_b', padding=1)
-            gamma, beta = film[:, 2*block*m:(2*block+1)*m]+1, film[:, (2*block+1)*m:(2*block+2)*m]
-            x = F.relu(F.relu(y*gamma+beta)+residual+spatial[:, MAP_RESIDUAL_BLOCKS-1-block])
-        if build is not None:
-            where, features = build
-            x = x.index_add(0, where, (features @ p['build_map_w']).permute(0, 2, 1).reshape(len(where), m, n, n))
-        cells, y = x, x
-        stages = location_stages(config)
-        for stage in range(len(stages)):
-            y = F.conv_transpose2d(y, p[f'location_up{stage}'], stride=2, padding=1)+p[f'location_up{stage}_b']
-            if stage < len(stages)-1:
-                y = F.relu(F.layer_norm(y.flatten(1), (y[0].numel(),), eps=1e-5).reshape(y.shape))
-        fine = config['position_bins']//n
-        flat = y.flatten(1)
-        flat = torch.tanh((flat-flat.gather(1, flat.detach().argmax(1, keepdim=True)))/LOGIT_CAP)*LOGIT_CAP
-        return cells, flat[:, self.location_order].reshape(rows, n*n, fine*fine)
-
-    def encode_inputs(self, inputs):
-        """Numerical encoder after CPU preparation and device staging."""
+    def entity_inputs(self, inputs):
+        """(units (batch, count, d), effect tokens (batch, effects, d)): NeuralPolicy._entity_inputs."""
         p, config = self.weights, self.config
         features = inputs['numeric']
         batch, count, _ = features.shape
         # One per-type table for an entity's own type and its queue items, then a single input
-        # GEMM: the same sums as separate per-slice products (generals_policy._encode_modalities).
+        # GEMM: the same sums as separate per-slice products.
         table = self.object_embedding(self.identity_type_objects)
         types = F.embedding(inputs['types'], table)
         # Queue: slot 0 is in production now, the rest pending; a slot is a unit type (-1: none)
@@ -175,7 +119,7 @@ class TorchPolicyV3(nn.Module):
                        + F.embedding(ids, p['entity_command_progress_embedding'])*progress)*charging).sum(dim=2)
         entity = torch.tanh(torch.cat([features, types, upgrades, commands], dim=-1) @ p['entity_w'] + p['entity_b'])
         from unit_tasks import RELATIONS
-        hidden = config['entity_hidden']
+        hidden = self.widths['entity']
         base = entity.reshape(batch*count, hidden)
         rows = inputs['task_rows'].numel()
         # Masking a linked row before its product equals masking after (0/1);
@@ -187,77 +131,310 @@ class TorchPolicyV3(nn.Module):
                     + inputs['task_relation_features'].flatten(1)
                     @ torch.cat([p['task_'+role+'_features_w'] for role in RELATIONS]))
         entity = torch.tanh(base.index_add(0, inputs['task_rows'], addition.to(base.dtype))).reshape(batch, count, hidden)
-        heads, width = config['attention_heads'], config['entity_hidden']//config['attention_heads']
-        # v11 effect and sound-cue tokens (generals_policy.Encoder._effects) join the attention, then
-        # leave before the map scatter, pools of units and every head; padded tokens are never keys.
-        effect_valid = inputs['effect_valid']
         tokens = torch.tanh(inputs['effect_numeric'] @ p['effect_w'] + self.type_embedding(inputs['effect_types']) @ p['effect_type_w']
                             + F.embedding(inputs['effect_powers'], p['power_embedding']) @ p['effect_power_w'] + p['effect_b'])
-        entity = torch.cat([entity, tokens.to(entity.dtype)], dim=1)
-        rows = entity.shape[1]
-        valid = ~torch.cat([inputs['valid'], effect_valid], dim=1)[:, None, None, :]
+        return entity, tokens.to(entity.dtype)
+
+    def attend(self, q, k, v, valid):
+        """Masked multi-head attention: (batch, queries, inner) over (batch, sources, inner).
+
+        A row whose source group is empty gets zeros, as the reference."""
+        heads, width = self.widths['heads'], self.widths['head_width']
+        batch, queries, sources = q.shape[0], q.shape[1], k.shape[1]
+        q = q.reshape(batch, queries, heads, width).transpose(1, 2)
+        k = k.reshape(batch, sources, heads, width).transpose(1, 2)
+        v = v.reshape(batch, sources, heads, width).transpose(1, 2)
+        mask = valid[:, None, None, :]
+        scores = (q @ k.transpose(-1, -2)/math.sqrt(width)).masked_fill(~mask, -torch.inf)
+        scores = torch.where(mask.any(dim=-1, keepdim=True), scores, torch.zeros_like(scores))
+        weights = scores.softmax(dim=-1)*mask
+        return (weights @ v).transpose(1, 2).reshape(batch, queries, heads*width)
+
+    def group_transformer(self, groups, valid):
+        """Per-group features after the plan §1b layers; groups[g] is (batch, n_g, d), valid[g] (batch, n_g)."""
+        p, x = self.weights, list(groups)
         for layer in range(ATTENTION_LAYERS):
-            q, k, v = [(entity @ p[f'{name}{layer}']).reshape(batch, rows, heads, width).transpose(1, 2)
-                       for name in ('attn_q', 'attn_k', 'attn_v')]
-            scores = (q @ k.transpose(-1, -2)/math.sqrt(width)).masked_fill(valid, -torch.inf)
-            attended = (scores.softmax(dim=-1) @ v).transpose(1, 2).reshape(batch, rows, config['entity_hidden'])
-            entity = self.normalize(entity + attended @ p[f'attn_out{layer}'])
-            entity = self.normalize(entity + F.relu(entity @ p[f'entity_ff_in{layer}']) @ p[f'entity_ff_out{layer}'])
-        entity, effects = entity[:, :count], entity[:, count:]
-        spatial, map_embedding = self.encode_map(inputs, entity)
-        scalar = inputs['scalars'] @ p['scalar_w'] + p['scalar_b']
-        for i, prefix in enumerate(('task_command', 'task_validation')):
-            scalar = scalar + inputs['task_commands'][:, i] @ p[prefix+'_w']
-            embedding = self.type_embedding(inputs['task_command_templates'][:, i])
-            scalar = scalar + (embedding @ p[prefix+'_template_w']) * inputs['task_command_template_present'][:, i, None]
+            normed = [self.layer_norm(value, f'attn{layer}_{GROUPS[g]}_ln') for g, value in enumerate(x)]
+            updated = []
+            for g, value in enumerate(x):
+                name, ffn = f'attn{layer}_{GROUPS[g]}', f'ffn{layer}_{GROUPS[g]}'
+                parts = []
+                for s in group_sources(g):
+                    pair = f'{name}_{GROUPS[s]}'
+                    parts.append(self.attend(normed[g] @ p[pair+'_q'], normed[s] @ p[pair+'_k'], normed[s] @ p[pair+'_v'], valid[s]))
+                value = value+torch.cat(parts, dim=-1) @ p[name+'_out_w']+p[name+'_out_b']
+                hidden = F.relu(self.layer_norm(value, ffn+'_ln') @ p[ffn+'_in_w']+p[ffn+'_in_b'])
+                updated.append(value+hidden @ p[ffn+'_out_w']+p[ffn+'_out_b'])
+            x = updated
+        return [self.layer_norm(value, f'final_{GROUPS[g]}_ln') for g, value in enumerate(x)]
+
+    def pool(self, value, valid, group):
+        """Attention pooling (NeuralPolicy._pool): (batch, queries*heads*width); an empty group gives zeros."""
+        p, W = self.weights, self.widths
+        heads, width, queries = W['heads'], W['head_width'], W['pool_queries']
+        batch, count = value.shape[:2]
+        k = (value @ p[f'pool_{group}_k']).reshape(batch, count, heads, width)
+        v = (value @ p[f'pool_{group}_v']).reshape(batch, count, heads, width)
+        q = p[f'pool_{group}_query'].reshape(queries, heads, width)
+        scores = torch.einsum('bnhw,qhw->bqhn', k, q.to(k.dtype))/math.sqrt(width)
+        mask = valid[:, None, None, :]
+        scores = scores.masked_fill(~mask, -torch.inf)
+        scores = torch.where(mask.any(dim=-1, keepdim=True), scores, torch.zeros_like(scores))
+        weights = scores.softmax(dim=-1)*mask
+        return torch.einsum('bqhn,bnhw->bqhw', weights, v).reshape(batch, queries*heads*width)
+
+    @staticmethod
+    def entity_order(values, index, valid, count):
+        """Per-group rows (batch, n_g, width) back in entity order (batch, count, width); padding stays zero."""
+        width = values[0].shape[-1]
+        result = values[0].new_zeros((values[0].shape[0], count, width))
+        for value, rows, mask in zip(values, index, valid):
+            result = result.scatter_add(1, rows[:, :, None].expand(-1, -1, width), value*mask[:, :, None].to(value.dtype))
+        return result
+
+    def encode_map(self, inputs, scattered):
+        """(1x1 map (batch, map_out, n, n), embedding): NeuralPolicy._encode_map."""
+        p, config = self.weights, self.config
+        side = config['map_side']*SCATTER_SCALE
+        batch, area = scattered.shape[0], side*side
+        pixels, real = inputs['scatter_pixels'], inputs['real']
+        counts = torch.zeros((batch, area), dtype=scattered.dtype, device=self.device).scatter_add(1, pixels, real.to(scattered.dtype))
+        shares = SCATTER_VOLUME/counts.gather(1, pixels).clamp_min(SCATTER_VOLUME)*real
+        values = scattered*shares[:, :, None]
+        image = torch.zeros((batch, area, values.shape[-1]), dtype=values.dtype, device=self.device).scatter_add(
+            1, pixels[:, :, None].expand(-1, -1, values.shape[-1]), values)
+        image = image.reshape(batch, side, side, -1).permute(0, 3, 1, 2)
+        # The same planes as generals_policy.map_planes, built here from compact inputs.
+        static = inputs['map_statics'][inputs['map_static_index']].permute(0, 2, 1)
+        visibility = F.one_hot(inputs['map_visibility'], 3).permute(0, 2, 1).to(static.dtype)
+        planes = torch.zeros((batch, 5*area), dtype=static.dtype, device=self.device).scatter_add(
+            1, inputs['map_channels']*area+pixels, real.to(static.dtype))
+        planes = (planes[:, :4*area].reshape(batch, 4, area)+1).log()/4
+        attacked = (inputs['numeric'][:, :, UNDER_ATTACK_COLUMN]*real).to(static.dtype)
+        alert = torch.zeros((batch, area), dtype=static.dtype, device=self.device).scatter_add(1, pixels, attacked).clamp_max(1)[:, None]
+        maps = torch.cat([static, visibility, planes, alert], dim=1).reshape(batch, -1, side, side)
+        x = F.relu(self.conv(torch.cat([maps.to(image.dtype), image], dim=1), 'map_project'))
+        for stage in range(3):
+            x = F.relu(self.conv(x, f'map_down{stage}', 2, 1))
+        for block in range(MAP_RESIDUAL_BLOCKS):
+            residual = x
+            x = self.conv(F.relu(x), f'map_res{block}_a', padding=1)
+            x = self.conv(F.relu(x), f'map_res{block}_b', padding=1)+residual
+        out = F.relu(self.conv(F.relu(x), 'map_out'))
+        return out, F.relu(out.flatten(1) @ p['map_fc_w']+p['map_fc_b'])
+
+    def scalars(self, inputs):
+        """NeuralPolicy._scalars over a batch, in scalar_input_size's order."""
+        p = self.weights
         identities = inputs['identities']
         identity = p['base_faction_embedding'][identities[:, 0]]+p['general_embedding'][identities[:, 1]]
-        scalar = scalar + identity @ p['player_identity_w']
         identities = inputs['enemy_identities']
         enemy = p['base_faction_embedding'][identities[:, 0]]+p['general_embedding'][identities[:, 1]]
-        scalar = scalar + enemy @ p['enemy_identity_w']
-        scalar = scalar + inputs['ratings'] @ p['ratings_w']
-        scalar = scalar + inputs['opener'] @ p['opener_w']
-        scalar = scalar + inputs['player_flags'] @ p['player_flags_w']
-        counts = torch.zeros((batch, len(config['types'])), dtype=self.dtype, device=self.device).scatter_add(
+        batch = identity.shape[0]
+        counts = torch.zeros((batch, len(self.config['types'])), dtype=self.dtype, device=self.device).scatter_add(
             1, inputs['types'], inputs['real'])
-        available = inputs['available_actions']
-        scalar = scalar + counts.sqrt() @ p['unit_counts_w'] + available @ p['available_actions_w']
-        gate = F.relu(identity @ p['gate_identity_w'] + enemy @ p['gate_enemy_w'] + available @ p['gate_actions_w'] + p['gate_b'])
-        scalar = torch.tanh(scalar)
-        query = scalar @ p['pool_query']
-        def pool(mask, rows=entity):
-            logits = torch.bmm(rows, query.unsqueeze(-1)).squeeze(-1).masked_fill(~mask, -torch.inf)
-            logits = torch.where(mask.any(dim=1, keepdim=True), logits, torch.zeros_like(logits))
-            weights = logits.softmax(dim=1)*mask
-            return torch.bmm(weights.unsqueeze(1), rows).squeeze(1)
-        features = torch.cat([scalar, pool(inputs['pool_own']), pool(inputs['pool_visible']),
-                              pool(inputs['pool_hidden']), pool(inputs['pool_neutral']), pool(effect_valid, effects),
-                              map_embedding], dim=1)
-        return features, entity, spatial, gate
+        parts = [inputs['scalars'], identity, enemy, inputs['ratings'], inputs['opener'], inputs['player_flags'],
+                 counts.sqrt(), inputs['available_actions']]
+        for i in range(2):
+            template = self.type_embedding(inputs['task_command_templates'][:, i])
+            parts += [inputs['task_commands'][:, i], template*inputs['task_command_template_present'][:, i, None]]
+        x = F.relu(torch.cat([part.to(identity.dtype) for part in parts], dim=1) @ p['scalar_in_w']+p['scalar_in_b'])
+        return F.relu(x @ p['scalar_hidden_w']+p['scalar_hidden_b'])
+
+    def encode_inputs(self, inputs, selection=None):
+        """Encoder outputs per row: core input, unit features, keys, the 1x1 map and, given
+        selection = (rows, indices, lengths), the selected units' [Mean, Max] summary."""
+        p = self.weights
+        entity, tokens = self.entity_inputs(inputs)
+        count = entity.shape[1]
+        flat = torch.cat([entity, tokens], dim=1)
+        index = [inputs[f'group{g}_index'] for g in range(len(GROUPS))]
+        valid = [inputs[f'group{g}_valid'] for g in range(len(GROUPS))]
+        groups = [flat.gather(1, rows[:, :, None].expand(-1, -1, flat.shape[-1])) for rows in index]
+        final = self.group_transformer(groups, valid)
+        units = final[:UNIT_GROUPS]
+        features = self.entity_order(units, index[:UNIT_GROUPS], valid[:UNIT_GROUPS], count)
+        keys = self.entity_order([value @ p[f'key_{GROUPS[g]}_w']+p[f'key_{GROUPS[g]}_b'] for g, value in enumerate(units)],
+                                 index[:UNIT_GROUPS], valid[:UNIT_GROUPS], count)
+        scattered = self.entity_order([F.relu(value @ p[f'scatter_{GROUPS[g]}_w']+p[f'scatter_{GROUPS[g]}_b'])
+                                       for g, value in enumerate(units)], index[:UNIT_GROUPS], valid[:UNIT_GROUPS], count)
+        spatial, map_embedding = self.encode_map(inputs, scattered)
+        pools = [self.pool(value, valid[g], GROUPS[g]) for g, value in enumerate(final)]
+        core_input = torch.cat([self.scalars(inputs).to(map_embedding.dtype), *[pool.to(map_embedding.dtype) for pool in pools],
+                                map_embedding], dim=1)
+        result = {'core_input': core_input, 'features': features, 'keys': keys, 'map': spatial}
+        if selection is not None:
+            result['summary'] = self.selection_summary(features, *selection)
+        return result
+
+    @staticmethod
+    def selection_summary(features, rows, indices, lengths):
+        """[Mean, Max] of each row's selected units' features; zeros for rows without a selection.
+
+        rows (k,) index the batch; indices (k, longest) and lengths (k,) are their selections."""
+        batch, _, width = features.shape
+        summary = features.new_zeros((batch, 2*width))
+        if not rows.numel():
+            return summary
+        chosen = features[rows[:, None], indices]
+        mask = torch.arange(indices.shape[1], device=features.device)[None, :] < lengths[:, None]
+        total = (chosen*mask[:, :, None].to(chosen.dtype)).sum(dim=1)
+        mean = total/lengths.clamp_min(1)[:, None].to(chosen.dtype)
+        peak = chosen.masked_fill(~mask[:, :, None], -torch.inf).amax(dim=1)
+        has = (lengths > 0)[:, None]
+        value = torch.cat([torch.where(has, mean, torch.zeros_like(mean)), torch.where(has, peak, torch.zeros_like(peak))], dim=1)
+        return summary.index_copy(0, rows, value)
+
+    # Core (plan §1e): FC-ReLU, then the residual LSTM over each lane's decisions.
+
+    def initial_state(self, lanes):
+        size = self.widths['core']
+        return [(torch.zeros((lanes, size), dtype=self.dtype, device=self.device),
+                 torch.zeros((lanes, size), dtype=self.dtype, device=self.device)) for _ in range(LSTM_LAYERS)]
+
+    def lstm_cell(self, layer, x, h, c, projected=None):
+        """One layer-normed LSTM step (NeuralPolicy._core); x @ W_x may be given precomputed."""
+        p, size = self.weights, self.widths['core']
+        pre = (x @ p[f'core_lstm{layer}_x_w'] if projected is None else projected)+h @ p[f'core_lstm{layer}_h_w']
+        gates = F.layer_norm(pre.reshape(-1, 4, size), (size,), eps=1e-5)*p[f'core_lstm{layer}_gate_g']+p[f'core_lstm{layer}_gate_b']
+        c = torch.sigmoid(gates[:, 1])*c+torch.sigmoid(gates[:, 0])*torch.tanh(gates[:, 2])
+        h = torch.sigmoid(gates[:, 3])*torch.tanh(self.layer_norm(c, f'core_lstm{layer}_cell'))
+        return h, c
+
+    def core(self, core_input, resets, state):
+        """(core outputs (lanes, steps, W), state after the last step) in fp32.
+
+        core_input (lanes, steps, inputs); resets (lanes, steps) zero the state before that step
+        (a new episode). state: the LSTM (h, c) per layer, carried from the lane's previous unroll."""
+        p = self.weights
+        with torch.autocast(self.device.type, enabled=False):
+            u = F.relu(core_input.to(self.dtype) @ p['core_in_w']+p['core_in_b'])
+            projected = u @ p['core_lstm0_x_w']  # The first layer's input is known for every step: one GEMM.
+            keep = (~resets).to(u.dtype)
+            outputs, state = [], list(state)
+            for step in range(u.shape[1]):
+                x = None
+                for layer in range(LSTM_LAYERS):
+                    h, c = (value*keep[:, step, None] for value in state[layer])
+                    h, c = self.lstm_cell(layer, x, h, c, projected[:, step] if layer == 0 else None)
+                    state[layer] = (h, c)
+                    x = h
+                outputs.append(u[:, step]+x)
+            return torch.stack(outputs, dim=1), state
+
+    def values(self, core):
+        p = self.weights
+        return (core @ p['value_w']+p['value_b']).squeeze(-1)
+
+    # Heads (plan §1f): every head reads the core output and its own embedding of the selected action.
+
+    def with_action(self, core, head, actions, summary=None):
+        parts = [core, F.embedding(actions, self.weights[head+'_action_embedding']).to(core.dtype)]
+        return torch.cat(parts+([summary.to(core.dtype)] if summary is not None else []), dim=-1)
+
+    def action_logits(self, core):
+        return core @ self.weights['action_w']+self.weights['action_b']
+
+    def delay_logits(self, core, actions):
+        return self.with_action(core, 'delay', actions) @ self.weights['delay_w']+self.weights['delay_b']
+
+    def slot_logits(self, core, actions, summary):
+        return self.with_action(core, 'slot', actions, summary) @ self.weights['slot_w']+self.weights['slot_b']
+
+    def angle_logits(self, core, actions):
+        return self.with_action(core, 'angle', actions) @ self.weights['angle_w']+self.weights['angle_b']
+
+    def target_logits(self, core, actions, summary, keys):
+        """(rows, count): conditioned concat-attention over every entity's key."""
+        p = self.weights
+        query = self.with_action(core, 'target', actions, summary) @ p['target_in_w']+p['target_in_b']
+        hidden = torch.tanh(keys.to(query.dtype) @ p['target_score_k_w']+query[:, None])
+        return (hidden @ F.embedding(actions, p['target_action_embedding'])[:, :, None]).squeeze(-1)
+
+    def unit_context(self, core, actions):
+        p = self.weights
+        return self.with_action(core, 'unit', actions) @ p['unit_in_w']+p['unit_in_b']
+
+    def unit_query(self, context):
+        p = self.weights
+        return F.relu(context) @ p['unit_query_w']+p['unit_query_b']
+
+    def unit_step(self, query, state):
+        """One step of the unit query LSTM (torch.lstm's equations; NeuralPolicy._lstm_step)."""
+        p = self.weights
+        h, c = state
+        gates = query @ p['unit_lstm_input_w']+h @ p['unit_lstm_hidden_w']+p['unit_lstm_b']
+        i, f, g, o = gates.chunk(4, dim=-1)
+        c = torch.sigmoid(f)*c+torch.sigmoid(i)*torch.tanh(g)
+        return torch.sigmoid(o)*torch.tanh(c), c
+
+    def unit_keys(self, keys):
+        """Every entity key then the end token's, projected for the unit pointer: (rows, count+1, a)."""
+        p = self.weights
+        end = p['unit_end_key'].to(keys.dtype).expand(keys.shape[0], 1, -1)
+        return torch.cat([keys, end], dim=1) @ p['unit_score_k_w']
+
+    def unit_logits(self, hidden, projected_keys, actions):
+        """Scores of each token's query over its row's projected keys and the end token."""
+        p = self.weights
+        scores = torch.tanh(projected_keys+(hidden @ p['unit_score_q_w']+p['unit_score_b'])[:, None])
+        return (scores @ F.embedding(actions, p['unit_action_embedding'])[:, :, None]).squeeze(-1)
+
+    def unit_add(self, context, key):
+        p = self.weights
+        return context+(key/SELECTED_UNIT_DIVISOR) @ p['unit_ar_w']+p['unit_ar_b']
+
+    def location(self, spatial, core, actions, summary, build=None):
+        """(rows, n*n, offsets) position logits: NeuralPolicy._location over a batch."""
+        p, config = self.weights, self.config
+        rows, n, m = spatial.shape[0], config['map_side'], config['map_hidden']
+        query = self.with_action(core, 'position', actions, summary) @ p['location_query_w']+p['location_query_b']
+        x = F.relu(torch.cat([spatial.to(query.dtype), query.reshape(rows, 4, n, n)], dim=1))
+        x = F.relu(self.conv(x, 'location_input'))
+        film = (query @ p['location_film_w']+p['location_film_b'])[:, :, None, None]
+        for block in range(LOCATION_BLOCKS):
+            residual = F.relu(self.conv(x, f'location_block{block}_a'))
+            y = self.conv(residual, f'location_block{block}_b', padding=1)
+            gamma, beta = film[:, 2*block*m:(2*block+1)*m]+1, film[:, (2*block+1)*m:(2*block+2)*m]
+            x = F.relu(F.relu(y*gamma+beta)+residual)
+        if build is not None:
+            where, features = build
+            x = x.index_add(0, where, (features @ p['build_map_w']).permute(0, 2, 1).reshape(len(where), m, n, n))
+        y = x
+        stages = location_stages(config)
+        for stage in range(len(stages)):
+            y = F.conv_transpose2d(y, p[f'location_up{stage}'], stride=2, padding=1)+p[f'location_up{stage}_b']
+            if stage < len(stages)-1:
+                y = F.relu(F.layer_norm(y.flatten(1), (y[0].numel(),), eps=1e-5).reshape(y.shape))
+        fine = config['position_bins']//n
+        flat = y.flatten(1)
+        flat = torch.tanh((flat-flat.gather(1, flat.detach().argmax(1, keepdim=True)))/LOGIT_CAP)*LOGIT_CAP
+        return flat[:, self.location_order].reshape(rows, n*n, fine*fine)
+
+    def encode_batch(self, encoded):
+        """Stage encoded rows (live play) and run the encoder."""
+        from training_preparation import encode_values
+        values, _ = encode_values(self, encoded)
+        return self.encode_inputs(self.stager.stage(values))
 
     def events(self, encoded=None, *, prepared=None):
-        """Trunk outputs from encoded rows, or from training_preparation's prepared arrays.
+        """(core outputs (rows, W), encoder outputs) of independent observations, each scored as its
+        game's first decision (tests and tools; training and play carry the LSTM state). prepared:
+        a training_preparation microbatch instead of encoded rows."""
+        out = (self.encode_batch(encoded) if prepared is None
+               else self.encode_inputs(self.stager.stage(prepared['values'])))
+        rows = out['core_input'].shape[0]
+        core, _ = self.core(out['core_input'][:, None], torch.zeros((rows, 1), dtype=torch.bool, device=self.device),
+                            self.initial_state(rows))
+        return core[:, 0], out
 
-        The first holds the core's output followed by scalar_context.
-        """
-        if prepared is None:
-            features, entities, spatial, gate = self.encode_batch(encoded)
-        else:
-            staged = prepared['staged_values'] if 'staged_values' in prepared else self.stager.stage(prepared['values'])
-            features, entities, spatial, gate = self.encode_inputs(staged)
-        p = self.weights
-        hidden = torch.tanh(torch.tanh(features @ p['event_input_w']+p['event_input_b'])
-                            @ p['event_hidden_w']+p['event_hidden_b'])
-        return torch.cat([hidden, gate], dim=1), entities, spatial
-
-    def teacher_heads(self, encoded, teachers, memories, entities, spatial, *, loss_only=False, plan=None,
-                      position_metrics=False):
+    def teacher_heads(self, encoded, teachers, core, bundle, *, loss_only=False, plan=None, position_metrics=False):
+        """torch_training_inputs.teacher_heads for events()' outputs, planning the teachers here."""
         from torch_training_inputs import teacher_heads
-        return teacher_heads(self, encoded, teachers, memories, entities, spatial, loss_only=loss_only, plan=plan,
+        from training_preparation import teacher_plan
+        plan = plan or teacher_plan(self, encoded, teachers, bundle['keys'].shape[1])
+        plan['staged'] = staged = self.stager.stage(plan['values'])
+        summary = self.selection_summary(bundle['features'], staged['command_rows'], staged['selected_indices'],
+                                         staged['selected_lengths'])
+        return teacher_heads(self, core, {**bundle, 'summary': summary}, plan, loss_only=loss_only,
                              position_metrics=position_metrics)
-
-    def values(self, hidden):
-        p = self.weights
-        hidden = hidden[:, :self.config['hidden']]
-        return ((hidden @ p['value_hidden_w'] + p['value_hidden_b']).tanh() @ p['value_w'] + p['value_b']).squeeze(-1)

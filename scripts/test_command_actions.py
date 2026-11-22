@@ -9,7 +9,7 @@ import unittest
 import numpy as np
 
 from event_store import feature_identity
-from generals_policy import KINDS, NeuralPolicy, Unrepresentable
+from generals_policy import KINDS, NeuralPolicy, Unrepresentable, scalar_input_slices
 from nn_numpy import no_grad
 from replay_actions import ReplayActionAdapter
 from replay_training import audit
@@ -206,8 +206,7 @@ class CommandActionTests(unittest.TestCase):
             expected = [float(self.policy.decide(r['encoded'], None, teacher=r['target'])[4].data) for r in rows]
         for batch in (rows, portable):
             encoded = [row['encoded'] for row in batch]
-            h, entities, spatial = learner.model.events(encoded)
-            actual = learner.model.teacher_heads(encoded, [r['target'] for r in batch], h, entities, spatial)
+            actual = learner.model.teacher_heads(encoded, [r['target'] for r in batch], *learner.model.events(encoded))
             np.testing.assert_allclose(actual['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
         # A microbatch with no unit tokens (only waits) must still prepare and train.
         quiet = [rows[0], copy.deepcopy(rows[0])]
@@ -216,17 +215,20 @@ class CommandActionTests(unittest.TestCase):
         prepared = prepare_update(learner.model, quiet, learner.pair_budget)
         self.assertEqual([part['plan'].get('unit_tokens', 0) for part in prepared['microbatches']], [0])
         part = prepared['microbatches'][0]
-        h, entities, spatial = learner.model.events(prepared=part)
-        actual = learner.model.teacher_heads(None, [r['target'] for r in part['rows']], h, entities, spatial,
+        actual = learner.model.teacher_heads(None, [r['target'] for r in part['rows']], *learner.model.events(prepared=part),
                                              plan=part['plan'])
         by_kind = {r['target']['kind']: value for r, value in zip(quiet, expected)}
         np.testing.assert_allclose(actual['logp'].detach().cpu().numpy(),
                                    [by_kind[row['target']['kind']] for row in part['rows']], rtol=4e-6, atol=3e-5)
         self.assertEqual(learner.run(prepared, train=True)['updates'], 1)
         learner.batch(portable, train=True)
-        for name in ('command_embedding', 'command_query_w',
-                     'upgrade_embedding', 'player_flags_w', 'target_pointer_w'):
+        # AlphaGenerals: commands are flat actions (action_w), player flags a block of scalar_in_w.
+        for name in ('action_w', 'upgrade_embedding', 'scalar_in_w', 'target_in_w', 'target_score_k_w'):
             self.assertGreater(float(learner.model.weights[name].grad.abs().sum().cpu()), 0, name)
+        flags = scalar_input_slices(self.policy.config)['player_flags']
+        self.assertGreater(float(learner.model.weights['scalar_in_w'].grad[flags].abs().sum().cpu()), 0)
+        commands = self.policy.actions[:, 0] == self.policy.kinds.index('ability')
+        self.assertGreater(float(learner.model.weights['action_w'].grad[:, commands].abs().sum().cpu()), 0)
 
 
 if __name__ == '__main__':

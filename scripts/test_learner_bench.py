@@ -32,9 +32,9 @@ class LearnerBenchTests(unittest.TestCase):
 
     def arguments(self, root, **changes):
         settings = dict(dataset=str(root/'dataset.json'), code=None, label=None, output=str(root/'run.json'),
-                        device='cpu', precision='fp32', compile=False, compile_heads=False, warmup=1, updates=2,
-                        widths=None, width_scale=1.0,
-                        profile=0, batch_size=3, pair_budget=8_000_000, buffer_mib=64, prefetch=0, readers=1, seed=3)
+                        device='cpu', precision='fp32', compile=False, warmup=1, updates=2,
+                        widths=None, width_scale=1.0, profile=0, lanes=2, unroll=2, part_lanes=1,
+                        pair_budget=8_000_000, cache_mib=64, prefetch=0, readers=1, seed=3)
         return SimpleNamespace(**{**settings, **changes})
 
     def test_run_times_real_updates_and_summary_compares_losses(self):
@@ -92,15 +92,17 @@ class LearnerBenchTests(unittest.TestCase):
                 learner_bench.summary(SimpleNamespace(reports=[str(root/'a.json')]))
             self.assertIn('GPU busy 50% over 3 samples -> CPU-bound', out.getvalue())
 
-    def test_width_sweep_scales_the_trunk_in_multiples_of_64(self):
-        config = {'hidden': 1408, 'entity_hidden': 256, 'map_hidden': 128, 'scalar_hidden': 256}
-        self.assertEqual(learner_bench.model_widths(config, scale=1.5),
-                         {'hidden': 2112, 'entity_hidden': 384, 'map_hidden': 192, 'scalar_hidden': 384})
+    def test_width_sweep_scales_the_core_in_multiples_of_64(self):
+        # AlphaGenerals: the core is the width plan.md §6 sizes the model by; the rest are fixed.
+        config = {'map_hidden': 128}
+        self.assertEqual(learner_bench.model_widths(config, scale=1.5), {'widths': {'core': 1536}})
+        self.assertEqual(learner_bench.model_widths({'widths': {'core': 16, 'entity': 8}}, scale=2.0),
+                         {'widths': {'core': 64, 'entity': 8}})
         self.assertEqual(learner_bench.model_widths(config), {})
         import cloud_bundle
-        self.assertEqual(learner_bench.model_widths(config, 'big'), cloud_bundle.WIDTHS['big'])
+        self.assertEqual(learner_bench.model_widths(config, 'default'), cloud_bundle.WIDTHS['default'])
         with self.assertRaises(ValueError):
-            learner_bench.model_widths(config, 'big', 2.0)
+            learner_bench.model_widths(config, 'default', 2.0)
         with self.assertRaises(ValueError):
             learner_bench.model_widths(config, '{"map_side": 32}')
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,7 +110,7 @@ class LearnerBenchTests(unittest.TestCase):
             self.dataset(root)
             with contextlib.redirect_stdout(io.StringIO()):
                 plain = learner_bench.run(self.arguments(root, widths=None, width_scale=1.0))
-                wide = learner_bench.run(self.arguments(root, widths=None, width_scale=1.5,
+                wide = learner_bench.run(self.arguments(root, widths=None, width_scale=8.0,
                                                         output=str(root/'wide.json')))
             self.assertEqual(plain['widths'], {})
             self.assertGreater(wide['parameters'], plain['parameters'])

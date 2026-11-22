@@ -8,8 +8,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from generals_policy import ACTION_RESIDUAL_BLOCKS, KINDS, LOGIT_CAP, SELECTED_UNIT_DIVISOR
-from training_preparation import teacher_plan
+from generals_policy import LOGIT_CAP, SELECTED_UNIT_DIVISOR
 
 
 class TensorStager:
@@ -212,38 +211,14 @@ def position_errors(logits, cell_mask, cell_choices, offset_choices, config):
     return (joint*distance).sum(dim=1), distance.gather(1, joint.argmax(dim=1, keepdim=True)).squeeze(1)
 
 
-def action_trunk(p, core, gate, all_verbs, dtype):
-    """Decision logits, the autoregressive embedding and the delay logits.
+def teacher_heads(model, core, bundle, plan, *, loss_only=False, position_metrics=False):
+    """Every head's teacher-forced log-probabilities for one microbatch.
 
-    Fixed structure (16 residual blocks: ~150 small kernels and as many autograd
-    nodes per microbatch), so --compile fuses it into one graph with a dynamic
-    batch (EventLearner sets model.action_trunk); eager runs this as written.
+    core: (rows, W) core outputs; bundle: the encoder's keys, [Mean, Max] summary and 1x1 map
+    for the same rows. The heads are independent given the selected action (SCC), so each
+    reads the teacher's action, units and arguments. position_metrics adds
+    outputs['position_errors'] (position_errors) and outputs['wait_probability'] (p(wait) per row).
     """
-    x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])
-    for block in range(ACTION_RESIDUAL_BLOCKS):
-        # torch_policy_v3's normalize: layer norm over the last axis, no affine. Pre-activation,
-        # as generals_policy._action_type: the branch's last step is linear, so it is signed.
-        y = F.relu(F.layer_norm(x, (x.shape[-1],), eps=1e-5)) @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']
-        x = x+F.relu(F.layer_norm(y, (y.shape[-1],), eps=1e-5)) @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b']
-    logits = (F.relu(x) @ p['verb_w'])*torch.sigmoid(gate @ p['verb_gate_w']+p['verb_gate_b'])+p['verb_b']
-    # The autoregressive embedding, then the delay, which every later argument sees.
-    action = F.relu(F.one_hot(all_verbs, len(KINDS)).to(dtype) @ p['ar_verb_w']+p['ar_verb_b'])
-    ar = ((core @ p['ar_core_w'])*torch.sigmoid(gate @ p['ar_core_gate_w']+p['ar_core_gate_b'])
-          + (action @ p['ar_verb_out_w'])*torch.sigmoid(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']))
-    x = F.relu(F.relu(ar @ p['delay_in_w']+p['delay_in_b']) @ p['delay_hidden_w']+p['delay_hidden_b'])
-    return logits, ar, x @ p['delay_w']+p['delay_b']
-
-
-def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss_only=False, plan=None,
-                  position_metrics=False):
-    """Vectorized argument heads; teacher selections determine autoregressive control.
-
-    position_metrics adds outputs['position_errors']: (expected, mode) pixel distances
-    per position row (position_errors), for validation reports, and outputs['wait_probability']:
-    the model's p(wait) per row (the report's expected wait share).
-    """
-    if plan is None:
-        plan = teacher_plan(model, encoded, teachers, entities.shape[1])
     inputs = plan['staged'] if 'staged' in plan else model.stager.stage(plan['values'])
     p, config = model.weights, model.config
     batch, count = plan['batch'], plan['command_count']
@@ -255,119 +230,113 @@ def teacher_heads(model, encoded, teachers, memories, entities, spatial, *, loss
                            predict=not loss_only or name in ('decision', 'event_delay'),
                            capped=name not in ('cell', 'offset'))
 
-    core, gate = memories[:, :config['hidden']], memories[:, config['hidden']:]
-    logits, ar, delay_logits = getattr(model, 'action_trunk', action_trunk)(p, core, gate, inputs['all_verbs'], model.dtype)
+    actions = inputs['actions']
+    logits = model.action_logits(core)
     timing, entropy, decision = draw('decision', logits)
-    outputs = {'by_head': {'decision': timing}, 'head_counts': {'decision': np.ones(batch, dtype=int)},
-               'predictions': [('decision', np.arange(batch), decision)]}
-    if position_metrics:  # Validation: p(wait) per row, for the report's expected wait share.
+    from training_preparation import head_counts
+    outputs = {'by_head': {'decision': timing}, 'head_counts': head_counts(plan),
+               'predictions': [('decision', np.arange(batch), model.action_kinds[decision])]}
+    if position_metrics or not loss_only:
         with torch.no_grad():
-            outputs['wait_probability'] = cap_logits(logits, inputs['decision_mask']).masked_fill(
+            wait = cap_logits(logits, inputs['decision_mask']).masked_fill(
                 ~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0]
+        if position_metrics:  # Validation: p(wait) per row, for the report's expected wait share.
+            outputs['wait_probability'] = wait
     if not loss_only:
-        outputs.update(logp=timing, entropy=entropy, action_kinds=KINDS, token_counts=np.ones(batch, dtype=int),
-                       event_prediction=(decision != 0).long(),
-                       conditional_prediction=logits[:, 1:].masked_fill(~inputs['conditional_mask'], -torch.inf).argmax(dim=1),
-                       order_probability=1-cap_logits(logits, inputs['decision_mask']).masked_fill(
-                           ~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0])
-    lp, ent, prediction = draw('event_delay', delay_logits)
+        legal = inputs['decision_mask'] & (model.action_kinds != 0)[None]
+        outputs.update(logp=timing, entropy=entropy, action_kinds=model.action_kinds,
+                       event_prediction=(model.action_kinds[decision] != 0).long(),
+                       conditional_prediction=model.action_kinds[logits.masked_fill(~legal, -torch.inf).argmax(dim=1)],
+                       order_probability=1-wait)
+    lp, ent, prediction = draw('event_delay', model.delay_logits(core, actions))
     outputs['by_head']['delay'] = lp
-    outputs['head_counts']['delay'] = np.ones(batch, dtype=int)
     if not loss_only:
         outputs['logp'] = outputs['logp']+lp
         outputs['entropy'] = outputs['entropy']+ent
     outputs['predictions'].append(('delay', np.arange(batch), prediction))
     if not count:
         return outputs
-    x = F.one_hot(inputs['event_delay_choices'], len(config['delay_ticks'])).to(model.dtype)
-    x = F.relu(F.relu(x @ p['delay_embed_in_w']+p['delay_embed_in_b']) @ p['delay_embed_hidden_w']+p['delay_embed_hidden_b'])
-    # A censored teacher delay is unknown: later arguments do not see the placeholder.
-    ar = ar+(x @ p['delay_embed_out_w']+p['delay_embed_out_b'])*inputs['delay_known'][:, None]
 
     def record(name, values):
         lp, ent, prediction = values
         global_rows, ix = plan['categories'][name], inputs[name+'_global']
-        previous = outputs['by_head'].get(name, torch.zeros(batch, dtype=model.dtype, device=model.device))
+        previous = outputs['by_head'].get(name, torch.zeros(batch, dtype=lp.dtype, device=lp.device))
         outputs['by_head'][name] = previous.index_add(0, ix, lp)
-        np.add.at(outputs['head_counts'].setdefault(name, np.zeros(batch, dtype=int)), global_rows, 1)
         if not loss_only:
             outputs['logp'] = outputs['logp'].index_add(0, ix, lp)
             outputs['entropy'] = outputs['entropy'].index_add(0, ix, ent)
-            np.add.at(outputs['token_counts'], global_rows, 1)
             outputs['predictions'].append((name, global_rows.copy(), prediction))
 
     command = inputs['command_rows']
-    keys = entities[command] @ p['entity_key_w']
-    func = inputs['func_types'] @ p['func_w']+p['func_b']
-    # Teacher selections fix each step's embedding, so the query LSTM runs across them in one pass.
-    chosen = keys[inputs['command_range'][:, None], inputs['selected_indices']]/SELECTED_UNIT_DIVISOR
-    steps = (chosen @ p['unit_ar_w']+p['unit_ar_b']).cumsum(dim=1)
-    steps = ar[command][:, None]+torch.cat([torch.zeros_like(steps[:, :1]), steps], dim=1)
+    core, acts = core[command], actions[command]
+    keys, summary = bundle['keys'][command].to(core.dtype), bundle['summary'][command].to(core.dtype)
     if plan['unit_tokens']:
-        queries = F.relu(steps @ p['unit_in_w']+p['unit_in_b']+func[:, None]) @ p['unit_query_w']+p['unit_query_b']
-        # The step count comes from the host-side plan: reading the staged
-        # tensor here would synchronise with the GPU in every microbatch.
+        # Teacher selections fix each step's context, so the query LSTM runs across them in one pass.
+        chosen = keys[inputs['command_range'][:, None], inputs['selected_indices']]/SELECTED_UNIT_DIVISOR
+        steps = (chosen @ p['unit_ar_w']+p['unit_ar_b']).cumsum(dim=1)
+        context = model.unit_context(core, acts)[:, None]
+        contexts = context+torch.cat([torch.zeros_like(steps[:, :1]), steps], dim=1)
+        # The step count comes from the host-side plan: reading the staged tensor here would
+        # synchronise with the GPU in every microbatch.
         length = max(plan['values']['unit_prefixes'][0])+1
-        # One fused LSTM over every selection step (cuDNN/MIOpen on a GPU)
-        # instead of a dozen kernels per step. The gate layout is PyTorch's
-        # (input, forget, cell, output); the single bias goes in b_ih. cuDNN
+        queries = model.unit_query(contexts[:, :length])
+        # One fused LSTM over every selection step (cuDNN on a GPU). The gate layout is
+        # PyTorch's (input, forget, cell, output); the single bias goes in b_ih. cuDNN
         # flattens the weights with views, so they must be contiguous.
-        zeros = queries.new_zeros((1, count, queries.shape[-1]))
+        zeros = queries.new_zeros((1, queries.shape[0], queries.shape[-1]))
         bias = p['unit_lstm_b']
         weights = [p['unit_lstm_input_w'].T.contiguous(), p['unit_lstm_hidden_w'].T.contiguous()]
-        lstm_outputs = torch.lstm(queries[:, :length].contiguous(), (zeros, zeros),
-                                  [*weights, bias, torch.zeros_like(bias)],
-                                  True, 1, 0.0, torch.is_grad_enabled(), False, True)[0]
-        # Every step scored against its command's entities in one product: the
-        # same dot products as gathering a key block per token, without the
-        # (tokens, entities, width) gather and its scatter in the backward pass.
-        logits = torch.cat([torch.bmm(lstm_outputs, keys.transpose(1, 2)),
-                            (lstm_outputs @ p['unit_end_key']).unsqueeze(-1)], dim=2)
-        record('unit', draw('unit', logits[inputs['unit_rows'], inputs['unit_prefixes']]))
-    context = steps[inputs['command_range'], inputs['selected_lengths']]
-
-    if len(plan['command_head_rows']):
-        ix, choices = inputs['command_head_rows'], inputs['command_choices']
-        table = p['command_embedding']
-        record('command', draw('command', (context[ix] @ p['command_query_w']) @ table.T + p['command_b']))
-        context = context.index_copy(0, ix, context[ix]+table[choices] @ p['command_context_w'])
-
+        hidden = torch.lstm(queries.contiguous(), (zeros, zeros), [*weights, bias, torch.zeros_like(bias)],
+                            True, 1, 0.0, torch.is_grad_enabled(), False, True)[0]
+        rows, prefixes = inputs['unit_rows'], inputs['unit_prefixes']
+        record('unit', draw('unit', model.unit_logits(hidden[rows, prefixes], model.unit_keys(keys)[rows], acts[rows])))
     if len(plan['slot_rows']):
         ix = inputs['slot_rows']
-        record('slot', draw('slot', context[ix] @ p['slot_w']+p['slot_b']))
+        record('slot', draw('slot', model.slot_logits(core[ix], acts[ix], summary[ix])))
     if len(plan['target_rows']):
         ix = inputs['target_rows']
-        query = F.relu(context[ix] @ p['target_in_w']+p['target_in_b']+func[ix]) @ p['target_pointer_w']+p['target_pointer_b']
-        record('target', draw('target', torch.bmm(keys[ix], query.unsqueeze(-1)).squeeze(-1)))
-    if len(plan['template_rows']):
-        ix, choices = inputs['template_rows'], inputs['template_choices']
-        objects = model.object_embedding(model.identity_template_objects)
-        record('template', draw('template', (context[ix] @ p['template_query_w']) @ objects.T + p['template_b']))
-        context = context.index_copy(0, ix, context[ix]+objects[choices] @ p['template_context_w'])
-    def angle_head(ix):
-        record('angle', draw('angle', context[ix] @ p['angle_w']+p['angle_b']))
-
-    if placement and len(plan['angle_rows']):
+        record('target', draw('target', model.target_logits(core[ix], acts[ix], summary[ix], keys[ix])))
+    if len(plan['angle_rows']):
         ix = inputs['angle_rows']
-        angle_head(ix)
-        context = context.index_copy(0, ix, context[ix]+p['build_angle_embedding'][inputs['angle_choices']])
+        record('angle', draw('angle', model.angle_logits(core[ix], acts[ix])))
     if len(plan['spatial_rows']):
         ix = inputs['spatial_rows']
         build = (inputs['build_spatial'], inputs['build_features']) if placement and inputs['build_spatial'].numel() else None
-        cells, logits = model.location(spatial[command[ix]], context[ix], build)
+        logits = model.location(bundle['map'][command[ix]].to(core.dtype), core[ix], acts[ix], summary[ix], build)
         # One 256x256 distribution, scored as its map cell and then the offset within it.
-        cell_logits = logits.logsumexp(dim=2)
-        cell = draw('cell', cell_logits)
-        choices, side = inputs['cell_choices'], config['map_side']
+        cell = draw('cell', logits.logsumexp(dim=2))
+        choices = inputs['cell_choices']
         if position_metrics:
             with torch.no_grad():
                 outputs['position_errors'] = position_errors(logits.detach(), inputs['cell_mask'], choices,
                                                              inputs['offset_choices'], config)
-        chosen = cells[inputs['spatial_range'], :, torch.div(choices, side, rounding_mode='floor'), choices % side]
-        context = context.index_copy(0, ix, context[ix]+chosen @ p['cell_context_w'])
         offset = draw('offset', logits[inputs['spatial_range'], choices])
         record('cell', cell)
         record('offset', offset)
-    if not placement and len(plan['angle_rows']):
-        angle_head(inputs['angle_rows'])
     return outputs
+
+
+def head_losses(model, rows, by_head, counts, factors=None):
+    """Per-row loss: the action and (weighted) delay, plus each argument head averaged over its tokens.
+
+    factors: the staged per-row weights (loss_factors), when already on the device."""
+    if factors is None:
+        factors = model.stager.stage(loss_factors(model.config, rows, counts, by_head))
+    loss = -by_head['decision']
+    for name, logp in by_head.items():
+        if name != 'decision':
+            loss = loss-logp*factors[name]
+    return loss
+
+
+def loss_factors(config, rows, counts, names):
+    """{head: (per-row weight, 'float')} for head_losses; one staged upload per microbatch."""
+    weights = config.get('argument_loss_weights', {})
+    factors = {}
+    for name in names:
+        if name == 'delay':
+            factors[name] = np.asarray([config.get('delay_loss_weight', .2) if 'delay' in row['target'] else 0
+                                        for row in rows], dtype=float), 'float'
+        elif name != 'decision':
+            factors[name] = weights.get(name, 1)/np.maximum(counts[name], 1), 'float'
+    return factors

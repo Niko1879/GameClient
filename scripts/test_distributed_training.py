@@ -11,15 +11,15 @@ import unittest
 
 import numpy as np
 
-from event_training_batches import prepare_share
+from event_training_batches import assemble, lane_parts, prepare_part
 from generals_policy import NeuralPolicy
-from train_events import EventLearner, launch, train
-from training_preparation import PreparationSpec, prepare_update
+from train_events import EventLearner, global_lanes, launch, rank_lanes, train
+from training_preparation import PreparationSpec
 
 
 def settings(data, output, **changes):
     return {**dict(dataset=str(data.path), output=str(output), resume=None, device='cpu', epochs=2, max_updates=0,
-                   seed=123, lr=3e-4, threads=1, batch_size=5, pair_budget=2_000_000, buffer_mib=1,
+                   seed=123, lr=3e-4, threads=1, lanes=6, unroll=2, part_lanes=1, pair_budget=2_000_000, cache_mib=1,
                    checkpoint_seconds=600, min_free_ram_mib=256, max_private_mib=16384, min_free_disk_gib=1,
                    early_stopping_patience=0, min_delta=0.0, validations_per_epoch=2, prefetch_batches=0,
                    reader_processes=1), **changes}
@@ -72,13 +72,14 @@ class DistributedTrainingTests(unittest.TestCase):
         reference = self.single('one')
         self.assertGreater(reference[0]['optimizer_updates'], 2)
         self.assert_close_runs(reference, self.ranks('two', 2))
-        # Three ranks and a reader process per rank: shares of 5 rows are 2/2/1.
+        # Three ranks and a reader process per rank: two of the six lanes each.
         self.assert_close_runs(reference, self.ranks('three', 3, prefetch_batches=1))
 
     def test_a_rank_with_an_empty_share_still_joins_the_update(self):
-        # 12 training rows in batches of 11: the second update has one row, so rank 1 gets none.
-        self.assert_close_runs(self.single('one-11', batch_size=11, epochs=1),
-                               self.ranks('two-11', 2, batch_size=11, epochs=1))
+        # One training episode on two lanes of 11 steps: lane 1 has no episode, so rank 1's part is empty.
+        self.assertEqual(len(self.data.episodes('train')), 1)
+        self.assert_close_runs(self.single('one-11', lanes=2, unroll=11, epochs=1),
+                               self.ranks('two-11', 2, lanes=2, unroll=11, epochs=1))
 
     def test_ranked_resume_matches_an_uninterrupted_ranked_run(self):
         full = self.ranks('full', 2)
@@ -99,7 +100,7 @@ class DistributedTrainingTests(unittest.TestCase):
 
     def test_a_failing_rank_stops_the_others(self):
         with self.assertRaisesRegex(RuntimeError, 'exited with code'):
-            launch(SimpleNamespace(**settings(self.data, self.root/'broken', batch_size=1)), 2)
+            launch(SimpleNamespace(**settings(self.data, self.root/'broken', lanes=1)), 2)
 
     def test_nccl_ranks_match_one_gpu_strict_and_with_the_compiled_encoder(self):
         import torch
@@ -113,21 +114,37 @@ class DistributedTrainingTests(unittest.TestCase):
         for left, right in zip(one[0]['history'], two[0]['history']):
             self.assertAlmostEqual(left['validation']['mean_nll'], right['validation']['mean_nll'], delta=.02)
 
-    def test_shares_partition_each_batch_and_scale_by_the_global_rows(self):
-        batch = max((rows for rows, _ in self.data.batches('train', seed=123, epoch=0, batch_size=5)), key=len)
+    def test_shares_partition_each_update_and_scale_by_the_global_rows(self):
         spec = PreparationSpec(self.data.config, self.data.key, device_type='cpu')
-        shares = [prepare_share(spec, batch, 2_000_000, (rank, 3)) for rank in range(3)]
-        self.assertEqual([share['rows'] for share in shares], [2, 2, 1])
-        self.assertEqual({share['global_rows'] for share in shares}, {5})
+        options = dict(seed=123, epoch=0, lanes=3, steps=5, part_lanes=1)
+
+        def update(share):
+            parts = [prepare_part(spec, self.data, 'train', item, 2_000_000, 1 << 20)
+                     for item in lane_parts(self.data, 'train', share=share, **options) if item[0] == 0]
+            return assemble(parts, options['steps'])
+        whole = update(None)
+        shares = [update((rank, 3)) for rank in range(3)]
+        self.assertEqual([share['lanes'] for share in shares], [1, 1, 1])
+        self.assertEqual({share['global_rows'] for share in shares}, {whole['rows']})
+        self.assertEqual(sum(share['rows'] for share in shares), whole['rows'])
         frames = sorted(row['frame'] for share in shares for part in share['microbatches'] for row in part['rows'])
-        self.assertEqual(frames, sorted(row['frame'] for row in batch))
-        self.assertNotIn('global_rows', prepare_share(spec, batch, 2_000_000))
+        self.assertEqual(frames, sorted(row['frame'] for part in whole['microbatches'] for row in part['rows']))
+        # A rank's lanes are numbered locally; its resets are its parts' rows.
+        np.testing.assert_array_equal(np.concatenate([share['resets'] for share in shares]), whole['resets'])
         # An empty share is a valid update input: it contributes nothing, but takes part.
-        empty = prepare_share(spec, batch[:1], 2_000_000, (1, 2))
-        self.assertEqual((empty['rows'], empty['microbatches'], empty['global_rows']), (0, [], 1))
+        empty = [share for share in shares if not share['rows']]
         learner = EventLearner(NeuralPolicy(self.data.config, 5), device='cpu')
-        self.assertEqual(learner.run(empty, train=False)['decisions'], 0)
-        self.assertEqual(learner.run(prepare_update(spec, batch, 2_000_000), train=True)['decisions'], 5)
+        for share in empty:
+            self.assertEqual(learner.run(share, train=False, split='validation')['decisions'], 0)
+        self.assertEqual(learner.run(whole, train=True)['decisions'], whole['rows'])
+
+    def test_lane_states_gather_to_global_order_and_split_back(self):
+        lanes = {'lane_h0': np.arange(12.)[:, None], 'lane_c0': -np.arange(12.)[:, None]}
+        shares = [rank_lanes(lanes, 2, rank, 3) for rank in range(3)]
+        np.testing.assert_array_equal(shares[1]['lane_h0'][:, 0], [2, 3, 8, 9])
+        merged = global_lanes(shares, 2)
+        for name in lanes:
+            np.testing.assert_array_equal(merged[name], lanes[name])
 
 
 if __name__ == '__main__':

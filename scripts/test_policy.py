@@ -140,7 +140,10 @@ class PolicyTests(unittest.TestCase):
         encoded = self.policy.encoder.encode(other, self.terrain, 6)
         a = self.policy.decide(self.encoded, teacher={'kind': 'wait'})
         b = self.policy.decide(encoded, teacher={'kind': 'wait'})
-        np.testing.assert_array_equal(a[2].data, b[2].data)
+        # decide's third value is the core LSTM state after this decision.
+        for (h, c), (h2, c2) in zip(a[2], b[2]):
+            np.testing.assert_array_equal(h.data, h2.data)
+            np.testing.assert_array_equal(c.data, c2.data)
         self.assertEqual(float(a[4].data), float(b[4].data))
 
     def test_opposite_spawns_share_canonical_features_and_commands_rotate_back(self):
@@ -260,8 +263,8 @@ class AgreementTests(unittest.TestCase):
         config, obs, terrain = fixture(placement_mode)
         policy = NeuralPolicy(config, 5)
         if head_scale:  # Extreme head logits, so LOGIT_CAP is what bounds them.
-            for name in ('verb_w', 'delay_w', 'angle_w', 'slot_w', 'command_query_w',
-                         'template_query_w', 'target_pointer_w', 'unit_query_w'):
+            for name in ('action_w', 'delay_w', 'angle_w', 'slot_w', 'target_action_embedding',
+                         'unit_action_embedding'):
                 policy.parameters[name].data *= head_scale
         # Ready and charging buttons, and a seen supply count, reach both implementations.
         obs['own_entities'][1].update(commands=['Command_UpgradeChinaRadar'],

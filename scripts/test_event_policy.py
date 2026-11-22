@@ -366,7 +366,7 @@ class EventTests(unittest.TestCase):
                     np.testing.assert_array_equal(a['exp_avg'].cpu().numpy(), b['exp_avg'].cpu().numpy())
 
     def test_model_width_does_not_invalidate_features(self):
-        config = copy.deepcopy(self.config); config['hidden'] *= 2
+        config = copy.deepcopy(self.config); config['widths'] = {**config['widths'], 'core': 2*config['widths']['core']}
         self.assertEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
         config['event_max_delay'], config['delay_ticks'] = 60, list(range(1, 61))
         self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
@@ -386,15 +386,15 @@ class EventTests(unittest.TestCase):
             root = Path(temporary)
             data = self.shard_dataset(root/'data')
             settings = dict(dataset=str(data.path), resume=None, device='cpu', epochs=1, max_updates=0,
-                seed=123, lr=3e-4, threads=1, batch_size=3, pair_budget=2_000_000,
-                buffer_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192)
+                seed=123, lr=3e-4, threads=1, lanes=2, unroll=3, part_lanes=1, pair_budget=2_000_000,
+                cache_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192)
             full = train(SimpleNamespace(**settings, output=str(root/'full')))
             stop_file = root/'stop.json'
             stop_file.write_text('{}')
             stopped = train(SimpleNamespace(**settings, output=str(root/'stopped'), stop_file=str(stop_file)))
             self.assertEqual(stopped['status'], 'interrupted')
             self.assertEqual(stopped['optimizer_updates'], 0)
-            self.assertEqual(stopped['cursor'], {'epoch':0, 'position':[0,0], 'validations':0})
+            self.assertEqual(stopped['cursor'], {'epoch':0, 'position':0, 'validations':0})
             stop_file.unlink()
             continued = train(SimpleNamespace(**{**settings, 'resume': stopped['checkpoint']},
                 output=str(root/'stopped'), stop_file=str(stop_file)))
@@ -419,8 +419,8 @@ class EventTests(unittest.TestCase):
             root = Path(temporary)
             data = self.shard_dataset(root/'data')
             result = train(SimpleNamespace(dataset=str(data.path), resume=None, device='cpu', epochs=1, max_updates=0,
-                seed=123, lr=3e-4, threads=1, batch_size=3, pair_budget=2_000_000,
-                buffer_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192,
+                seed=123, lr=3e-4, threads=1, lanes=2, unroll=3, part_lanes=1, pair_budget=2_000_000,
+                cache_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192,
                 output=str(root/'run')))
             records = [json.loads(line) for line in (root/'run'/'outliers.jsonl').read_text().splitlines()]
             history = result['history'][0]
@@ -434,39 +434,14 @@ class EventTests(unittest.TestCase):
                 self.assertAlmostEqual(sum(record['terms'].values()), record['nll'], places=4)
                 self.assertIn('kind', record['target'])
 
-    def test_outlier_recheck_blames_corrupted_staged_inputs(self):
-        from training_preparation import prepare_update
-        with tempfile.TemporaryDirectory() as temporary, patch('train_events.OUTLIER_NLL', -1.0):
-            data = self.shard_dataset(Path(temporary))
-            rows = next(data.batches('train', seed=1, epoch=0, batch_size=6))[0]
-            learner = EventLearner(NeuralPolicy(data.config, 5))
-            learner.batch(rows, train=False)
-            clean = {(r['frame'], r['player']): r for r in learner.outliers}
-            learner.outliers.clear()
-            # The device copy differs from the host's, as a broken upload would leave it.
-            prepared = prepare_update(learner.model, rows, learner.pair_budget)
-            for part in prepared['microbatches']:
-                part['staged_values'] = learner.model.stager.stage(
-                    {name: (value*50 if kind == 'float' else value, kind) for name, (value, kind) in part['values'].items()})
-            learner.run(prepared, train=False)
-            self.assertEqual(len(learner.outliers), len(clean))
-            moved = 0
-            for record in learner.outliers:
-                reference = clean[(record['frame'], record['player'])]
-                self.assertAlmostEqual(record['recheck']['unstaged'], reference['nll'], places=4)
-                self.assertAlmostEqual(record['recheck']['fp32'], reference['nll'], places=4)
-                self.assertFalse(record['after_update'])
-                moved += abs(record['nll']-reference['nll']) > 1e-3
-            self.assertGreater(moved, 0)
-
     def test_init_starts_from_checkpoint_weights_with_a_fresh_optimizer(self):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()), \
                 patch('train_events.within_budget', return_value=True):
             root = Path(temporary)
             data = self.shard_dataset(root/'data')
             settings = dict(dataset=str(data.path), resume=None, device='cpu', epochs=1, max_updates=0,
-                seed=123, lr=3e-4, threads=1, batch_size=3, pair_budget=2_000_000,
-                buffer_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192)
+                seed=123, lr=3e-4, threads=1, lanes=2, unroll=3, part_lanes=1, pair_budget=2_000_000,
+                cache_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192)
             base = train(SimpleNamespace(**settings, output=str(root/'base')))
             tuned = train(SimpleNamespace(**{**settings, 'lr': 1e-4, 'max_updates': 1, 'init': base['checkpoint'],
                                              'select_on': '1400+'}, output=str(root/'tuned')))
@@ -494,7 +469,7 @@ class EventTests(unittest.TestCase):
                 train(SimpleNamespace(**{**settings, 'lr': 1e-4, 'select_on': '1400+',
                                          'resume': tuned['checkpoint']}, output=str(root/'tuned')))
             document = json.loads(Path(data.path).read_text())
-            document['config'] = {**document['config'], 'hidden': document['config']['hidden']*2}
+            document['config'] = {**document['config'], 'widths': {**document['config']['widths'], 'core': 32}}
             wider = Path(data.path).with_name('wider.json')
             wider.write_text(json.dumps(document))
             with self.assertRaises(ValueError):
@@ -504,8 +479,7 @@ class EventTests(unittest.TestCase):
 
 class MicrobatchTests(unittest.TestCase):
     def test_microbatches_cover_each_row_once_within_pair_budget(self):
-        from train_events import microbatches
-        from training_preparation import MICROBATCH_ROWS
+        from training_preparation import MICROBATCH_ROWS, microbatches
         sizes = np.random.default_rng(3).integers(1, 60, 200)
         rows = [{'id': str(i), 'encoded': {'numeric': np.zeros((int(size), 1))}} for i, size in enumerate(sizes)]
         rows.append({'id': 'large', 'encoded': {'numeric': np.zeros((120, 1))}})

@@ -55,7 +55,9 @@ class EarlyStoppingTests(unittest.TestCase):
             config={'hidden':2};digest='dataset';key='feature';document={}
             entries=[dict(match_key='t',split='train',index={'source':{}}),dict(match_key='v',split='validation',index={'source':{}})]
             def __init__(self,*unused):pass
-            def batches(self,split,**unused):yield [dict(split=split)],(0,1)
+            # One update per epoch (lane_schedule's length; batches stands in for the prepared stream).
+            def lane_schedule(self,split,**unused):yield None
+            def batches(self,split,**unused):yield [dict(split=split)],1
         class Policy:
             parameters={}
             def __init__(self,*unused):pass
@@ -67,10 +69,12 @@ class EarlyStoppingTests(unittest.TestCase):
                 self.fp16=False
             def set_lr(self,lr):self.lr=lr
             def staged(self,stream):return stream
-            def run(self,prepared,train):
+            def reset_lanes(self,split):pass
+            def run(self,prepared,train,split='train'):
                 if train:self.step_count+=1
                 return dict(loss_sum=1 if train else next(self.scores),decisions=1)
-            def save(self,path,metadata):
+            def lane_arrays(self):return {}
+            def save(self,path,metadata,lanes=None):
                 with Path(path).open('wb') as f:np.savez(f,metadata=np.asarray(json.dumps(dict(metadata=metadata))),step=self.step_count)
         torch=SimpleNamespace(manual_seed=lambda seed:None,__version__='fake',version=SimpleNamespace(hip=None))
         resource=dict(available_ram_bytes=10*1024**3,free_disk_bytes=100*1024**3,private_bytes=0)
@@ -78,10 +82,10 @@ class EarlyStoppingTests(unittest.TestCase):
                 patch.object(trainer,'EventDataset',Dataset),patch.object(trainer,'NeuralPolicy',Policy),\
                 patch.object(trainer,'EventLearner',Learner),patch.object(trainer,'feature_identity',return_value='feature'),\
                 patch.object(trainer,'snapshot',return_value=resource),patch.object(trainer,'Adam',return_value=None),                patch.object(trainer,'PreparationSpec'),                patch.object(trainer,'prepared_batches',lambda data,split,*,spec,pair_budget,reader,**settings:data.batches(split,**settings)):
-            args=SimpleNamespace(output=name,dataset='ignored',resume=None,device='cpu',epochs=0,
-                max_updates=0,seed=123,lr=.0003,threads=1,batch_size=2,pair_budget=100,
-                buffer_mib=1,checkpoint_seconds=600,min_free_ram_mib=1024,max_private_mib=8192,
-                stop_file=None,early_stopping_patience=3,min_delta=0,prefetch_batches=0,**changes)
+            args=SimpleNamespace(**{**dict(output=name,dataset='ignored',resume=None,device='cpu',epochs=0,
+                max_updates=0,seed=123,lr=.0003,threads=1,lanes=2,unroll=1,part_lanes=1,pair_budget=100,
+                cache_mib=1,checkpoint_seconds=600,min_free_ram_mib=1024,max_private_mib=8192,
+                stop_file=None,early_stopping_patience=3,min_delta=0,prefetch_batches=0),**changes})
             report=trainer.train(args)
             with np.load(Path(name)/'best.npz') as saved:best=int(saved['step'])
             with np.load(Path(name)/'latest.npz') as saved:latest=int(saved['step'])
@@ -130,42 +134,36 @@ class EarlyStoppingTests(unittest.TestCase):
         self.assertEqual((resumed.at(7),resumed.state()),(rate.at(7),rate.state()))
         for _ in range(3):rate.observe(False)
         self.assertEqual(rate.at(7),.2)  # The floor.
-        for options in (dict(schedule='cosine'),dict(decay=0),dict(patience=0),dict(min_lr=2),dict(warmup=-1),dict(schedule='step')):
+        for options in (dict(schedule='cosine'),dict(decay=0),dict(patience=0),dict(min_lr=2),dict(warmup=-1),dict(schedule='step'),
+                        dict(schedule='step',horizon=5,step_factor=0)):
             with self.assertRaises(ValueError):trainer.LearningRate(1.0,**options)
+        # SCC's step: the peak until `horizon` updates, then x step_factor (after the warmup ramp).
+        rate=trainer.LearningRate(1e-3,warmup=4,schedule='step',horizon=10,step_factor=.1)
+        self.assertAlmostEqual(rate.at(1),5e-4);self.assertAlmostEqual(rate.at(9),1e-3);self.assertAlmostEqual(rate.at(10),1e-4)
+        self.assertEqual(rate.settings(),dict(warmup=4,schedule='step',horizon=10,step_factor=.1,min_lr=0.0))
 
     def test_cosine_horizon_counts_updates_from_the_shard_index(self):
-        dataset=SimpleNamespace(windows=lambda split,**unused:[[(0,0,dict(rows=300)),(0,0,dict(rows=300))],[(0,0,dict(rows=10))]])
-        self.assertEqual(trainer.updates_per_epoch(dataset,123,256,1),4)
+        dataset=SimpleNamespace(lane_schedule=lambda split,**unused:iter(range(4)))
+        self.assertEqual(trainer.updates_per_epoch(dataset,123,240,64),4)
 
-    def test_batch_fill_measures_how_much_of_the_requested_batch_updates_get(self):
-        # One ~290-row window per update: the shape of v10's "batch 512" run.
-        small=SimpleNamespace(windows=lambda split,**unused:[[(0,0,dict(rows=290))]]*10)
-        self.assertAlmostEqual(trainer.batch_fill(small,123,512,1),290/512)
-        self.assertAlmostEqual(trainer.batch_fill(small,123,256,1),145/256)  # A full batch, then a 34-row remainder.
-        large=SimpleNamespace(windows=lambda split,**unused:[[(0,0,dict(rows=2560+30))]]*10)
-        self.assertGreater(trainer.batch_fill(large,123,256,1),.9)
-
-    def test_training_refuses_a_shuffle_window_too_small_for_the_batch(self):
-        with self.assertRaisesRegex(ValueError,'buffer-mib'):
-            with patch.object(trainer,'batch_fill',return_value=.57):self.run_loop(min_batch_fill=.9)
-        with patch.object(trainer,'batch_fill',return_value=.95):
-            self.assertEqual(self.run_loop(min_batch_fill=.9)[0]['status'],'early_stopped')
+    def test_training_refuses_lanes_that_are_not_whole_reader_parts(self):
+        with self.assertRaisesRegex(ValueError,'Invalid run budget'):self.run_loop(lanes=3,part_lanes=2)
+        self.assertEqual(self.run_loop(lanes=4,part_lanes=2)[0]['status'],'early_stopped')
 
 
 class ValidationRoundTests(unittest.TestCase):
-    """Mid-epoch validation over a fake 4-window dataset; validation loss depends only on the update count."""
+    """Mid-epoch validation over a fake 4-update epoch; validation loss depends only on the update count."""
     def run_training(self,root,scores=None,**changes):
         class Dataset:
             config={'hidden':2};digest='dataset';key='feature';document={}
             entries=[dict(match_key='t',split='train',index={'source':{}}),dict(match_key='v',split='validation',index={'source':{}})]
             def __init__(self,*unused):pass
-            def windows(self,split,**unused):return [0,1,2,3]
-            def batches(self,split,*,cursor=(0,0),**unused):
+            def lane_schedule(self,split,**unused):return iter(range(4))
+            def batches(self,split,*,cursor=0,**unused):
                 if split=='validation':
-                    yield [dict(split=split)],(0,1);yield [dict(split=split)],(0,2);return
-                for window in range(cursor[0],4):
-                    for batch in range(cursor[1] if window==cursor[0] else 0,1):
-                        yield [dict(split=split)],(window,batch+1)
+                    yield [dict(split=split)],1;yield [dict(split=split)],2;return
+                for update in range(cursor,4):
+                    yield [dict(split=split)],update+1
         losses=scores or {}
         class Policy:
             parameters={}
@@ -184,7 +182,9 @@ class ValidationRoundTests(unittest.TestCase):
             def staged(self,stream):return stream
             def restore_rng(self,metadata):pass
             def restore_scaler(self,metadata):pass
-            def run(self,prepared,train):
+            def restore_lanes(self,path,part_lanes):pass
+            def reset_lanes(self,split):pass
+            def run(self,prepared,train,split='train'):
                 if train:
                     self.step_count+=1
                     return dict(loss_sum=1,decisions=1,updates=1)
@@ -192,13 +192,14 @@ class ValidationRoundTests(unittest.TestCase):
                 if stop and self.step_count==stop[0] and not Path(stop[1]).exists():
                     Path(stop[1]).write_text('{}')
                 return dict(loss_sum=losses.get(self.step_count,10-self.step_count),decisions=1)
-            def save(self,path,metadata):
+            def lane_arrays(self):return {}
+            def save(self,path,metadata,lanes=None):
                 with Path(path).open('wb') as f:np.savez(f,metadata=np.asarray(json.dumps(dict(metadata=metadata))),step=self.step_count)
         torch=SimpleNamespace(manual_seed=lambda seed:None,__version__='fake',version=SimpleNamespace(hip=None))
         resource=dict(available_ram_bytes=10*1024**3,free_disk_bytes=100*1024**3,private_bytes=0)
         settings=dict(output=str(root),dataset='ignored',resume=None,device='cpu',epochs=2,
-            max_updates=0,seed=123,lr=.0003,threads=1,batch_size=2,pair_budget=100,
-            buffer_mib=1,checkpoint_seconds=600,min_free_ram_mib=1024,max_private_mib=8192,
+            max_updates=0,seed=123,lr=.0003,threads=1,lanes=2,unroll=1,part_lanes=1,pair_budget=100,
+            cache_mib=1,checkpoint_seconds=600,min_free_ram_mib=1024,max_private_mib=8192,
             stop_file=None,early_stopping_patience=0,min_delta=0,prefetch_batches=0,validations_per_epoch=2)
         settings.update((k,v) for k,v in changes.items() if k!='stop_during_validation')
         with patch.dict(sys.modules,{'torch':torch}),patch('builtins.print'),\
@@ -214,14 +215,14 @@ class ValidationRoundTests(unittest.TestCase):
         return [(h['round'],h['epoch'],h['epoch_fraction'],h['train']['decisions'],h['validation']['mean_nll'],h['cursor'])
                 for h in report['history']]
 
-    def test_rounds_split_each_epoch_at_window_boundaries(self):
+    def test_rounds_split_each_epoch_at_update_marks(self):
         with tempfile.TemporaryDirectory() as name:
             report=self.run_training(Path(name))
         self.assertEqual(report['status'],'completed');self.assertEqual(report['optimizer_updates'],8)
         # Two updates per round; round k validates after 2k updates (loss 10-2k).
         self.assertEqual(self.rounds(report),[
-            (1,1,.5,2,8,dict(epoch=0,position=[1,1],validations=1)),(2,1,1.0,2,6,dict(epoch=1,position=[0,0],validations=0)),
-            (3,2,.5,2,4,dict(epoch=1,position=[1,1],validations=1)),(4,2,1.0,2,2,dict(epoch=2,position=[0,0],validations=0))])
+            (1,1,.5,2,8,dict(epoch=0,position=2,validations=1)),(2,1,1.0,2,6,dict(epoch=1,position=0,validations=0)),
+            (3,2,.5,2,4,dict(epoch=1,position=2,validations=1)),(4,2,1.0,2,2,dict(epoch=2,position=0,validations=0))])
 
     def test_resume_after_an_update_limit_or_inside_validation_matches_one_run(self):
         with tempfile.TemporaryDirectory() as name:
@@ -234,7 +235,7 @@ class ValidationRoundTests(unittest.TestCase):
                     self.assertIn(stopped['status'],('update_limit','interrupted'))
                     if label=='validation':
                         # Stopped before round 1 was recorded: it reruns before any further training.
-                        self.assertEqual(stopped['cursor'],dict(epoch=0,position=[1,1],validations=0));stop.unlink()
+                        self.assertEqual(stopped['cursor'],dict(epoch=0,position=2,validations=0));stop.unlink()
                     resumed=self.run_training(root/label,resume=stopped['checkpoint'],
                                               **{k:v for k,v in changes.items() if k=='stop_file'})
                     self.assertEqual(self.rounds(resumed),self.rounds(full))

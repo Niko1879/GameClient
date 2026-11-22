@@ -1,8 +1,9 @@
-"""PyTorch inference with the reference policy's autoregressive masks and sampling."""
+"""PyTorch inference with the reference policy's masks, sampling and carried LSTM state."""
 from __future__ import annotations
 
 from copy import deepcopy
 
+import numpy as np
 import torch
 
 from generals_policy import NeuralPolicy
@@ -11,6 +12,8 @@ from torch_policy_v3 import TorchPolicyV3
 
 
 class TorchLivePolicy(NeuralPolicy):
+    """NeuralPolicy.decide with every network step on PyTorch (batch 1), via TorchPolicyV3's
+    batched functions: the training equations, so live play and the learner cannot drift apart."""
     def __init__(self, reference, *, device='cuda', dtype=torch.float32):
         if torch.device(device).type == 'cuda' and not torch.cuda.is_available():
             raise RuntimeError('GPU inference requires a PyTorch installation with a working ROCm or CUDA device')
@@ -19,30 +22,65 @@ class TorchLivePolicy(NeuralPolicy):
         # The live actor applies the checkpoint's rating switch when it prepares the row.
         self.model.config = {**self.config, 'rating_input': True}
         self.parameters = self.model.weights
-        self._sample_array = self.model.array
         self.rating_input = getattr(reference, 'rating_input', False)
-
-    _sample_concat = staticmethod(torch.cat)
-    _sample_normalize = staticmethod(TorchPolicyV3.normalize)
 
     def _sampling_logits(self, logits):
         # Transfer just the current head. Sharing the NumPy draw preserves temperature,
         # masks, seeded sampling and the reference probability calculation.
-        return Tensor(logits.cpu().numpy())
+        return Tensor(logits.float().cpu().numpy())
 
-    def _template_embeddings(self):
-        return self.model.object_embedding(self.model.identity_template_objects)
+    def initial_state(self):
+        return self.model.initial_state(1)
 
-    def _trunk(self, encoded):
-        core, entities, spatial = self.model.events([encoded])
-        size = self.config['hidden']
-        return core[0, :size], entities[0], spatial, self.model.values(core)[0], core[0, size:]
+    def _trunk(self, encoded, state=None):
+        model = self.model
+        out = model.encode_batch([encoded])
+        core, state = model.core(out['core_input'][:, None], torch.zeros((1, 1), dtype=torch.bool, device=model.device),
+                                 self.initial_state() if state is None else state)
+        return {'core': core[:, 0], 'state': state, 'value': Tensor(float(model.values(core[:, 0])[0])),
+                'keys': out['keys'], 'features': out['features'], 'map': out['map']}
 
-    def _location(self, spatial, context, build_features=None):
+    def _action(self, action):
+        return self.model.indices([action])
+
+    def _action_logits(self, trunk):
+        return self.model.action_logits(trunk['core'])[0]
+
+    def _delay_logits(self, trunk, action):
+        return self.model.delay_logits(trunk['core'], self._action(action))[0]
+
+    def _unit_begin(self, trunk, action):
+        model = self.model
+        zeros = trunk['core'].new_zeros((1, model.widths['unit_query']))
+        return {'context': model.unit_context(trunk['core'], self._action(action)), 'state': (zeros, zeros),
+                'action': self._action(action), 'keys': model.unit_keys(trunk['keys'])}
+
+    def _unit_scores(self, trunk, unit):
+        model = self.model
+        state = model.unit_step(model.unit_query(unit['context']), unit['state'])
+        return model.unit_logits(state[0], unit['keys'], unit['action'])[0], {**unit, 'state': state}
+
+    def _unit_add(self, trunk, unit, index):
+        return {**unit, 'context': self.model.unit_add(unit['context'], trunk['keys'][:, index])}
+
+    def _selection_summary(self, trunk, selected):
+        model = self.model
+        return model.selection_summary(trunk['features'], model.indices([0]), model.indices([selected or [0]]),
+                                       model.indices([len(selected)]))
+
+    def _slot_logits(self, trunk, action, summary):
+        return self.model.slot_logits(trunk['core'], self._action(action), summary)[0]
+
+    def _target_logits(self, trunk, action, summary):
+        return self.model.target_logits(trunk['core'], self._action(action), summary, trunk['keys'])[0]
+
+    def _angle_logits(self, trunk, action):
+        return self.model.angle_logits(trunk['core'], self._action(action))[0]
+
+    def _location(self, trunk, action, summary, build_features=None):
         build = None if build_features is None else (
             self.model.indices([0]), self.model.array(build_features[None]))
-        cells, logits = self.model.location(spatial, context.unsqueeze(0), build)
-        return cells[0], logits[0]
+        return self.model.location(trunk['map'], trunk['core'], self._action(action), summary, build)[0]
 
     @torch.inference_mode()
     def decide(self, *args, **kwargs):
@@ -59,8 +97,8 @@ class TorchLivePolicy(NeuralPolicy):
         try:
             actor.next_decision_frame = 0
             actor.act(deepcopy(observation), terrain, frame)
-            hidden, _, spatial, _, gate = self._trunk(actor.last['encoded'])
-            self._location(spatial, self._action_type(hidden, gate)[1])[1].cpu()
+            trunk = self._trunk(actor.last['encoded'])
+            self._location(trunk, 0, self._selection_summary(trunk, [])).cpu()
         finally:
             vars(actor).clear()
             vars(actor).update(state)

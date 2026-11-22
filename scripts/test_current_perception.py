@@ -87,8 +87,8 @@ class CurrentPerceptionTests(unittest.TestCase):
             targets.append(target)
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key
-        h, entities, spatial = learner.model.events([self.encoded, self.plain])
-        output = learner.model.teacher_heads([self.encoded, self.plain], targets, h, entities, spatial)
+        output = learner.model.teacher_heads([self.encoded, self.plain], targets,
+                                             *learner.model.events([self.encoded, self.plain]))
         with no_grad():
             expected = [float(self.policy.decide(r['encoded'], None, teacher=t)[4].data) for r, t in zip(rows, targets)]
         np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), expected, rtol=3e-6, atol=2e-5)

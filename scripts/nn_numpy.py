@@ -168,6 +168,15 @@ class Tensor:
             self.add_grad(np.broadcast_to(g, self.data.shape))
         return Tensor(self.data.sum(axis=axis), (self,), backward)
 
+    def max(self, axis=0):
+        """Maximum along one axis; the gradient goes to the first maximal entry, as torch.max(dim)."""
+        index = np.expand_dims(self.data.argmax(axis=axis), axis)
+        def backward(g):
+            gradient = np.zeros_like(self.data)
+            np.put_along_axis(gradient, index, np.expand_dims(g, axis), axis=axis)
+            self.add_grad(gradient)
+        return Tensor(np.take_along_axis(self.data, index, axis=axis).squeeze(axis), (self,), backward)
+
     def mean(self, axis=None):
         count = self.data.size if axis is None else self.data.shape[axis]
         return self.sum(axis) / count
@@ -203,15 +212,15 @@ def tensor(value):
     return value if isinstance(value, Tensor) else Tensor(value)
 
 
-def concatenate(values):
+def concatenate(values, axis=0):
     values = [tensor(v) for v in values]
-    sizes = [v.data.shape[0] for v in values]
+    sizes = [v.data.shape[axis] for v in values]
     def backward(g):
         offset = 0
         for value, size in zip(values, sizes):
-            value.add_grad(g[offset:offset + size])
+            value.add_grad(np.take(g, np.arange(offset, offset + size), axis=axis))
             offset += size
-    return Tensor(np.concatenate([v.data for v in values]), values, backward)
+    return Tensor(np.concatenate([v.data for v in values], axis=axis), values, backward)
 
 
 def minimum(first, second):

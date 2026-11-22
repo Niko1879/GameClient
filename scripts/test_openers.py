@@ -14,7 +14,7 @@ import openers
 from event_dataset import EventDataset
 from event_policy import EventActor
 from event_store import feature_identity, write_shard
-from generals_policy import OPENER_BUILDINGS, OPENER_WINDOW_SECONDS, NeuralPolicy, opener_inputs
+from generals_policy import OPENER_BUILDINGS, OPENER_WINDOW_SECONDS, NeuralPolicy, opener_inputs, scalar_input_slices
 from nn_numpy import Tensor, no_grad
 from prepared_io import _write_json
 from test_fixtures import fixture, raw_row
@@ -129,14 +129,15 @@ class OpenerModelTests(unittest.TestCase):
             targets.append(target)
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key
-        h, entities, spatial = learner.model.events([given, encoded])
-        output = learner.model.teacher_heads([given, encoded], targets, h, entities, spatial)
+        output = learner.model.teacher_heads([given, encoded], targets, *learner.model.events([given, encoded]))
         with no_grad():
             expected = [float(self.policy.decide(r['encoded'], None, teacher=t)[4].data) for r, t in zip(rows, targets)]
         np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), expected, rtol=3e-6, atol=2e-5)
         self.assertNotAlmostEqual(expected[0], expected[1], places=6)
         learner.batch(rows, train=True)
-        self.assertGreater(float(learner.model.weights['opener_w'].grad.abs().sum().cpu()), 0)
+        # AlphaGenerals: the opener is a row block of scalar_in_w (scalar_input_slices).
+        rows = scalar_input_slices(self.policy.config)['opener']
+        self.assertGreater(float(learner.model.weights['scalar_in_w'].grad[rows].abs().sum().cpu()), 0)
 
     def test_actor_shows_its_opener_only_in_the_window_and_keeps_it_across_games(self):
         actor = EventActor(self.policy)

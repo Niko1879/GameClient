@@ -191,7 +191,10 @@ class ProductionScopeTests(unittest.TestCase):
             source_ticks_per_second=60,player=2),Counter()))
         learner=EventLearner(self.policy,device='cpu',threads=1)
         result=learner.batch(events,train=True)
-        self.assertEqual(learner.model.weights['template_b'].numel(),2)
+        # The flat action holds one train and one build entry per scoped template (two here).
+        kinds=learner.model.reference.actions[:,0]
+        self.assertEqual([int((kinds==learner.model.reference.kinds.index(k)).sum()) for k in ('build','train')],[2,2])
+        self.assertEqual(learner.model.weights['action_w'].shape[1],len(kinds))
         self.assertTrue(all(np.isfinite(value) for value in result.values()))
         self.assertEqual([event['frame'] for event in events],[0,30])
 

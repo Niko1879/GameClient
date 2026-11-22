@@ -4,13 +4,13 @@ The bundle holds no shards: data/ has only dataset.json, and bundle.json
 names training-data/ as the shard source, from which scripts/cloud_upload.py
 streams every shard into data/ on the instance. Nothing is copied or linked on
 the workstation, so a full bundle takes no disk space. code/ holds every script
-(tests included, so the GPU path can be checked on the instance), and
-setup.sh/train.sh run the same learner settings as run_prepared_training.py.
+(tests included, so the GPU path can be checked on the instance); setup.sh runs
+them and train.sh trains with SCC's supervised recipe (notes/plan.md §3).
 Gameplay checks stay local: the native engine is Windows-only.
 
   python -B scripts/cloud_bundle.py --output D:/bundles/v7-all --validation 1000
   python -B scripts/cloud_bundle.py --output ... --training 15000 --validation 1000
-  python -B scripts/cloud_bundle.py --output ... --widths big     # v11 big run (52.1M; the map is not scaled)
+  python -B scripts/cloud_bundle.py --output ... --widths '{"widths": {"core": 896}}'  # another core width
 
 bundle.json records the learner's parameter count, which changes as inputs and
 heads are added; the preset names deliberately carry no size.
@@ -54,66 +54,53 @@ cd code && TEST_TORCH_DEVICE=cuda CUBLAS_WORKSPACE_CONFIG=:4096:8 ../.venv/bin/p
   test_event_policy test_event_training_batches test_scheduled_capture test_policy \\
   test_unit_tasks test_command_actions test_build_placement test_resume_construction \\
   test_event_dataset test_compiled_learner test_enemy_and_clock test_prepared_training test_learner_bench \\
-  test_distributed_training test_staged_updates
+  test_distributed_training test_staged_updates test_alphagenerals
 """
 
 TRAIN = """#!/usr/bin/env bash
-# The local experiment's learner settings (run_prepared_training.py), with cloud
-# resource limits. Extra arguments are appended, e.g. --resume run/latest.npz.
-# Resume needs identical settings: keep PRECISION, COMPILE, READERS, WORLD, BATCH, BUFFER_MIB and the
-# learning-rate variables unchanged.
-# Defaults from the RTX 5070 Ti benchmark (scripts/cloud_training.md): BF16 with
-# the compiled encoder was fastest. 8 readers were the steadiest on a 5090 + 9950X (5 Nov).
+# AlphaGenerals with SCC's supervised recipe (notes/plan.md Â§3), with cloud resource limits.
+# Extra arguments are appended, e.g. --resume run/latest.npz, or for the winners' fine-tune
+# --init <stage-2 best.npz> with LR=0.00001 LR_SCHEDULE=constant on its own bundle.
+# Resume needs identical settings: keep PRECISION, COMPILE, READERS, WORLD, LANES, UNROLL, PART_LANES,
+# CACHE_MIB and the learning-rate variables unchanged.
 set -euo pipefail
 cd "$(dirname "$0")"
 GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-# Data-parallel ranks, one per GPU (train_events --world-size); BATCH is the global
-# batch, split across them. 512 for the v11 big run (15 Nov, with LR 4.2e-4 and a 1024 MiB
-# window so batches really fill); the rating ladder used 256 with lr 3e-4 (BATCH=256 LR=0.0003).
-WORLD=${WORLD:-1}  # One GPU (user decision, 9 Nov); WORLD=N for data-parallel ranks.
-BATCH=${BATCH:-512}
+WORLD=${WORLD:-1}  # One GPU (user decision, 9 Nov); WORLD=N for data-parallel ranks (lanes split between them).
+# An update is LANES episodes x UNROLL consecutive decisions (truncated BPTT, LSTM state carried):
+# 240 x 64 = 15,360, SCC's final batch (plan Â§3).
+LANES=${LANES:-240}
+UNROLL=${UNROLL:-64}
+PART_LANES=${PART_LANES:-8}  # Reader preparation unit: 512 decisions, the old batch's shared-memory size.
+CACHE_MIB=${CACHE_MIB:-256}  # Decoded chunks each reader keeps while its lanes read their episodes.
 # Reader processes per rank: each rank's main thread needs a core of its own.
 PER_RANK=$(( ($(nproc) - WORLD) / WORLD ))
 # Inductor otherwise forks one ~0.5 GB compile worker per CPU thread (12 GB on a
 # 24-thread host), which with the readers overran a 31 GB container (11 Nov).
 export TORCHINDUCTOR_COMPILE_THREADS=1
-# Each reader loads its own copy of the dataset index (~3.3 GB for 112.7k matches)
-# and the main process ~8 GB: cap readers by the container's memory limit too.
+# Each reader loads its own copy of the dataset index (~3.3 GB for 112.7k matches) plus its chunk
+# cache, and the main process ~8 GB plus one update in host memory: cap readers by the memory limit.
 MEM_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
 [ "$MEM_LIMIT" = max ] && MEM_LIMIT=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) * 1024 ))
-MEM_READERS=$(( (MEM_LIMIT / 1048576 - 12288) / 3584 / WORLD ))
+MEM_READERS=$(( (MEM_LIMIT / 1048576 - 16384) / (3584 + CACHE_MIB) / WORLD ))
 CPU_READERS=$(( PER_RANK >= 8 ? 8 : (PER_RANK > 1 ? PER_RANK : 1) ))
 READERS=${READERS:-$(( MEM_READERS < CPU_READERS ? (MEM_READERS > 1 ? MEM_READERS : 1) : CPU_READERS ))}
 PRECISION=${PRECISION:-bf16}
-COMPILE=${COMPILE:-1}  # v9, 5090 + 9950X (5 Nov): +16% over eager; the first ~250 updates recompile
-# Validation rounds per epoch; PATIENCE and LR_DECAY count rounds, so scale them with
-# VALIDATIONS. All-data defaults (9 Nov): a 100k-match epoch is ~4.5 h on a 5090, so
-# validate about hourly and stop after ~2 epochs without improvement.
+COMPILE=${COMPILE:-1}  # The encoder; the core LSTM and the heads stay eager and FP32.
+# Validation rounds per epoch; PATIENCE counts rounds. One round scores the 500 validation
+# matches' whole episodes in order.
 VALIDATIONS=${VALIDATIONS:-4}
 PATIENCE=${PATIENCE:-4}  # One epoch without a 0.005 gain (user, 12 Nov: stop soon after validation flattens).
-# Learning rate (train_events.LearningRate, 12 Nov): a warmup ramp, then the rate halves
-# only after LR_PATIENCE validation rounds in a row without improvement, and the round
-# after a cut is not counted. v10's per-round 0.74 cut the rate on one loss spike in epoch 1.
-# For a run of planned length: LR_SCHEDULE=cosine with EPOCHS set to that length
-# (and LR_DECAY=1 to leave the cosine alone).
-WARMUP=${WARMUP:-2000}
-# Learning rate. v11 big run (15 Nov 2026, agent's call): batch 512 with 3e-4 x sqrt(2), the
-# square-root rule for Adam; 256 / 3e-4 is the ladder runs' setting (top20R, the pilot).
-LR=${LR:-0.00042}
-LR_DECAY=${LR_DECAY:-0.5}
-LR_PATIENCE=${LR_PATIENCE:-2}
-LR_COOLDOWN=${LR_COOLDOWN:-1}
-LR_SCHEDULE=${LR_SCHEDULE:-constant}
-EPOCHS=${EPOCHS:-20}
-# Shuffle window. A batch is cut from one window, and 64 MiB holds only ~290 rows of v6
-# shards: BATCH=512 was never reached (v10 averaged 292 rows per update) and BATCH=256
-# leaves a ~30-row update after every full one. 512 MiB is ~2,300 rows from ~140 game
-# segments (measured on v6 shards, 12 Nov); it costs each reader well under 1 GB.
-BUFFER_MIB=${BUFFER_MIB:-1024}
-# Readers hand updates over in shared memory (~4 slots of >= 16 MiB each).
+# SCC's recipe: 1e-3, then x0.1 after 154M decisions (its 40k steps at batch 3,850); warmup ours.
+WARMUP=${WARMUP:-500}
+LR=${LR:-0.001}
+LR_SCHEDULE=${LR_SCHEDULE:-step}
+LR_STEP_DECISIONS=${LR_STEP_DECISIONS:-154000000}
+EPOCHS=${EPOCHS:-10}  # The cap on pool epochs (plan Â§3).
+# Readers hand parts over in shared memory (~4 slots of >= 16 MiB each).
 SHM_MB=$(df -m /dev/shm | awk 'NR==2 {print $4}')
-if [ "$SHM_MB" -lt $(( READERS * WORLD * 100 )) ]; then
-  echo "/dev/shm has $SHM_MB MB free; $(( READERS * WORLD )) readers need ~$(( READERS * WORLD * 100 )) MB: raise the container's --shm-size" >&2
+if [ "$SHM_MB" -lt $(( READERS * WORLD * 400 )) ]; then
+  echo "/dev/shm has $SHM_MB MB free; $(( READERS * WORLD )) readers need ~$(( READERS * WORLD * 400 )) MB: raise the container's --shm-size" >&2
   exit 1
 fi
 # Rating input ON (user, 15/17 Nov 2026: it helped the top-20% run). It is no config key (that would change
@@ -123,24 +110,22 @@ mkdir -p run
 if [ "$GENERALS_RATING_INPUT" = 1 ]; then touch run/RATING_INPUT; fi
 EXTRA=()
 if [ "$COMPILE" = 1 ]; then EXTRA+=(--compile); fi
+if [ "$LR_SCHEDULE" = step ]; then EXTRA+=(--lr-step-decisions "$LR_STEP_DECISIONS"); fi
 exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json --output run \\
   --device cuda --epochs "$EPOCHS" --early-stopping-patience "$PATIENCE" --validations-per-epoch "$VALIDATIONS" \\
   --min-delta 0.005 --seed TRAIN_SEED --threads 1 \\
-  --world-size "$WORLD" --batch-size "$BATCH" --buffer-mib "$BUFFER_MIB" --pair-budget 8000000 --checkpoint-seconds 600 \\
-  --lr-decay "$LR_DECAY" --lr-patience "$LR_PATIENCE" --lr-cooldown "$LR_COOLDOWN" \\
-  --lr "$LR" --lr-warmup-updates "$WARMUP" --lr-schedule "$LR_SCHEDULE" --min-lr 0.00001 --precision "$PRECISION" "${EXTRA[@]}" \\
+  --world-size "$WORLD" --lanes "$LANES" --unroll "$UNROLL" --part-lanes "$PART_LANES" --cache-mib "$CACHE_MIB" \\
+  --pair-budget 8000000 --checkpoint-seconds 600 \\
+  --lr "$LR" --lr-warmup-updates "$WARMUP" --lr-schedule "$LR_SCHEDULE" --precision "$PRECISION" "${EXTRA[@]}" \\
   --reader-processes "$READERS" --prefetch-batches 2 \\
   --min-free-ram-mib 4096 --max-private-mib 1048576 --min-free-disk-gib 10 \\
   --max-gpu-mib $(( GPU_MIB * 9 / 10 )) --stop-file run/stop "$@"
 """
 
-# Model-only widths: the feature key and shards are unchanged. 'default' is
-# replay-runtime/policy.json's own (29.0M parameters on 15 Nov, observation v11). 'big' is the
-# v11 big run (user, 15 Nov 2026: do not scale the map; the capacity goes to the entity encoder,
-# the core and the scalar encoder): 52.1M, entity+attention 12.1M (4x), core 15.1M (3x), map
-# encoder and its 256-wide summary (map_fc 8.4M) unchanged. map_hidden is deliberately absent.
-WIDTHS = {'default': {},
-          'big': dict(hidden=2560, entity_hidden=512, scalar_hidden=512)}
+# Model-only config overrides: the feature key and shards are unchanged. 'default' is AlphaGenerals'
+# fixed widths (generals_policy.WIDTHS, 47.3M parameters; notes/plan.md §6). Others are JSON, e.g.
+# '{"widths": {"core": 896}}'.
+WIDTHS = {'default': {}}
 
 
 def check_shards(entries, source, report=None):
@@ -169,7 +154,7 @@ def main():
     selection_options.add_archive_arguments(parser)
     parser.add_argument('--train-seed', type=int, default=123, help='Learner seed baked into train.sh (initialisation, shuffling)')
     parser.add_argument('--widths', default='default',
-                        help="Learner size: 'default', 'big' or a JSON object of model-only widths")
+                        help="Learner size: 'default' or a JSON object of model-only settings")
     args = parser.parse_args()
     from engine_runtime import disable_power_throttling
     disable_power_throttling()

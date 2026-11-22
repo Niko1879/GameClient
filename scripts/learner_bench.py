@@ -10,9 +10,9 @@
   # A checkpoint's match split, for cloud_bundle.py --validation-from.
   python -B scripts/learner_bench.py splits --checkpoint .cache/cloud-runs/v9-10k/best.npz --output split.json
 
-`run --code DIR` imports the learner from DIR (e.g. the baseline sources) instead
-of this directory, so old and new code are timed on the same instance, data and
-settings. Updates are the ones train.sh runs: the same sampler, readers,
+`run --code DIR` imports the learner from DIR (sources with the same lane API)
+instead of this directory, so two versions are timed on the same instance, data
+and settings. Updates are the ones train.sh runs: the same lane sampler, readers,
 prefetch and learner; nothing is checkpointed.
 """
 from __future__ import annotations
@@ -32,19 +32,18 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 
 ROOT = Path(__file__).resolve().parents[1]
-# Trunk widths a width sweep scales uniformly (the 'big' preset instead leaves map_hidden alone).
-WIDTH_KEYS = ('hidden', 'entity_hidden', 'map_hidden', 'scalar_hidden')
+# The width a sweep scales: AlphaGenerals' core (generals_policy.WIDTHS; plan.md §6 sizes the model by it).
+WIDTH_KEYS = ('core',)
 LEARNER = ('train_events.py', 'torch_training_inputs.py', 'torch_policy_v3.py', 'training_preparation.py',
            'event_training_batches.py', 'generals_policy.py')
 
 BENCH = """#!/usr/bin/env bash
-# Learner timing matrix: baseline sources (baseline-code.zip) against this
-# bundle's code/, on the same data with train.sh's settings. Results land in
+# Learner timing for the AlphaGenerals sequence learner: lanes x unroll decisions per
+# update (train_events --lanes/--unroll), train.sh's other settings. Results land in
 # results/; results/summary.txt compares them. About 20-30 minutes.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p results
-if [ ! -d baseline ]; then mkdir baseline && (cd baseline && unzip -q ../baseline-code.zip); fi
 export TORCHINDUCTOR_COMPILE_THREADS=1  # One ~0.5 GB compile worker per CPU thread otherwise (11 Nov).
 # Readers each load the dataset index (~3.3 GB at 112.7k matches): cap by the memory limit.
 MEM_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
@@ -52,11 +51,9 @@ MEM_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
 MEM_READERS=$(( (MEM_LIMIT / 1048576 - 12288) / 3584 ))
 CPU_READERS=$(( $(nproc) >= 12 ? 8 : ($(nproc) > 4 ? 4 : $(nproc) - 1) ))
 READERS=${READERS:-$(( MEM_READERS < CPU_READERS ? (MEM_READERS > 1 ? MEM_READERS : 1) : CPU_READERS ))}
-UPDATES=${UPDATES:-400}
-# One warm-up for every run: throughput depends on which updates are timed
-# (eager baseline 1,936 dec/s after 60 updates, 2,357 after 250, same host),
-# and compilation recompiles for new shapes for a few hundred updates.
-WARMUP=${WARMUP:-250}
+UPDATES=${UPDATES:-40}
+# Compilation recompiles for new shapes during the first updates; an update is 15,360 decisions.
+WARMUP=${WARMUP:-20}
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv | tee results/gpu.txt
 lscpu | grep -E 'Model name|^CPU\\(s\\)|MHz' | tee results/cpu.txt
 run() {
@@ -65,74 +62,11 @@ run() {
     --precision bf16 --updates "$UPDATES" --label "$label" --output "results/$label.json" "$@" \\
     > "results/$label.log" 2>&1 && tail -1 "results/$label.log" || echo "$label failed: see results/$label.log"
 }
-# SWEEP=1: model width against throughput, compiled, at batch 256 and 512 (~30 min).
-# Run it on the host that will train: the cost of width depends on its CPU and GPU.
-if [ "${SWEEP:-0}" = 1 ]; then
-  for scale in 1 1.5 2; do
-    for batch in 256 512; do
-      run "sweep-w$scale-b$batch" --compile --width-scale "$scale" --batch-size "$batch" --warmup "$WARMUP"
-    done
-  done
-  # The first condition again: drift on a shared host shows up as a disagreement.
-  run sweep-w1-b256-repeat --compile --width-scale 1 --batch-size 256 --warmup "$WARMUP"
-  .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
-  exit 0
-fi
-# BIG=1: the v11 big run's sizes (15 Nov 2026; the map is not scaled), compiled (~45 min): 'big' (C,
-# 52.1M) at batch 512/1024/2048 with the shuffle window at 2x the batch, then B (45.9M) and the
-# default (29.0M) at 512 for the cost of width. Run on the training host while the shards upload.
-if [ "${BIG:-0}" = 1 ]; then
-  for batch in 512 1024 2048; do
-    run "big-C-b$batch" --compile --widths big --batch-size "$batch" --buffer-mib $(( batch * 2 )) --warmup "$WARMUP"
-  done
-  run big-B-b512 --compile --widths '{"hidden": 2048, "entity_hidden": 512, "scalar_hidden": 384}' \
-    --batch-size 512 --buffer-mib 1024 --warmup "$WARMUP"
-  run big-default-b512 --compile --batch-size 512 --buffer-mib 1024 --warmup "$WARMUP"
-  .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
-  exit 0
-fi
-# SCALE=1: data-parallel scaling (train_events --world-size), compiled, on every GPU count
-# from 1 up to this host's, at global batch 256 and at 256 per GPU (and one GPU at those
-# batches); then two ranks sharing
-# one GPU, since a CPU-bound learner may leave room for a second process (~40 min on 4 GPUs).
-if [ "${SCALE:-0}" = 1 ]; then
-  GPUS=$(nvidia-smi -L | wc -l)
-  for world in 1 2 4 8; do
-    [ "$world" -le "$GPUS" ] || break
-    per_rank=$(( ($(nproc) - world) / world )); readers=$(( per_rank >= 8 ? 8 : (per_rank > 1 ? per_rank : 1) ))
-    # One GPU at every batch too: a larger global batch is faster on its own.
-    for batch in 256 512 1024 2048; do
-      [ "$batch" -le $(( 256 * GPUS )) ] || continue
-      [ "$world" = 1 ] || [ "$batch" = 256 ] || [ "$batch" = $(( 256 * world )) ] || continue
-      READERS=$readers run "scale-w$world-b$batch" --compile --world-size "$world" --batch-size "$batch" --warmup "$WARMUP"
-    done
-  done
-  per_rank=$(( ($(nproc) - 2) / 2 )); readers=$(( per_rank >= 8 ? 8 : (per_rank > 1 ? per_rank : 1) ))
-  READERS=$readers run scale-shared2-b256 --compile --world-size 2 --ranks-per-gpu 2 --batch-size 256 --warmup "$WARMUP"
-  run scale-w1-b256-repeat --compile --world-size 1 --batch-size 256 --warmup "$WARMUP"
-  .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
-  exit 0
-fi
-# QUICK=1: current code only, eager and compiled (~10 min), e.g. to price a second host.
-if [ "${QUICK:-0}" = 1 ]; then
-  run current-eager --warmup "$WARMUP"
-  run current-compile --compile --warmup "$WARMUP"
-  .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
-  exit 0
-fi
-# Eager pairs in ABBA order, so drift (clocks, thermals) shows up as a disagreement.
-run baseline-eager --code baseline/scripts --warmup "$WARMUP"
-run current-eager --warmup "$WARMUP"
-run current-eager-2 --warmup "$WARMUP"
-run baseline-eager-2 --code baseline/scripts --warmup "$WARMUP"
-run baseline-compile --code baseline/scripts --compile --warmup "$WARMUP"
-run current-compile --compile --warmup "$WARMUP"
-run current-compile-b512 --compile --batch-size 512 --warmup "$WARMUP"
-# Experimental: compile the argument heads and losses too (graph breaks expected).
-run current-compile-heads --compile --compile-heads --warmup "$WARMUP"
-# Kernel launches and GPU synchronisations per update (profiled separately, not timed).
-run baseline-profile --code baseline/scripts --warmup "$WARMUP" --updates 20 --profile 10
-run current-profile --warmup "$WARMUP" --updates 20 --profile 10
+run eager --warmup "$WARMUP"
+run compile --compile --warmup "$WARMUP"
+# Half the lanes: the update's fixed costs (the LSTM's 64 sequential steps) against its size.
+run compile-lanes120 --compile --lanes 120 --warmup "$WARMUP"
+run compile-repeat --compile --warmup "$WARMUP"
 .venv/bin/python -B code/learner_bench.py summary results/*.json | tee results/summary.txt
 """
 
@@ -226,17 +160,20 @@ def bundle(args):
 
 
 def model_widths(config, widths=None, scale=1.0):
-    """Model-only width overrides: a cloud_bundle preset name or JSON object, or the
-    dataset's trunk widths times `scale`, rounded to multiples of 64. Shards and the
-    feature key are unchanged by either."""
+    """Model-only config overrides: a cloud_bundle preset name or JSON object, or the
+    core width times `scale`, rounded to multiples of 64, as {'widths': {...}}. Shards and
+    the feature key are unchanged by either."""
     from event_store import MODEL_ONLY
+    from generals_policy import widths as network_widths
     if widths is not None and scale != 1.0:
         raise ValueError('Give --widths or --width-scale, not both')
     if widths is not None:
         from cloud_bundle import WIDTHS
         chosen = WIDTHS[widths] if widths in WIDTHS else json.loads(widths)
     else:
-        chosen = {key: max(64, round(config[key]*scale/64)*64) for key in WIDTH_KEYS} if scale != 1.0 else {}
+        current = network_widths(config)
+        chosen = ({'widths': {**config.get('widths', {}), **{key: max(64, round(current[key]*scale/64)*64)
+                                                              for key in WIDTH_KEYS}}} if scale != 1.0 else {})
     if not isinstance(chosen, dict) or not set(chosen) <= MODEL_ONLY:
         raise ValueError('Widths must be model-only settings')
     return chosen
@@ -353,10 +290,6 @@ def run(args, ranks=None):
     learner = train_events.EventLearner(reference, device=args.device, threads=1,
                                         pair_budget=args.pair_budget, precision=args.precision,
                                         compile_encoder=args.compile, **({'ranks': ranks} if ranks.share else {}))
-    if args.compile_heads:
-        import torch_training_inputs
-        torch_training_inputs.teacher_heads = torch.compile(torch_training_inputs.teacher_heads, dynamic=True)
-        train_events.event_losses = torch.compile(train_events.event_losses, dynamic=True)
     spec = PreparationSpec(dataset.config, dataset.key, float_dtype=learner.model.float_dtype,
                            device_type=learner.model.device_type)
     cuda = learner.model.device.type == 'cuda'
@@ -364,8 +297,8 @@ def run(args, ranks=None):
     reader = (PreparedReader(dataset, spec, args.pair_budget, args.prefetch, args.readers, *share.values())
               if args.prefetch else None)
     stream = prepared_batches(dataset, 'train', spec=spec, pair_budget=args.pair_budget, reader=reader, seed=args.seed,
-                              epoch=0, batch_size=args.batch_size, buffer_bytes=args.buffer_mib*1024*1024, cursor=(0, 0),
-                              **share)
+                              epoch=0, lanes=args.lanes, steps=args.unroll, part_lanes=args.part_lanes,
+                              cache_bytes=args.cache_mib*1024*1024, cursor=0, **share)
     if hasattr(learner, 'staged'):  # Older --code baselines upload on the main thread.
         stream = learner.staged(stream)
     measured, waits, losses, profile, busy, sampler = Counter(), [], [], None, None, None
@@ -497,15 +430,16 @@ def main():
     timing.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     timing.add_argument('--precision', default='bf16')
     timing.add_argument('--compile', action='store_true')
-    timing.add_argument('--compile-heads', action='store_true', help='Experimental: also compile heads and losses')
     timing.add_argument('--warmup', type=int, default=60)
     timing.add_argument('--updates', type=int, default=400)
     timing.add_argument('--profile', type=int, default=0, help='Updates to profile after the timed ones')
-    timing.add_argument('--batch-size', type=int, default=256)
+    timing.add_argument('--lanes', type=int, default=240, help='Episodes per update (train_events --lanes)')
+    timing.add_argument('--unroll', type=int, default=64, help='Decisions per lane and update')
+    timing.add_argument('--part-lanes', type=int, default=8, help='Lanes per reader part')
     timing.add_argument('--widths', help="Model-only widths: cloud_bundle preset ('default', 'big') or JSON")
     timing.add_argument('--width-scale', type=float, default=1.0, help='Scale the trunk widths (multiples of 64)')
     timing.add_argument('--pair-budget', type=int, default=8_000_000)
-    timing.add_argument('--buffer-mib', type=int, default=512)
+    timing.add_argument('--cache-mib', type=int, default=256)
     timing.add_argument('--prefetch', type=int, default=2)
     timing.add_argument('--readers', type=int, default=4)
     timing.add_argument('--seed', type=int, default=123)

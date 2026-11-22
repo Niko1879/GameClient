@@ -6,6 +6,7 @@ the corpus.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import hashlib
 import json
 from pathlib import Path
@@ -92,6 +93,10 @@ def player_rating_inputs(ratings):
             for player, rating in ratings.items()}
 
 
+# Games' shared map data kept decoded: sequence training reads one game per lane at a time.
+SHARED_GAMES = 1024
+
+
 class EventDataset:
     def __init__(self, manifest):
         self.path = Path(manifest).resolve()
@@ -115,7 +120,8 @@ class EventDataset:
             raise ValueError('Event dataset mixes feature identities')
         self.key = next(iter(keys))
         self.entries = self.document['entries']
-        self.verified, self.shared = {}, {}
+        self.verified, self.shared = {}, OrderedDict()
+        self._episodes, self._chunks = {}, OrderedDict()
 
     def shard_path(self, entry):
         path = (self.path.parent / entry['path']).resolve()
@@ -162,7 +168,11 @@ class EventDataset:
                 columns, meta = read_member(archive, entry['index']['shared'][shared])
                 common = {name: column.at(0) for name, column in columns.items()}
                 common.update(meta[0])
-                self.shared = {identity: common}  # One immutable map working set.
+                self.shared[identity] = common
+                # Immutable map working sets, one per game a sequence lane may be reading.
+                while len(self.shared) > SHARED_GAMES:
+                    self.shared.popitem(last=False)
+            self.shared.move_to_end(identity)
             columns, metadata = read_member(archive, descriptor)
         if len(metadata) != descriptor['rows']:
             raise ValueError('Event column row count mismatch')
@@ -244,3 +254,104 @@ class EventDataset:
             for rows, position in self.window_batches(windows[window], seed=seed, epoch=epoch, window=window,
                                                       batch_size=batch_size, start=start):
                 yield rows, (window, position)
+
+    # Sequence training (notes/plan.md Â§2): lanes of consecutive decisions, one episode at a time.
+
+    def episodes(self, split):
+        """The split's training units in index order: (chunk references in game order, rows).
+
+        An episode is one supervised player's decisions in one match; below-floor players'
+        episodes stay skipped, as in chunks()."""
+        cached = self._episodes.get(split)
+        if cached is None:
+            cached = []
+            for source, entry in enumerate(self.entries):
+                if entry['split'] != split:
+                    continue
+                excluded = set(entry.get('excluded_players', ()))
+                for episode in entry['index']['episodes']:
+                    if str(episode['player']) in excluded:
+                        continue
+                    chunks = [(source, episode['shared'], descriptor) for descriptor in episode['chunks']]
+                    rows = sum(descriptor['rows'] for descriptor in episode['chunks'])
+                    if rows:
+                        cached.append((chunks, rows))
+            self._episodes[split] = cached
+        return cached
+
+    def lane_schedule(self, split, *, seed, epoch, lanes, steps, shuffle=True):
+        """Every update of an epoch as int arrays (lanes, steps): (episode or -1 for no row, row
+        within the episode, reset = an episode's first decision).
+
+        Each lane plays one episode from its first decision to its last, then takes the next
+        episode of a seeded permutation (index order with shuffle=False), so an update holds
+        `lanes` different games at different phases. Lanes drain at the epoch's end; the last
+        updates are partly empty. A pure function of the index: a cursor is an update number."""
+        if lanes < 1 or steps < 1:
+            raise ValueError('Positive lane and step counts required')
+        episodes = self.episodes(split)
+        order = (np.random.default_rng(np.random.SeedSequence([seed, epoch, 2])).permutation(len(episodes))
+                 if shuffle else np.arange(len(episodes)))
+        queue = iter(order.tolist())
+        current = [None]*lanes
+        while True:
+            episode = np.full((lanes, steps), -1, dtype=np.int64)
+            row, reset = np.zeros((lanes, steps), dtype=np.int64), np.zeros((lanes, steps), dtype=bool)
+            for lane in range(lanes):
+                step = 0
+                while step < steps:
+                    if current[lane] is None:
+                        following = next(queue, None)
+                        if following is None:
+                            break
+                        current[lane] = (following, 0)
+                    number, start = current[lane]
+                    take = min(steps-step, episodes[number][1]-start)
+                    episode[lane, step:step+take] = number
+                    row[lane, step:step+take] = np.arange(start, start+take)
+                    reset[lane, step] = start == 0
+                    step += take
+                    current[lane] = None if start+take == episodes[number][1] else (number, start+take)
+            if (episode < 0).all():
+                return
+            yield episode, row, reset
+
+    def episode_rows(self, split, number, start, stop, cache_bytes=256*1024*1024):
+        """Rows [start, stop) of one episode, in game order.
+
+        Decoded chunks stay in a least-recently-used cache of about cache_bytes (three times their
+        stored size each), so a lane reading its episode across updates decodes each chunk once."""
+        chunks, _ = self.episodes(split)[number]
+        rows, offset = [], 0
+        for reference in chunks:
+            count = reference[2]['rows']
+            if offset < stop and offset+count > start:
+                key = reference[0], reference[2]['member']
+                cached = self._chunks.get(key)
+                if cached is None:
+                    cached = self._chunks[key] = (self.read(reference), reference[2]['bytes']*3)
+                    while len(self._chunks) > 1 and sum(item[1] for item in self._chunks.values()) > cache_bytes:
+                        self._chunks.popitem(last=False)
+                self._chunks.move_to_end(key)
+                rows.extend(cached[0][max(0, start-offset):stop-offset])
+            offset += count
+        return rows
+
+    def lane_rows(self, split, schedule, lanes, cache_bytes=256*1024*1024):
+        """One update's rows of the given lanes, each a shallow copy with its 'lane' and 'step'."""
+        episode, row, _ = schedule
+        result = []
+        for lane in lanes:
+            numbers = episode[lane]
+            step = 0
+            while step < len(numbers) and numbers[step] >= 0:
+                end = step
+                while end < len(numbers) and numbers[end] == numbers[step]:
+                    end += 1
+                values = self.episode_rows(split, int(numbers[step]), int(row[lane, step]), int(row[lane, end-1])+1,
+                                           cache_bytes)
+                if len(values) != end-step:
+                    raise ValueError('Episode rows do not match the shard index')
+                result.extend({**value, 'lane': lane, 'step': position} for position, value in enumerate(values, start=step))
+                step = end
+        return result

@@ -136,14 +136,17 @@ class ResumeConstructionTests(unittest.TestCase):
         learner.model.legality_key = key
         for batch in (rows, portable):
             encoded = [row['encoded'] for row in batch]
-            h, entities, spatial = learner.model.events(encoded)
-            actual = learner.model.teacher_heads(encoded, [r['target'] for r in batch], h, entities, spatial)
+            actual = learner.model.teacher_heads(encoded, [r['target'] for r in batch], *learner.model.events(encoded))
             with no_grad():
                 expected = [float(self.policy.decide(r['encoded'], None, teacher=r['target'])[4].data) for r in rows]
             np.testing.assert_allclose(actual['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
         learner.batch(portable, train=True)
-        for name in ('target_pointer_w', 'task_command_w'):
+        # AlphaGenerals: the target head's query and key projections; the command receipt is a scalar_in_w block.
+        for name in ('target_in_w', 'target_score_k_w'):
             self.assertGreater(float(learner.model.weights[name].grad.abs().sum().cpu()), 0)
+        from generals_policy import scalar_input_slices
+        rows = scalar_input_slices(self.policy.config)['task_command']
+        self.assertGreater(float(learner.model.weights['scalar_in_w'].grad[rows].abs().sum().cpu()), 0)
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary)/'checkpoint.npz'
             learner.save(checkpoint, {})

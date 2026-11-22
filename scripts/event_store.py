@@ -37,7 +37,7 @@ FEATURE_CONSTANTS = ('OBSERVATION_VERSION', 'KINDS', 'TARGET_KINDS', 'BUILDER_KI
                      'COMMAND_KINDS', 'GUARD_KINDS', 'QUEUE_SLOTS', 'PAIR_FIELDS', 'ENTITY_FEATURES', 'EXTRA_ENTITY_FEATURES', 'ENTITY_UPGRADE_SLOTS',
                      'ENTITY_COMMAND_SLOTS', 'SUPPLY_BOX_SCALE',
                      'SCALAR_FEATURES', 'MAP_CHANNELS')
-MODEL_ONLY = {'hidden', 'entity_hidden', 'embedding', 'attention_heads', 'map_hidden', 'scalar_hidden',
+MODEL_ONLY = {'widths', 'embedding', 'map_hidden',
               'variant_l2', 'argument_loss_weights', 'delay_loss_weight', 'target_smoothing'}
 
 

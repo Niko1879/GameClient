@@ -22,7 +22,21 @@ VOCABULARY = {'types': ['<unknown>', 'ChinaVehicleDozer', 'ChinaCommandCenter', 
               'promotions': {'FactionChina': ['SCIENCE_ArtilleryBarrage1', 'SCIENCE_Frenzy1']},
               'upgrades': ['Upgrade_ChinaRadar', 'Upgrade_InfantryCaptureBuilding'],
               'powers': ['SuperweaponArtilleryBarrage', 'SuperweaponCarpetBomb']}
-SMALL = dict(hidden=16, entity_hidden=8, embedding=4, map_hidden=6, scalar_hidden=6, map_side=4, position_bins=16)
+SMALL = dict(embedding=4, map_hidden=6, map_side=4, position_bins=16,
+             widths={'entity': 8, 'ffn': 16, 'heads': 2, 'head_width': 2, 'key': 4, 'pool_queries': 2, 'scatter': 2,
+                     'map_out': 3, 'map_embedding': 8, 'scalar': 8, 'scalar_out': 6, 'core': 16,
+                     'action_embedding': 8, 'unit_query': 4})
+
+
+def trunk_arrays(trunk):
+    """Every array a decision's network trunk computes, for equality checks: a NeuralPolicy._trunk
+    dict, or TorchPolicyV3.events' (core outputs, encoder outputs)."""
+    if isinstance(trunk, dict):
+        return ([trunk[name].data for name in ('features', 'keys', 'map', 'core_input', 'core')]
+                + [value.data for pair in trunk['state'] for value in pair])
+    core, outputs = trunk
+    return [core.detach().cpu().numpy()]+[outputs[name].detach().cpu().numpy()
+                                          for name in ('core_input', 'features', 'keys', 'map')]
 
 
 def task(kind='idle', **changes):

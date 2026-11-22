@@ -13,7 +13,7 @@ from event_dataset import EventDataset
 from event_store import write_shard
 from generals_policy import NeuralPolicy, Unrepresentable
 from nn_numpy import no_grad
-from test_fixtures import fixture, grid, raw_row
+from test_fixtures import fixture, grid, raw_row, trunk_arrays
 from train_events import EventLearner
 
 
@@ -71,8 +71,9 @@ class PlacementTests(unittest.TestCase):
         encoded = self.policy.encoder.encode(self.obs, self.terrain, 0)
         query = Mock(side_effect=lambda builder, name, angle, bins: grid(self.mask, angle=angle))
         encoded['placement_query'] = query
-        self.policy.parameters['verb_b'].data[:] = -100
-        self.policy.parameters['verb_b'].data[self.policy.kinds.index('build')] = 100
+        # The flat action (AlphaGenerals): every build entry far above the rest.
+        self.policy.parameters['action_b'].data[:] = -100
+        self.policy.parameters['action_b'].data[self.policy.actions[:, 0] == self.policy.kinds.index('build')] = 100
         with no_grad():
             actions, trace, *_ = self.policy.decide(encoded, None, deterministic=True)
         query.assert_called_once()
@@ -83,8 +84,9 @@ class PlacementTests(unittest.TestCase):
     def test_empty_preview_defers_without_selecting_a_fallback_site(self):
         encoded = self.policy.encoder.encode(self.obs, self.terrain, 0)
         encoded['placement_query'] = lambda builder, name, angle, bins: grid(np.zeros((16, 16), bool), angle=angle)
-        self.policy.parameters['verb_b'].data[:] = -100
-        self.policy.parameters['verb_b'].data[self.policy.kinds.index('build')] = 100
+        # The flat action (AlphaGenerals): every build entry far above the rest.
+        self.policy.parameters['action_b'].data[:] = -100
+        self.policy.parameters['action_b'].data[self.policy.actions[:, 0] == self.policy.kinds.index('build')] = 100
         with no_grad():
             actions, trace, *_ = self.policy.decide(encoded, None, deterministic=True)
         self.assertEqual(actions, [])
@@ -112,8 +114,8 @@ class PlacementTests(unittest.TestCase):
             right = self.policy._trunk(b['encoded'])
         # Conditional legality is used only after choosing builder/template/angle.
         self.assertFalse(np.array_equal(a['encoded']['build_features'], b['encoded']['build_features']))
-        for first, second in zip(left, right):
-            np.testing.assert_array_equal(first.data, second.data)
+        for first, second in zip(trunk_arrays(left), trunk_arrays(right)):
+            np.testing.assert_array_equal(first, second)
 
     def test_placement_frame_remains_native_for_a_30_hz_source(self):
         obs = copy.deepcopy(self.obs)
@@ -140,14 +142,14 @@ class PlacementTests(unittest.TestCase):
         learner.model.legality_key = key
         for batch in (rows, list(portable)):
             encoded = [r['encoded'] for r in batch]
-            h, entities, spatial = learner.model.events(encoded)
-            output = learner.model.teacher_heads(encoded, [r['target'] for r in batch], h, entities, spatial)
+            output = learner.model.teacher_heads(encoded, [r['target'] for r in batch], *learner.model.events(encoded))
             with no_grad():
                 expected = [float(self.policy.decide(r['encoded'], None, teacher=r['target'])[4].data) for r in rows]
             np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), expected, rtol=3e-6, atol=2e-5)
         learner.batch(list(portable), train=True)
         self.assertGreater(float(learner.model.weights['build_map_w'].grad.abs().sum().cpu()), 0)
-        self.assertGreater(float(learner.model.weights['build_angle_embedding'].grad.abs().sum().cpu()), 0)
+        # AlphaGenerals: the angle is an independent head reading its own action embedding.
+        self.assertGreater(float(learner.model.weights['angle_action_embedding'].grad.abs().sum().cpu()), 0)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)/'checkpoint.npz'
             learner.save(path, {})

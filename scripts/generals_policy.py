@@ -1,9 +1,11 @@
-"""Memory-free event policy: encoder, factual action masks, teacher targets and NumPy inference.
+"""AlphaGenerals event policy: encoder, factual action masks, teacher targets and NumPy inference.
 
-Spatial processing follows AlphaStar (scripts/micro_feature_review.md): binary positions, a
-3-layer entity transformer, entities scattered onto a 128x128 map, a convolutional encoder with
-skips and a FiLM location head upsampled to 256x256. The PyTorch learner (torch_policy_v3.py)
-trains these same parameters; this module is the deployed inference path and the test reference.
+The network is StarCraft Commander's (SCC, ICML 2021, supplement Fig. 4; notes/plan.md §1): a
+group transformer over own, enemy, neutral and effect tokens, attention pooling, a spatial
+ResNet, a residual LSTM core stepped once per decision, and independent heads conditioned on
+one flat selected action. The PyTorch learner (torch_policy_v3.py) trains these same parameters
+on whole episodes; this module is the test reference. generals_policy_old.py keeps the previous
+memory-free policy runnable until adoption.
 """
 from __future__ import annotations
 
@@ -19,12 +21,12 @@ import threading
 import numpy as np
 
 from generals_identity import IdentityHierarchy, in_production_scope, production_twin, validate_production_scope
-from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum
+from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum, tensor
 
 # v6 (re-export, Nov 2026): logit caps on every head (exact shift gradient), weapon/armour inputs,
 # full production queue, no science action, visible-only enemies (observation v10). Older models
 # play from their own code snapshot (their run's sources.zip), never through compatibility branches.
-ARCHITECTURE = 'generals-relational-v6-event'
+ARCHITECTURE = 'alphagenerals'
 OBSERVATION_VERSION = 11
 KINDS = ('wait', 'move', 'attack_move', 'attack', 'stop', 'sell', 'build', 'train', 'rally', 'dock',
          'resume_construction', 'upgrade', 'ability', 'enter', 'exit', 'evacuate',
@@ -110,14 +112,84 @@ LOCATION_BLOCKS = 4
 # cannot compound. Uncapped action-kind and angle logits reached NLL 107 and 377 in
 # v10 (11 Nov 2026).
 LOGIT_CAP = 50.0
-ACTION_RESIDUAL_BLOCKS = 16
-# Each selected unit's key enters the autoregressive embedding divided by this constant, as
-# AlphaStar's mean over its fixed 512 entity slots does. It was the observation's own entity
-# count until 12 Nov 2026, which made the same selection ~40x fainter late in a game than in
-# the opening. 16 is about the smallest entity count seen, so no selection got fainter.
+# Each selected unit's key enters the unit query divided by this constant, as AlphaStar's
+# mean over its fixed 512 entity slots does (12 Nov 2026: 16 is about the smallest entity count).
 SELECTED_UNIT_DIVISOR = 16
 # Live sampling temperature for every argument except the delay.
 SAMPLING_TEMPERATURE = .8
+# AlphaGenerals (notes/plan.md Â§1): SCC's policy network. Unit groups as SCC's own, enemy and
+# neutral, plus the v11 effect and sound-cue tokens; the transformer and pooling run per group.
+GROUPS = ('own', 'enemy', 'neutral', 'effects')
+UNIT_GROUPS = 3
+LSTM_LAYERS = 3
+# The heads that read an action embedding of the selected action, each its own (SCC Fig. 4).
+ARGUMENT_HEADS = ('delay', 'unit', 'target', 'position', 'slot', 'angle')
+# Widths SCC does not give: AlphaStar's where a counterpart exists, otherwise ours (plan.md Â§6).
+# 'core' is the pre-LSTM FC and every LSTM layer, chosen so the model has 45-49M parameters.
+# Fixed constants; a config 'widths' entry (model-only, event_store.MODEL_ONLY) shrinks them for tests.
+WIDTHS = {'entity': 256, 'ffn': 1024, 'heads': 2, 'head_width': 32, 'key': 32, 'pool_queries': 2,
+          'scatter': 32, 'map_out': 32, 'map_embedding': 256, 'scalar': 512, 'scalar_out': 256,
+          'core': 1024, 'action_embedding': 256, 'unit_query': 32}
+
+
+def widths(config):
+    """The network widths: WIDTHS, overridden only by a test model's config 'widths'."""
+    return {**WIDTHS, **config.get('widths', {})}
+
+
+def group_sources(group):
+    """Source groups of one query group's attention blocks, in concat order: itself, then the others."""
+    return [group]+[other for other in range(len(GROUPS)) if other != group]
+
+
+def unit_groups(own, owners, real):
+    """Each entity row's unit group: 0 own, 1 enemy (seen or remembered), 2 neutral; -1 for padding."""
+    own, owners, real = np.asarray(own, dtype=bool), np.asarray(owners), np.asarray(real, dtype=bool)
+    return np.where(~real, -1, np.where(own, 0, np.where(owners >= 2, 1, 2)))
+
+
+def action_vocabulary(config):
+    """SCC's selected action as one flat vocabulary: (kind index, object index or -1) per entry.
+
+    The object is the production template for build/train and the command for upgrade/ability
+    (the kinds whose stored target carries one); every other kind, wait included, is one entry."""
+    entries = []
+    for k, kind in enumerate(KINDS):
+        if kind in ('build', 'train'):
+            entries += [(k, t) for t in range(len(config['templates']))]
+        elif kind in COMMAND_KINDS:
+            entries += [(k, c) for c, name in enumerate(config['commands']) if config['command_info'][name][0] == kind]
+        else:
+            entries.append((k, -1))
+    return np.asarray(entries, dtype=np.int64)
+
+
+def action_object(target):
+    """The object index of a teacher or decision target: template, command or -1."""
+    if target['kind'] in ('build', 'train'):
+        return target['template']
+    return target['command'] if target['kind'] in COMMAND_KINDS else -1
+
+
+def scalar_input_slices(config):
+    """{input: rows of scalar_in_w}, in the scalar input's concatenation order (NeuralPolicy._scalars)."""
+    from unit_tasks import COMMAND_FEATURES
+    e = config['embedding']
+    widths = [('scalars', SCALAR_FEATURES), ('player_identity', e), ('enemy_identity', e), ('ratings', RATING_FEATURES),
+              ('opener', len(config['templates'])+1), ('player_flags', len(config['upgrades'])+2*len(config['sciences'])),
+              ('unit_counts', len(config['types'])), ('available_actions', len(KINDS)),
+              ('task_command', COMMAND_FEATURES), ('task_command_template', e),
+              ('task_validation', COMMAND_FEATURES), ('task_validation_template', e)]
+    slices, start = {}, 0
+    for name, width in widths:
+        slices[name] = slice(start, start+width)
+        start += width
+    return slices
+
+
+def scalar_input_size(config):
+    """Width of the scalar input concatenation (NeuralPolicy._scalars)."""
+    return scalar_input_slices(config)['task_validation_template'].stop
 
 
 def selection_limit(config, kind):
@@ -145,11 +217,6 @@ def entity_key(entity):
     # IDs are only used to resolve commands. They are never neural features.
     return (not entity['own'], not entity['visible'], entity['owner'] < 2, entity['type'],
             tuple(entity['position']), entity['last_seen_frame'])
-
-
-def head_sizes(config):
-    """(autoregressive, head and pointer key widths): AlphaStar's 1024, 256 and 32, capped for small test models."""
-    return min(config['hidden'], 1024), min(config['hidden'], 256), min(config['entity_hidden'], 32)
 
 
 def visible_scalars(scalars):
@@ -719,8 +786,7 @@ class NeuralPolicy:
                 self.structure_types.update(choices)
         self.structure_types -= self.mobile_types
         n, bins = config['map_side'], config['position_bins']
-        if (n <= 0 or 32 % n or bins % n or bins <= n or (bins//n) & (bins//n-1)
-                or config['entity_hidden'] % config['attention_heads']):
+        if n <= 0 or 32 % n or bins % n or bins <= n or (bins//n) & (bins//n-1):
             raise ValueError('Invalid map/attention dimensions')
         if config['delay_ticks'] != list(range(1, config['event_max_delay']+1)):
             raise ValueError('Unsupported delay vocabulary')
@@ -728,11 +794,17 @@ class NeuralPolicy:
             raise ValueError('Variant regularization must be finite and nonnegative')
         if config['placement_mode'] == 'full_mask' and config['angle_bins'] != 16:
             raise ValueError('Build angles must match the native 16-bin vocabulary')
+        # SCC's selected action: one flat vocabulary of (kind, object) entries (action_vocabulary).
+        self.actions = action_vocabulary(config)
+        self.action_index = {(int(k), int(o)): i for i, (k, o) in enumerate(self.actions)}
+        self._template_positions = {name: i for i, name in enumerate(config['templates'])}
         if not parameters:
             return
         rng = np.random.default_rng(seed)
         identity_rng = np.random.default_rng(np.random.SeedSequence([seed, 1]))
-        h, d, e, m, s = (config[k] for k in ('hidden', 'entity_hidden', 'embedding', 'map_hidden', 'scalar_hidden'))
+        W = widths(config)
+        d, e, m, n = W['entity'], config['embedding'], config['map_hidden'], config['map_side']
+        inner, key, core, a = W['heads']*W['head_width'], W['key'], W['core'], W['action_embedding']
         def w(name, shape, gain=1, *, generator=None):
             self.parameters[name] = Tensor((generator or rng).normal(0, gain/math.sqrt(shape[0]), shape), requires_grad=True)
         def b(name, count, value=0):
@@ -741,7 +813,10 @@ class NeuralPolicy:
             self.parameters[name] = Tensor(rng.normal(0, gain/math.sqrt(inputs*size*size), (outputs, inputs, size, size)),
                                            requires_grad=True)
             b(name+'_b', (outputs, 1, 1))
+        def norm(name, size):
+            b(name+'_g', size, 1.); b(name+'_b', size)
         vocab = self.encoder.identity.config
+        # Unit input (plan Â§1a): type embedding, position and every other entity feature.
         # Embedding scale depends on vector width, not vocabulary size.
         self.parameters['family_embedding'] = Tensor(
             identity_rng.normal(0, 1/math.sqrt(e), (len(vocab['families']), e)), requires_grad=True)
@@ -763,39 +838,6 @@ class NeuralPolicy:
         for name in ('entity_command_ready', 'entity_command_charging', 'entity_command_progress'):
             w(name+'_embedding', (len(config['commands'])+1, e), .5)
             self.parameters[name+'_embedding'].data[0] = 0
-        w('player_flags_w', (len(config['upgrades'])+2*len(config['sciences']), s), .2)
-        ar, f, key = head_sizes(config)
-        kinds, delays = len(KINDS), len(config['delay_ticks'])
-        w('command_embedding', (len(config['commands']), e), 1)
-        w('command_query_w', (ar, e), .1); b('command_b', len(config['commands']))
-        w('command_context_w', (e, ar), .2)
-        w('slot_w', (ar, QUEUE_SLOTS), .1); b('slot_b', QUEUE_SLOTS)
-        for layer in range(ATTENTION_LAYERS):
-            for name in ('attn_q', 'attn_k', 'attn_v', 'attn_out'):
-                w(f'{name}{layer}', (d, d), .5)
-            w(f'entity_ff_in{layer}', (d, 4*d), .5)
-            w(f'entity_ff_out{layer}', (4*d, d), .5)
-        scatter = max(1, m//4)
-        w('scatter_w', (d, scatter), .5)
-        c('map_project', scatter, MAP_CHANNELS+scatter, 1)
-        c('map_down0', max(1, m//2), scatter, 4)
-        c('map_down1', m, max(1, m//2), 4)
-        c('map_down2', m, m, 4)
-        for block in range(MAP_RESIDUAL_BLOCKS):
-            c(f'map_res{block}_a', m, m, 3)
-            c(f'map_res{block}_b', m, m, 3)
-        # AlphaStar's spatial summary width, independent of the entity width (15 Nov 2026).
-        w('map_fc', (n*n*m, MAP_EMBEDDING)); b('map_fc_b', MAP_EMBEDDING)
-        w('scalar_w', (SCALAR_FEATURES, s)); b('scalar_b', s)
-        w('player_identity_w', (e, s), .5, generator=identity_rng)
-        w('enemy_identity_w', (e, s), .5, generator=identity_rng)
-        w('ratings_w', (RATING_FEATURES, s), .5)
-        w('opener_w', (len(config['templates'])+1, s), .5)
-        w('unit_counts_w', (len(config['types']), s), .2)
-        w('available_actions_w', (kinds, s), .2)
-        # scalar_context: what AlphaStar gates its action head and autoregressive embedding with.
-        w('gate_identity_w', (e, s), .5, generator=identity_rng); w('gate_enemy_w', (e, s), .5, generator=identity_rng)
-        w('gate_actions_w', (kinds, s), .5); b('gate_b', s)
         from unit_tasks import NUMERIC, RELATIONS, RELATION_FEATURES, COMMAND_FEATURES, VALIDATION_COLUMNS
         w('task_w', (NUMERIC, d), .5)
         self.parameters['task_w'].data[list(VALIDATION_COLUMNS)] = 0
@@ -804,56 +846,85 @@ class NeuralPolicy:
             w('task_'+role+'_features_w', (RELATION_FEATURES, d), .25)
         self.parameters['task_validation_target_w'].data[:] = 0
         self.parameters['task_validation_target_features_w'].data[:] = 0
-        w('task_command_w', (COMMAND_FEATURES, s), .5)
-        w('task_command_template_w', (e, s), .25)
-        b('task_validation_w', (COMMAND_FEATURES, s))
-        b('task_validation_template_w', (e, s))
-        if config['placement_mode'] == 'full_mask':
-            w('build_map_w', (1, m), .2)
-            w('build_angle_embedding', (16, ar), .2)
-        # Scalars, own/visible enemy/hidden enemy/neutral/effect pools, map summary.
-        w('event_input_w', (s+5*d+MAP_EMBEDDING, h), .7); b('event_input_b', h)
-        w('event_hidden_w', (h, h), .7); b('event_hidden_b', h)
-        w('pool_query', (s, d), .2)
-        # Action type: residual blocks, then a GLU gated by scalar_context.
-        w('verb_in_w', (h, f)); b('verb_in_b', f)
-        for block in range(ACTION_RESIDUAL_BLOCKS):
-            w(f'verb_res{block}_a', (f, f), .5); b(f'verb_res{block}_a_b', f)
-            w(f'verb_res{block}_b', (f, f), .5); b(f'verb_res{block}_b_b', f)
-        w('verb_w', (f, kinds), .1); w('verb_gate_w', (s, kinds), .1); b('verb_gate_b', kinds, 2); b('verb_b', kinds)
-        # Autoregressive embedding from the action type and the core, each gated by scalar_context.
-        w('ar_verb_w', (kinds, f)); b('ar_verb_b', f)
-        w('ar_verb_out_w', (f, ar), .5); w('ar_verb_gate_w', (s, ar), .1); b('ar_verb_gate_b', ar, 2)
-        w('ar_core_w', (h, ar), .5); w('ar_core_gate_w', (s, ar), .1); b('ar_core_gate_b', ar, 2)
-        # Delay: decided after the action type, then visible to every later argument.
-        w('delay_in_w', (ar, f)); b('delay_in_b', f)
-        w('delay_hidden_w', (f, f)); b('delay_hidden_b', f)
-        w('delay_w', (f, delays), .1); b('delay_b', delays)
-        w('delay_embed_in_w', (delays, f)); b('delay_embed_in_b', f)
-        w('delay_embed_hidden_w', (f, f)); b('delay_embed_hidden_b', f)
-        w('delay_embed_out_w', (f, ar), .2); b('delay_embed_out_b', ar)
-        # Selected units: which entity types can act, a pointer key per entity and a small LSTM query.
-        w('func_w', (len(config['types']), f), .2); b('func_b', f)
-        w('entity_key_w', (d, key), .5)
+        # Group transformer (plan Â§1b): per layer and query group, one self- and three cross-attention
+        # blocks with their own weights, concatenated into the group's FC; pre-norm, per-group FFN.
+        for layer in range(ATTENTION_LAYERS):
+            for g, group in enumerate(GROUPS):
+                name = f'attn{layer}_{group}'
+                norm(name+'_ln', d)
+                for s in group_sources(g):
+                    for projection in ('q', 'k', 'v'):
+                        w(f'{name}_{GROUPS[s]}_{projection}', (d, inner))
+                w(name+'_out_w', (len(GROUPS)*inner, d), .5); b(name+'_out_b', d)
+                norm(f'ffn{layer}_{group}_ln', d)
+                w(f'ffn{layer}_{group}_in_w', (d, W['ffn']), math.sqrt(2)); b(f'ffn{layer}_{group}_in_b', W['ffn'])
+                w(f'ffn{layer}_{group}_out_w', (W['ffn'], d), .5); b(f'ffn{layer}_{group}_out_b', d)
+        # Group outputs (plan Â§1c): final norm, attention pooling, attention keys and the unit maps.
+        for g, group in enumerate(GROUPS):
+            norm(f'final_{group}_ln', d)
+            self.parameters[f'pool_{group}_query'] = Tensor(rng.normal(0, 1, (W['pool_queries'], inner)), requires_grad=True)
+            w(f'pool_{group}_k', (d, inner)); w(f'pool_{group}_v', (d, inner))
+            if g < UNIT_GROUPS:
+                w(f'key_{group}_w', (d, key)); b(f'key_{group}_b', key)
+                w(f'scatter_{group}_w', (d, W['scatter']), .5); b(f'scatter_{group}_b', W['scatter'])
+        # Spatial (plan Â§1d): map planes and unit maps, our ResNet, a 1x1 conv, flatten and FC.
+        scatter = W['scatter']
+        c('map_project', scatter, MAP_CHANNELS+scatter, 1)
+        c('map_down0', max(1, m//2), scatter, 4)
+        c('map_down1', m, max(1, m//2), 4)
+        c('map_down2', m, m, 4)
+        for block in range(MAP_RESIDUAL_BLOCKS):
+            c(f'map_res{block}_a', m, m, 3)
+            c(f'map_res{block}_b', m, m, 3)
+        c('map_out', W['map_out'], m, 1)
+        w('map_fc_w', (n*n*W['map_out'], W['map_embedding']), math.sqrt(2)); b('map_fc_b', W['map_embedding'])
+        # Scalars (plan Â§1e): every scalar input concatenated, FC-ReLU, FC-ReLU. The task validation
+        # receipt starts with no effect, as its entity counterpart (task_w's validation columns).
+        w('scalar_in_w', (scalar_input_size(config), W['scalar']), math.sqrt(2)); b('scalar_in_b', W['scalar'])
+        rows = scalar_input_slices(config)
+        self.parameters['scalar_in_w'].data[rows['task_validation'].start:rows['task_validation_template'].stop] = 0
+        w('scalar_hidden_w', (W['scalar'], W['scalar_out']), math.sqrt(2)); b('scalar_hidden_b', W['scalar_out'])
+        # Core: FC-ReLU, then a residual LSTM of LSTM_LAYERS layer-normed layers (AlphaStar's internals).
+        pooled = len(GROUPS)*W['pool_queries']*inner
+        w('core_in_w', (W['scalar_out']+pooled+W['map_embedding'], core), math.sqrt(2)); b('core_in_b', core)
+        for layer in range(LSTM_LAYERS):
+            w(f'core_lstm{layer}_x_w', (core, 4*core)); w(f'core_lstm{layer}_h_w', (core, 4*core))
+            # Gate order (input, forget, cell, output); each gate normalised on its own; forget bias 1.
+            self.parameters[f'core_lstm{layer}_gate_g'] = Tensor(np.ones((4, core)), requires_grad=True)
+            gate_bias = np.zeros((4, core))
+            gate_bias[1] = 1
+            self.parameters[f'core_lstm{layer}_gate_b'] = Tensor(gate_bias, requires_grad=True)
+            norm(f'core_lstm{layer}_cell', core)
+        # Heads (plan Â§1f): every head reads the core output; the selected action is one flat softmax,
+        # and each argument head has its own embedding of that action.
+        actions = len(self.actions)
+        w('action_w', (core, actions), .1); b('action_b', actions)
+        for head in ARGUMENT_HEADS:
+            w(head+'_action_embedding', (actions, a), 1)
+        delays = len(config['delay_ticks'])
+        w('delay_w', (core+a, delays), .1); b('delay_b', delays)
+        # Selected units: a pointer network; the query LSTM steps once per chosen unit (end token last).
+        uq = W['unit_query']
+        w('unit_in_w', (core+a, a)); b('unit_in_b', a)
+        w('unit_ar_w', (key, a), .5); b('unit_ar_b', a)
+        w('unit_query_w', (a, uq), .5); b('unit_query_b', uq)
+        w('unit_lstm_input_w', (uq, 4*uq), .5); w('unit_lstm_hidden_w', (uq, 4*uq), .5); b('unit_lstm_b', 4*uq)
+        w('unit_score_q_w', (uq, a)); w('unit_score_k_w', (key, a)); b('unit_score_b', a)
         self.parameters['unit_end_key'] = Tensor(rng.normal(0, 1/math.sqrt(key), key), requires_grad=True)
-        w('unit_in_w', (ar, f), .5); b('unit_in_b', f)
-        w('unit_query_w', (f, key), .5); b('unit_query_b', key)
-        w('unit_lstm_input_w', (key, 4*key), .5); w('unit_lstm_hidden_w', (key, 4*key), .5); b('unit_lstm_b', 4*key)
-        w('unit_ar_w', (key, ar), .5); b('unit_ar_b', ar)
-        # Target unit: the same keys, queried from the autoregressive embedding and func_embed.
-        w('target_in_w', (ar, f), .5); b('target_in_b', f)
-        w('target_pointer_w', (f, key), .5); b('target_pointer_b', key)
-        b('template_b', len(config['templates']))
-        # The same object representation informs sightings, queues, choice
-        # logits and placement context. Exact template IDs still dispatch.
-        w('template_query_w', (ar, e), .1, generator=identity_rng)
-        w('template_context_w', (e, ar), .2, generator=identity_rng)
-        w('location_context_w', (ar, 4*n*n), .5)
-        c('location_input', m, m+4, 1)
-        w('location_film_w', (ar, 2*LOCATION_BLOCKS*m), .1); b('location_film_b', 2*LOCATION_BLOCKS*m)
+        summary = 2*d
+        w('target_in_w', (core+a+summary, a)); b('target_in_b', a)
+        w('target_score_k_w', (key, a))
+        w('slot_w', (core+a+summary, QUEUE_SLOTS), .1); b('slot_b', QUEUE_SLOTS)
+        w('angle_w', (core+a, config['angle_bins']), .1); b('angle_b', config['angle_bins'])
+        # Target position: a query reshaped to 4 n x n planes beside the 1x1 map, FiLM blocks, upsampling.
+        w('location_query_w', (core+a+summary, 4*n*n), .5); b('location_query_b', 4*n*n)
+        w('location_film_w', (4*n*n, 2*LOCATION_BLOCKS*m), .1); b('location_film_b', 2*LOCATION_BLOCKS*m)
+        c('location_input', m, W['map_out']+4, 1)
         for block in range(LOCATION_BLOCKS):
             c(f'location_block{block}_a', m, m, 1)
             c(f'location_block{block}_b', m, m, 3)
+        if config['placement_mode'] == 'full_mask':
+            w('build_map_w', (1, m), .2)
         channels = m
         stages = location_stages(config)
         for stage, outputs in enumerate(stages):
@@ -862,10 +933,8 @@ class NeuralPolicy:
                 0, (.1 if stage == len(stages)-1 else math.sqrt(2))/math.sqrt(channels*16), (channels, outputs, 4, 4)), requires_grad=True)
             b(f'location_up{stage}_b', (outputs, 1, 1))
             channels = outputs
-        w('cell_context_w', (m, ar), .5)
-        w('angle_w', (ar, config['angle_bins']), .1); b('angle_b', config['angle_bins'])
-        w('value_hidden_w', (h, s), .5); b('value_hidden_b', s)
-        w('value_w', (s, 1), .1); b('value_b', 1)
+        # Value: untrained in imitation (RL replaces it).
+        w('value_w', (core, 1), .1); b('value_b', 1)
 
     def object_embedding(self, objects):
         """Shared family/base faction plus zero-initialized general/type residuals."""
@@ -899,7 +968,7 @@ class NeuralPolicy:
         # Apply once per optimizer update. There is no shrinkage on the shared
         # families or base faction representations.
         loss = Tensor(0)
-        for name in ('general_embedding', 'variant_embedding', 'template_b'):
+        for name in ('general_embedding', 'variant_embedding'):
             parameter = self.parameters[name]
             loss = loss + (parameter*parameter).sum()
         return loss*self.config['variant_l2']
@@ -1228,58 +1297,93 @@ class NeuralPolicy:
                 raise Unrepresentable('Quantized build placement outside observed legality mask')
         return target
 
+    def action_choice(self, target):
+        """The flat action index of a teacher or decision target."""
+        return self.action_index[(KINDS.index(target['kind']), action_object(target))]
+
+    def object_masks(self, encoded):
+        """{kind: objects some own unit offers} for the object kinds, from the stored arrays alone.
+
+        A template counts when a complete own unit has it on its (production-scope) menu and has
+        any choice available now; a command when a live complete own unit has its button ready.
+        The stored arrays hold no per-unit prerequisites, so this is a superset of the exact
+        choices; the teacher's object is always in it (test_alphagenerals)."""
+        config = self.config
+        numeric, extra = np.asarray(encoded['numeric']), np.asarray(encoded['extra_numeric'])
+        own = np.asarray(encoded['own'], dtype=bool)
+        complete = own & (numeric[:, 9] > .5)
+        alive = complete & (numeric[:, 3] > 0)
+        types = np.asarray(encoded['types'])
+        index = self._template_positions
+        masks = {}
+        for kind, column in (('build', 2), ('train', 3)):
+            mask = np.zeros(len(config['templates']), dtype=bool)
+            for t in np.unique(types[complete & (extra[:, column] > 0)]):
+                mask[[index[name] for name in self._production_menu(config['types'][t], kind) if name in index]] = True
+            masks[kind] = mask
+        ids, states = np.asarray(encoded['entity_commands'])[alive], np.asarray(encoded['entity_command_states'])[alive]
+        ready = np.unique(ids[(states[..., 0] > .5) & (ids > 0)])-1
+        info = config['command_info']
+        for kind in COMMAND_KINDS:
+            mask = np.zeros(len(config['commands']), dtype=bool)
+            mask[[c for c in ready if info[config['commands'][c]][0] == kind]] = True
+            masks[kind] = mask
+        return masks
+
+    def action_mask(self, encoded, verb=None):
+        """Flat action mask: the kind mask (verb_mask, or the stored one) times object_masks."""
+        verb = np.asarray(self.verb_mask(encoded) if verb is None else verb, dtype=bool)
+        mask = verb[self.actions[:, 0]].copy()
+        objects = self.object_masks(encoded)
+        for kind, values in objects.items():
+            rows = self.actions[:, 0] == KINDS.index(kind)
+            mask[rows] &= values[self.actions[rows, 1]]
+        return mask
+
+    def object_actors(self, encoded, kind, obj):
+        """Owned units that can perform `kind` with this object now (live play: exact)."""
+        mask = self.actor_mask(encoded, kind)
+        for i, e in enumerate(encoded['entities']):
+            if not mask[i]:
+                continue
+            if kind in ('build', 'train'):
+                template = self.config['templates'][obj]
+                mask[i] = template in self._production_menu(e['type'], kind) and template in self.production_available(e, kind)
+            else:
+                mask[i] = obj in self._commands(e, kind)
+        return mask
+
+    def exact_action_mask(self, encoded):
+        """action_mask narrowed to the objects some actor can use now (live play only)."""
+        mask = self.action_mask(encoded)
+        for i in np.flatnonzero(mask & (self.actions[:, 1] >= 0)):
+            k, obj = self.actions[i]
+            mask[i] = bool(self.object_actors(encoded, KINDS[k], int(obj)).any())
+        return mask
+
+    # AlphaGenerals network (notes/plan.md Â§1), one observation at a time. torch_policy_v3 batches
+    # the same equations; test_alphagenerals holds them equal.
+
+    def _layer_norm(self, x, name):
+        p = self.parameters
+        return x.layer_norm()*p[name+'_g']+p[name+'_b']
+
     def _conv(self, values, name, stride=1, padding=0):
         return conv2d(values, self.parameters[name], stride, padding)+self.parameters[name+'_b']
 
-    def _encode_map(self, encoded, entity):
-        """(skips: (5, m, n, n), embedding) from map inputs and entities scattered onto the image."""
-        p, config = self.parameters, self.config
-        n, side = config['map_side'], config['map_side']*SCATTER_SCALE
-        real = np.zeros(len(entity.data), dtype=bool)
-        real[:len(encoded['entities'])] = True
-        pixels = np.asarray(encoded['cells'])
-        weights = scatter_weights(pixels, real, side)
-        image = scatter_sum((entity @ p['scatter_w']).relu()*Tensor(weights[:, None]), pixels, side)
-        x = self._conv(concatenate([Tensor(map_planes(encoded)), image]), 'map_project').relu()
-        for stage in range(3):
-            x = self._conv(x, f'map_down{stage}', 2, 1).relu()
-        skips = [x]
-        for block in range(MAP_RESIDUAL_BLOCKS):
-            residual = x
-            x = self._conv(x.relu(), f'map_res{block}_a', padding=1)
-            x = self._conv(x.relu(), f'map_res{block}_b', padding=1)+residual
-            skips.append(x)
-        embedded = (x.relu().reshape((-1,)) @ p['map_fc']+p['map_fc_b']).relu()
-        return concatenate(skips).reshape((len(skips), config['map_hidden'], n, n)), embedded
+    def _attend(self, q, k, v):
+        """Multi-head attention of query rows over source rows, heads concatenated."""
+        W = widths(self.config)
+        width, parts = W['head_width'], []
+        for head in range(W['heads']):
+            sl = slice(head*width, (head+1)*width)
+            weights = (q[:, sl] @ k[:, sl].transpose()/math.sqrt(width)).softmax(axis=1)
+            parts.append(weights @ v[:, sl])
+        return concatenate(parts, axis=1)
 
-    def _location(self, spatial, context, build_features=None):
-        """(cell features (m, n, n), logits (n*n, offsets)) for one position argument."""
-        p, config = self.parameters, self.config
-        n, m = config['map_side'], config['map_hidden']
-        x = concatenate([spatial[MAP_RESIDUAL_BLOCKS], (context @ p['location_context_w']).reshape((4, n, n))]).relu()
-        x = self._conv(x, 'location_input').relu()
-        film = context @ p['location_film_w']+p['location_film_b']
-        for block in range(LOCATION_BLOCKS):
-            residual = self._conv(x, f'location_block{block}_a').relu()
-            y = self._conv(residual, f'location_block{block}_b', padding=1)
-            gamma = film[2*block*m:(2*block+1)*m].reshape((m, 1, 1))+1
-            beta = film[(2*block+1)*m:(2*block+2)*m].reshape((m, 1, 1))
-            x = ((y*gamma+beta).relu()+residual+spatial[MAP_RESIDUAL_BLOCKS-1-block]).relu()
-        if build_features is not None:
-            x = x+(Tensor(build_features) @ p['build_map_w']).transpose().reshape((m, n, n))
-        cells, y = x, x
-        stages = location_stages(config)
-        for stage in range(len(stages)):
-            y = conv_transpose2d(y, p[f'location_up{stage}'], 2, 1)+p[f'location_up{stage}_b']
-            if stage < len(stages)-1:
-                y = y.reshape((1, -1)).layer_norm().reshape(y.data.shape).relu()
-        fine = config['position_bins']//n
-        flat = y.reshape((-1,))
-        flat = ((flat-flat[int(np.argmax(flat.data))])/LOGIT_CAP).tanh()*LOGIT_CAP
-        return cells, flat[location_order(config)].reshape((n*n, fine*fine))
-
-    def _encode_modalities(self, encoded):
-        p, d, e = self.parameters, self.config['entity_hidden'], self.config['embedding']
+    def _entity_inputs(self, encoded):
+        """(units (count, d), effect tokens (k, d) or None): each unit's embedded input (plan Â§1a)."""
+        p, e = self.parameters, self.config['embedding']
         features = np.concatenate([encoded['numeric'], encoded['extra_numeric'],
                                    derived_inputs(encoded['numeric']), arms_inputs(encoded)], axis=1)
         offset = features.shape[1]
@@ -1301,90 +1405,166 @@ class NeuralPolicy:
             linked = base[encoded['task_relations'][:, i]]
             addition = addition + (linked @ p['task_'+role+'_w']) * Tensor(encoded['task_relation_valid'][:, i:i+1])
             addition = addition + Tensor(encoded['task_relation_features'][:, i]) @ p['task_'+role+'_features_w']
-        entity = (base+addition).tanh()
-        count = len(entity.data)
-        # v11 effects and sound cues join the attention as extra tokens, then leave before every head.
+        units = (base+addition).tanh()
         effects = None
         if len(encoded['effect_numeric']):
-            tokens = (Tensor(encoded['effect_numeric']) @ p['effect_w']
-                      + self.type_embedding(encoded['effect_types']) @ p['effect_type_w']
-                      + p['power_embedding'][encoded['effect_powers']] @ p['effect_power_w'] + p['effect_b']).tanh()
-            entity = concatenate([entity.reshape((-1,)), tokens.reshape((-1,))]).reshape((count+len(tokens.data), d))
-        rows, heads = len(entity.data), self.config['attention_heads']
-        width = d//heads
+            effects = (Tensor(encoded['effect_numeric']) @ p['effect_w']
+                       + self.type_embedding(encoded['effect_types']) @ p['effect_type_w']
+                       + p['power_embedding'][encoded['effect_powers']] @ p['effect_power_w'] + p['effect_b']).tanh()
+        return units, effects
+
+    def _group_transformer(self, rows):
+        """Per-group features (Tensor (n_g, d), or None for an empty group) after the plan Â§1b layers."""
+        p, W = self.parameters, widths(self.config)
+        inner = W['heads']*W['head_width']
+        x = list(rows)
         for layer in range(ATTENTION_LAYERS):
-            q, k, v = (entity @ p[f'{name}{layer}'] for name in ('attn_q', 'attn_k', 'attn_v'))
-            attended = []
+            normed = [None if value is None else self._layer_norm(value, f'attn{layer}_{GROUPS[g]}_ln')
+                      for g, value in enumerate(x)]
+            updated = []
+            for g, value in enumerate(x):
+                if value is None:
+                    updated.append(None)
+                    continue
+                name, ffn = f'attn{layer}_{GROUPS[g]}', f'ffn{layer}_{GROUPS[g]}'
+                parts = []
+                for s in group_sources(g):
+                    if normed[s] is None:  # An empty source group contributes zeros.
+                        parts.append(Tensor(np.zeros((len(value.data), inner))))
+                        continue
+                    pair = f'{name}_{GROUPS[s]}'
+                    parts.append(self._attend(normed[g] @ p[pair+'_q'], normed[s] @ p[pair+'_k'], normed[s] @ p[pair+'_v']))
+                value = value+concatenate(parts, axis=1) @ p[name+'_out_w']+p[name+'_out_b']
+                hidden = (self._layer_norm(value, ffn+'_ln') @ p[ffn+'_in_w']+p[ffn+'_in_b']).relu()
+                updated.append(value+hidden @ p[ffn+'_out_w']+p[ffn+'_out_b'])
+            x = updated
+        return [None if value is None else self._layer_norm(value, f'final_{GROUPS[g]}_ln') for g, value in enumerate(x)]
+
+    def _pool(self, value, group):
+        """Attention pooling (SCC Â§A.3): learned queries over a group's units, heads flattened."""
+        p, W = self.parameters, widths(self.config)
+        heads, width, queries = W['heads'], W['head_width'], W['pool_queries']
+        if value is None:
+            return Tensor(np.zeros(queries*heads*width))
+        k, v, q = value @ p[f'pool_{group}_k'], value @ p[f'pool_{group}_v'], p[f'pool_{group}_query']
+        parts = []
+        for j in range(queries):
             for head in range(heads):
                 sl = slice(head*width, (head+1)*width)
-                weights = (q[:, sl] @ k[:, sl].transpose() / math.sqrt(width)).softmax(axis=1)
-                attended.append(weights @ v[:, sl])
-            # concatenate() is vector-oriented; use a reshape around the head join.
-            joined = concatenate([a.transpose().reshape((-1,)) for a in attended]).reshape((d, rows)).transpose()
-            entity = (entity + joined @ p[f'attn_out{layer}']).layer_norm()
-            entity = (entity + (entity @ p[f'entity_ff_in{layer}']).relu() @ p[f'entity_ff_out{layer}']).layer_norm()
-        if rows > count:
-            effects, entity = entity[np.arange(count, rows)], entity[np.arange(count)]
-        spatial, map_embedding = self._encode_map(encoded, entity)
-        scalar = Tensor(visible_scalars(encoded['scalars'])) @ p['scalar_w'] + p['scalar_b']
-        commands = visible_task_commands(encoded['task_commands'])
-        for i, prefix in enumerate(('task_command', 'task_validation')):
-            scalar = scalar + Tensor(commands[i]) @ p[prefix+'_w']
-            embedding = self.type_embedding(encoded['task_command_templates'][i:i+1])[0]
-            scalar = scalar + (embedding @ p[prefix+'_template_w']) * float(encoded['task_command_template_present'][i])
+                parts.append((k[:, sl] @ q[j, sl]/math.sqrt(width)).softmax() @ v[:, sl])
+        return concatenate(parts)
+
+    @staticmethod
+    def _entity_order(values, members, count, width):
+        """Unit-group rows back in entity order (count, width); padding rows are zero."""
+        present = [(value, rows) for value, rows in zip(values, members) if value is not None]
+        stacked = concatenate([value for value, _ in present]+[Tensor(np.zeros((1, width)))])
+        position = np.full(count, len(stacked.data)-1)
+        if present:
+            position[np.concatenate([rows for _, rows in present])] = np.arange(len(stacked.data)-1)
+        return stacked[position]
+
+    def _encode_map(self, encoded, scattered):
+        """(1x1 map (map_out, n, n), map embedding): plan Â§1d."""
+        p, config = self.parameters, self.config
+        side = config['map_side']*SCATTER_SCALE
+        real = np.zeros(len(scattered.data), dtype=bool)
+        real[:len(encoded['entities'])] = True
+        pixels = np.asarray(encoded['cells'])
+        image = scatter_sum(scattered*Tensor(scatter_weights(pixels, real, side)[:, None]), pixels, side)
+        x = self._conv(concatenate([Tensor(map_planes(encoded)), image]), 'map_project').relu()
+        for stage in range(3):
+            x = self._conv(x, f'map_down{stage}', 2, 1).relu()
+        for block in range(MAP_RESIDUAL_BLOCKS):
+            residual = x
+            x = self._conv(x.relu(), f'map_res{block}_a', padding=1)
+            x = self._conv(x.relu(), f'map_res{block}_b', padding=1)+residual
+        out = self._conv(x.relu(), 'map_out').relu()
+        return out, (out.reshape((-1,)) @ p['map_fc_w']+p['map_fc_b']).relu()
+
+    def _scalars(self, encoded):
+        """Every scalar input, concatenated in scalar_input_size's order, through FC-ReLU, FC-ReLU."""
+        p = self.parameters
         faction, general = encoded['player_identity']
         identity = p['base_faction_embedding'][faction]+p['general_embedding'][general]
-        scalar = scalar + identity @ p['player_identity_w']
         # Known from the lobby in fair play. (0, 0) is the unknown row.
         faction, general = encoded.get('enemy_identity', (0, 0))
         enemy = p['base_faction_embedding'][faction]+p['general_embedding'][general]
-        scalar = scalar + enemy @ p['enemy_identity_w']
-        # Set per game by the dataset or the live actor; absent means both unrated.
-        scalar = scalar + Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)) @ p['ratings_w']
-        # Set by the dataset or the live actor (opener_inputs); absent means no opener.
-        if 'opener' in encoded:
-            scalar = scalar + Tensor(np.asarray(encoded['opener'], dtype=float)) @ p['opener_w']
-        scalar = scalar + Tensor(encoded['player_flags']) @ p['player_flags_w']
         counts = np.bincount(np.asarray(encoded['types'])[:len(encoded['entities'])], minlength=len(self.config['types']))
-        available = Tensor(np.asarray(self.verb_mask(encoded), dtype=float))
-        scalar = scalar + Tensor(np.sqrt(counts)) @ p['unit_counts_w'] + available @ p['available_actions_w']
-        gate = (identity @ p['gate_identity_w'] + enemy @ p['gate_enemy_w'] + available @ p['gate_actions_w'] + p['gate_b']).relu()
-        return scalar.tanh(), entity, spatial, map_embedding, gate, effects
+        opener = encoded['opener'] if 'opener' in encoded else np.zeros(len(self.config['templates'])+1)
+        parts = [Tensor(visible_scalars(encoded['scalars'])), identity, enemy,
+                 # Set per game by the dataset or the live actor; absent means both unrated.
+                 Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)), Tensor(np.asarray(opener, dtype=float)),
+                 Tensor(encoded['player_flags']), Tensor(np.sqrt(counts)),
+                 Tensor(np.asarray(self.verb_mask(encoded), dtype=float))]
+        commands = visible_task_commands(encoded['task_commands'])
+        for i in range(2):  # The last command receipt, then the last validation receipt.
+            template = self.type_embedding(encoded['task_command_templates'][i:i+1])[0]
+            parts += [Tensor(commands[i]), template*float(encoded['task_command_template_present'][i])]
+        x = (concatenate(parts) @ p['scalar_in_w']+p['scalar_in_b']).relu()
+        return (x @ p['scalar_hidden_w']+p['scalar_hidden_b']).relu()
 
-    def _trunk(self, encoded):
-        scalar, entity, spatial, map_embedding, gate, effects = self._encode_modalities(encoded)
-        p = self.parameters
-        query = scalar @ p['pool_query']
-        def pool(mask):
-            indices = np.flatnonzero(mask)
-            if not len(indices):
-                return Tensor(np.zeros(self.config['entity_hidden']))
-            selected = entity[indices]
-            return (selected @ query).softmax() @ selected
-        entities = encoded['entities']
-        enemy = np.asarray([not e['own'] and e['owner'] >= 2 for e in entities] or [False])
-        visible = np.asarray([e['visible'] for e in entities] or [False])
-        neutral = np.asarray([not e['own'] and e['owner'] < 2 for e in entities] or [False])
-        effect_pool = (Tensor(np.zeros(self.config['entity_hidden'])) if effects is None
-                       else (effects @ query).softmax() @ effects)
-        features = concatenate([scalar, pool(encoded['own']), pool(enemy & visible), pool(enemy & ~visible),
-                                pool(neutral), effect_pool, map_embedding])
-        hidden = ((features @ p['event_input_w'] + p['event_input_b']).tanh()
-                  @ p['event_hidden_w'] + p['event_hidden_b']).tanh()
-        value = (((hidden @ p['value_hidden_w'] + p['value_hidden_b']).tanh()) @ p['value_w'] + p['value_b'])[0]
-        return hidden, entity, spatial, value, gate
+    def initial_state(self):
+        """The core LSTM's (h, c) per layer at a game's start."""
+        size = widths(self.config)['core']
+        return [(np.zeros(size), np.zeros(size)) for _ in range(LSTM_LAYERS)]
 
-    def _action_type(self, hidden, gate):
-        """(logits, autoregressive input of the core): AlphaStar's action type head without its LSTM."""
+    def _core(self, core_input, state):
+        """(core output, next state): FC-ReLU u, then u + a residual LSTM step (plan Â§1e)."""
+        p, size = self.parameters, widths(self.config)['core']
+        u = (core_input @ p['core_in_w']+p['core_in_b']).relu()
+        x, following = u, []
+        for layer, (h, c) in enumerate(self.initial_state() if state is None else state):
+            h, c = tensor(h), tensor(c)
+            gates = ((x @ p[f'core_lstm{layer}_x_w']+h @ p[f'core_lstm{layer}_h_w']).reshape((4, size)).layer_norm()
+                     * p[f'core_lstm{layer}_gate_g']+p[f'core_lstm{layer}_gate_b'])
+            c = gates[1].sigmoid()*c+gates[0].sigmoid()*gates[2].tanh()
+            h = gates[3].sigmoid()*self._layer_norm(c, f'core_lstm{layer}_cell').tanh()
+            following.append((h, c))
+            x = h
+        return u+x, following
+
+    def encode_observation(self, encoded):
+        """Encoder outputs for one observation: unit features, keys, the 1x1 map and the core input."""
+        p, W = self.parameters, widths(self.config)
+        units, effects = self._entity_inputs(encoded)
+        count, real = len(units.data), len(encoded['entities'])
+        owners = [e['owner'] for e in encoded['entities']]+[-1]*(count-real)
+        groups = unit_groups(encoded['own'], owners, np.arange(count) < real)
+        members = [np.flatnonzero(groups == g) for g in range(UNIT_GROUPS)]
+        final = self._group_transformer([units[rows] if len(rows) else None for rows in members]+[effects])
+        units = final[:UNIT_GROUPS]
+        def project(name, width, activation=False):
+            values = [None if value is None else value @ p[f'{name}_{GROUPS[g]}_w']+p[f'{name}_{GROUPS[g]}_b']
+                      for g, value in enumerate(units)]
+            if activation:
+                values = [None if value is None else value.relu() for value in values]
+            return self._entity_order(values, members, count, width)
+        spatial, map_embedding = self._encode_map(encoded, project('scatter', W['scatter'], True))
+        pools = [self._pool(value, GROUPS[g]) for g, value in enumerate(final)]
+        return {'features': self._entity_order(units, members, count, W['entity']),
+                'keys': project('key', W['key']), 'map': spatial,
+                'core_input': concatenate([self._scalars(encoded), *pools, map_embedding])}
+
+    def _trunk(self, encoded, state=None):
+        trunk = self.encode_observation(encoded)
+        trunk['core'], trunk['state'] = self._core(trunk['core_input'], state)
         p = self.parameters
-        x = (hidden @ p['verb_in_w']+p['verb_in_b']).relu()
-        for block in range(ACTION_RESIDUAL_BLOCKS):
-            # Pre-activation: the branch ends in a linear layer, so a block can subtract from the
-            # stream as well as add (a trailing ReLU made every block's update non-negative).
-            y = self._sample_normalize(x).relu() @ p[f'verb_res{block}_a']+p[f'verb_res{block}_a_b']
-            x = x+(self._sample_normalize(y).relu() @ p[f'verb_res{block}_b']+p[f'verb_res{block}_b_b'])
-        logits = x.relu() @ p['verb_w']*(gate @ p['verb_gate_w']+p['verb_gate_b']).sigmoid()+p['verb_b']
-        return logits, hidden @ p['ar_core_w']*(gate @ p['ar_core_gate_w']+p['ar_core_gate_b']).sigmoid()
+        trunk['value'] = (trunk['core'] @ p['value_w']+p['value_b'])[0]
+        return trunk
+
+    def _with_action(self, trunk, head, action, summary=None):
+        """[core output â€– this head's embedding of the selected action â€– selected units' mean, max]."""
+        parts = [trunk['core'], self.parameters[head+'_action_embedding'][action]]
+        return concatenate(parts+([summary] if summary is not None else []))
+
+    def _action_logits(self, trunk):
+        p = self.parameters
+        return trunk['core'] @ p['action_w']+p['action_b']
+
+    def _delay_logits(self, trunk, action):
+        p = self.parameters
+        return self._with_action(trunk, 'delay', action) @ p['delay_w']+p['delay_b']
 
     def _lstm_step(self, query, state):
         """One step of torch's LSTM equations; state is (hidden, cell)."""
@@ -1393,69 +1573,114 @@ class NeuralPolicy:
         cell = gates[key:2*key].sigmoid()*state[1]+gates[:key].sigmoid()*gates[2*key:3*key].tanh()
         return gates[3*key:].sigmoid()*cell.tanh(), cell
 
-    _sample_array = staticmethod(Tensor)
-    _sample_concat = staticmethod(concatenate)
-    _sample_normalize = staticmethod(Tensor.layer_norm)
+    def _unit_begin(self, trunk, action):
+        p, size = self.parameters, widths(self.config)['unit_query']
+        zeros = Tensor(np.zeros(size))
+        return {'context': self._with_action(trunk, 'unit', action) @ p['unit_in_w']+p['unit_in_b'],
+                'state': (zeros, zeros), 'embedding': p['unit_action_embedding'][action]}
+
+    def _unit_scores(self, trunk, unit):
+        """(scores over every entity then the end token, next unit state): SCC's conditioned
+        concat-attention, score_i = e_a . tanh(W [query; key_i])."""
+        p = self.parameters
+        state = self._lstm_step(unit['context'].relu() @ p['unit_query_w']+p['unit_query_b'], unit['state'])
+        keys = concatenate([trunk['keys'], p['unit_end_key'].reshape((1, -1))])
+        hidden = (keys @ p['unit_score_k_w']+(state[0] @ p['unit_score_q_w']+p['unit_score_b'])).tanh()
+        return hidden @ unit['embedding'], {**unit, 'state': state}
+
+    def _unit_add(self, trunk, unit, index):
+        p = self.parameters
+        return {**unit, 'context': unit['context']+(trunk['keys'][index]/SELECTED_UNIT_DIVISOR) @ p['unit_ar_w']+p['unit_ar_b']}
+
+    def _selection_summary(self, trunk, selected):
+        """[Mean, Max] of the selected units' final features; zeros without a selection."""
+        if not selected:
+            return Tensor(np.zeros(2*widths(self.config)['entity']))
+        rows = trunk['features'][np.asarray(selected)]
+        return concatenate([rows.mean(axis=0), rows.max(axis=0)])
+
+    def _slot_logits(self, trunk, action, summary):
+        p = self.parameters
+        return self._with_action(trunk, 'slot', action, summary) @ p['slot_w']+p['slot_b']
+
+    def _target_logits(self, trunk, action, summary):
+        p = self.parameters
+        query = self._with_action(trunk, 'target', action, summary) @ p['target_in_w']+p['target_in_b']
+        return (trunk['keys'] @ p['target_score_k_w']+query).tanh() @ p['target_action_embedding'][action]
+
+    def _angle_logits(self, trunk, action):
+        p = self.parameters
+        return self._with_action(trunk, 'angle', action) @ p['angle_w']+p['angle_b']
+
+    def _location(self, trunk, action, summary, build_features=None):
+        """Logits (n*n, offsets) for one position argument: one 256x256 map, capped as a whole."""
+        p, config = self.parameters, self.config
+        n, m = config['map_side'], config['map_hidden']
+        query = self._with_action(trunk, 'position', action, summary) @ p['location_query_w']+p['location_query_b']
+        x = self._conv(concatenate([trunk['map'], query.reshape((4, n, n))]).relu(), 'location_input').relu()
+        film = query @ p['location_film_w']+p['location_film_b']
+        for block in range(LOCATION_BLOCKS):
+            residual = self._conv(x, f'location_block{block}_a').relu()
+            y = self._conv(residual, f'location_block{block}_b', padding=1)
+            gamma = film[2*block*m:(2*block+1)*m].reshape((m, 1, 1))+1
+            beta = film[(2*block+1)*m:(2*block+2)*m].reshape((m, 1, 1))
+            x = ((y*gamma+beta).relu()+residual).relu()
+        if build_features is not None:
+            x = x+(Tensor(build_features) @ p['build_map_w']).transpose().reshape((m, n, n))
+        y = x
+        stages = location_stages(config)
+        for stage in range(len(stages)):
+            y = conv_transpose2d(y, p[f'location_up{stage}'], 2, 1)+p[f'location_up{stage}_b']
+            if stage < len(stages)-1:
+                y = y.reshape((1, -1)).layer_norm().reshape(y.data.shape).relu()
+        fine = config['position_bins']//n
+        flat = y.reshape((-1,))
+        flat = ((flat-flat[int(np.argmax(flat.data))])/LOGIT_CAP).tanh()*LOGIT_CAP
+        return flat[location_order(config)].reshape((n*n, fine*fine))
 
     def _sampling_logits(self, logits):
         return logits
 
-    def _template_embeddings(self):
-        return self.object_embedding(self.encoder.identity.template_objects)
-
     def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False):
-        """One decision: action type, delay, then a command's arguments; DEFER has only the first two."""
+        """One decision and the next core state: the selected action, its delay, then the action's arguments.
+
+        memory is the core LSTM state from this player's previous decision (None at a game's start).
+        Returns (actions, trace, next memory, value, log-probability, entropy)."""
         from event_schedule import delay_mask
-        hidden, entity, spatial, value, gate = self._trunk(encoded)
-        p, config, trace = self.parameters, self.config, {}
+        trunk = self._trunk(encoded, memory)
+        config, trace = self.config, {}
         logp, entropy = Tensor(0), Tensor(0)
         def draw(name, logits, mask, override=None):
             nonlocal logp, entropy
             logits = self._sampling_logits(logits)
-            choice = override if override is not None else (teacher.get(name) if teacher is not None else None)
             if name not in ('cell', 'offset'):  # Position: capped in _location.
                 logits = cap_logits(logits, mask)
             if teacher is None and name != 'delay' and not deterministic:
                 logits = logits/SAMPLING_TEMPERATURE
-            choice, lp, ent = categorical(logits, mask, choice=choice, rng=rng, deterministic=deterministic)
+            choice, lp, ent = categorical(logits, mask, choice=override, rng=rng, deterministic=deterministic)
             logp, entropy = logp+lp, entropy+ent
             trace[name] = choice
             return choice
+        mask = self.action_mask(encoded)
+        if teacher is None:  # Live play: only objects some unit can use now.
+            exact = mask & self.exact_action_mask(encoded)
+            mask = exact if exact.any() else mask
+        action = draw('decision', self._action_logits(trunk), mask, self.action_choice(teacher) if teacher else None)
+        k, obj = (int(value) for value in self.actions[action])
+        kind = KINDS[k]
         delays = delay_mask(config, encoded.get('event_rate', 60))
         first_delay = int(np.flatnonzero(delays)[0])
-        logits, core = self._action_type(hidden, gate)
-        verb = draw('decision', logits, self.verb_mask(encoded),
-                    KINDS.index(teacher['kind']) if teacher is not None else None)
-        one_hot = np.zeros(len(KINDS))
-        one_hot[verb] = 1
-        action = (self._sample_array(one_hot) @ p['ar_verb_w']+p['ar_verb_b']).relu()
-        context = core+action @ p['ar_verb_out_w']*(gate @ p['ar_verb_gate_w']+p['ar_verb_gate_b']).sigmoid()
-        x = (context @ p['delay_in_w']+p['delay_in_b']).relu()
-        x = (x @ p['delay_hidden_w']+p['delay_hidden_b']).relu()
-        delay = draw('delay', x @ p['delay_w']+p['delay_b'], delays, teacher.get('delay', first_delay) if teacher else None)
-        if verb == 0:
-            return [], {'kind': 'wait', 'delay': delay}, hidden, value, logp, entropy
-        # A censored teacher delay is unknown: later arguments do not see the placeholder.
-        if teacher is None or 'delay' in teacher:
-            one_hot = np.zeros(len(config['delay_ticks']))
-            one_hot[delay] = 1
-            x = (self._sample_array(one_hot) @ p['delay_embed_in_w']+p['delay_embed_in_b']).relu()
-            x = (x @ p['delay_embed_hidden_w']+p['delay_embed_hidden_b']).relu()
-            context = context+x @ p['delay_embed_out_w']+p['delay_embed_out_b']
-        kind = KINDS[verb]
-        actors, selected = self.actor_mask(encoded, kind), []
-        limit = selection_limit(config, kind)
+        delay = draw('delay', self._delay_logits(trunk, action), delays, teacher.get('delay', first_delay) if teacher else None)
+        if kind == 'wait':
+            return [], {'kind': 'wait', 'delay': delay}, trunk['state'], trunk['value'], logp, entropy
+        actors = self.actor_mask(encoded, kind)
+        if teacher is None and obj >= 0:
+            actors &= self.object_actors(encoded, kind, obj)
+        selected, limit = [], selection_limit(config, kind)
         selection = teacher['selection'] if teacher else None
-        keys = entity @ p['entity_key_w']
-        func = np.zeros(len(config['types']))
-        func[np.asarray(encoded['types'])[actors]] = 1
-        func = self._sample_array(func) @ p['func_w']+p['func_b']
-        size = head_sizes(config)[2]
-        state = self._sample_array(np.zeros(size)), self._sample_array(np.zeros(size))
+        unit = self._unit_begin(trunk, action)
         for ordinal in range(limit):
-            query = ((context @ p['unit_in_w']+p['unit_in_b']+func).relu() @ p['unit_query_w']+p['unit_query_b'])
-            state = self._lstm_step(query, state)
-            scores = self._sample_concat([keys @ state[0], (p['unit_end_key'] @ state[0]).reshape((1,))])
+            scores, unit = self._unit_scores(trunk, unit)
             available = self.selection_mask(encoded, kind, selected, actors)
             actor_mask = np.concatenate([available, [ordinal > 0]])
             actor_mask[selected] = False
@@ -1464,50 +1689,47 @@ class NeuralPolicy:
             if index == len(actors):
                 break
             selected.append(index)
-            context = context+(keys[index]/SELECTED_UNIT_DIVISOR) @ p['unit_ar_w']+p['unit_ar_b']
+            unit = self._unit_add(trunk, unit, index)
             available = self.selection_mask(encoded, kind, selected, actors)
             if not any(available[i] for i in range(len(actors)) if i not in selected):
                 break
         trace = {'kind': kind, 'selection': selected, 'delay': delay}
         ids = [encoded['entities'][i]['id'] for i in selected]
-        action = {'kind': kind}
+        result = {'kind': kind}
         if kind in GROUP_KINDS:
-            action['units'] = ids
+            result['units'] = ids
         else:
-            action['builder' if kind in BUILDER_KINDS else 'producer'] = ids[0]
+            result['builder' if kind in BUILDER_KINDS else 'producer'] = ids[0]
         if kind in COMMAND_KINDS:
-            embeddings = p['command_embedding']
-            command = draw('command', embeddings @ (context @ p['command_query_w']) + p['command_b'],
-                           self.command_mask(encoded, kind, selected))
-            action['command'] = config['commands'][command]
-            context = context+embeddings[command] @ p['command_context_w']
+            trace['command'] = obj
+            result['command'] = config['commands'][obj]
+        if kind in ('build', 'train'):
+            trace['template'] = obj
+            result['template'] = self.production_native(encoded['entities'][selected[0]], kind, config['templates'][obj])
+        summary = self._selection_summary(trunk, selected)
         if kind == 'cancel_production':
-            action['slot'] = draw('slot', context @ p['slot_w']+p['slot_b'], self.slot_mask(encoded, selected))
+            result['slot'] = draw('slot', self._slot_logits(trunk, action, summary), self.slot_mask(encoded, selected),
+                                  teacher.get('slot') if teacher else None)
         mode = command_target(config, trace)
         if mode == 'entity':
-            query = (context @ p['target_in_w']+p['target_in_b']+func).relu() @ p['target_pointer_w']+p['target_pointer_b']
-            index = draw('target', keys @ query, self.target_mask(encoded, kind, selected, trace.get('command')))
-            action['target'] = encoded['entities'][index]['id']
-        if kind in ('build', 'train'):
-            actor = encoded['entities'][selected[0]]
-            menu = config['menus'][production_twin(config, actor['type'])+'|'+kind]
-            available = self.production_available(actor, kind)
-            choices = [t in menu and t in available for t in config['templates']]
-            embeddings = self._template_embeddings()
-            index = draw('template', embeddings @ (context @ p['template_query_w']) + p['template_b'], choices)
-            action['template'] = self.production_native(actor, kind, config['templates'][index])
-            context = context+embeddings[index] @ p['template_context_w']
-        build_mask = None
-        placement_unavailable = False
-        if kind == 'build' and config['placement_mode'] == 'full_mask':
-            from build_placement import mask_for
-            angle = draw('angle', context @ p['angle_w']+p['angle_b'], np.ones(16, bool))
-            context = context+p['build_angle_embedding'][angle]
-            build_mask = mask_for(config, encoded, selected[0], index, angle)
-            placement_unavailable = not build_mask.any()
-            action['angle'] = math.tau*((angle+8*encoded['rotated'])%16)/16
-            if placement_unavailable:
-                trace.update(kind='wait', attempted_kind='build', placement_unavailable=True)
+            index = draw('target', self._target_logits(trunk, action, summary),
+                         self.target_mask(encoded, kind, selected, trace.get('command')), teacher.get('target') if teacher else None)
+            result['target'] = encoded['entities'][index]['id']
+        build_mask, placement_unavailable = None, False
+        if kind == 'build':
+            angle = draw('angle', self._angle_logits(trunk, action), np.ones(config['angle_bins'], bool),
+                         teacher.get('angle') if teacher else None)
+            if config['placement_mode'] == 'full_mask':
+                from build_placement import mask_for
+                build_mask = mask_for(config, encoded, selected[0], obj, angle)
+                placement_unavailable = not build_mask.any()
+                result['angle'] = math.tau*((angle+8*encoded['rotated'])%16)/16
+                if placement_unavailable:
+                    trace.update(kind='wait', attempted_kind='build', placement_unavailable=True)
+            else:
+                result['angle'] = math.tau*angle/config['angle_bins']
+                if encoded['rotated']:
+                    result['angle'] = (result['angle']+math.pi)%math.tau
         if mode == 'position' and not placement_unavailable:
             bins, n = config['position_bins'], config['map_side']
             fine = bins//n
@@ -1517,26 +1739,20 @@ class NeuralPolicy:
                 from build_placement import categorical_masks, coarse_features
                 build_features = coarse_features(build_mask, n)
                 cell_mask, _ = categorical_masks(build_mask, n)
-            cells, logits = self._location(spatial, context, build_features)
+            logits = self._location(trunk, action, summary, build_features)
             # One 256x256 distribution, drawn as its map cell and then the offset within it.
-            cell = draw('cell', logits.logsumexp(1), cell_mask)
-            context = context+cells[:, cell//n, cell%n] @ p['cell_context_w']
+            cell = draw('cell', logits.logsumexp(1), cell_mask, teacher.get('cell') if teacher else None)
             if build_mask is not None:
                 _, offset_mask = categorical_masks(build_mask, n, cell)
-            offset = draw('offset', logits[cell], offset_mask)
+            offset = draw('offset', logits[cell], offset_mask, teacher.get('offset') if teacher else None)
             x, y = (cell%n)*fine+offset%fine, (cell//n)*fine+offset//fine
             trace['x'], trace['y'] = x, y
             normalized = (np.asarray([x, y])+.5)/bins
             if encoded['rotated']:
                 normalized = 1-normalized
             xy = encoded['low']+encoded['span']*normalized
-            action['position'] = [float(xy[0]), float(xy[1]), 0]
-        if kind == 'build' and config['placement_mode'] != 'full_mask':
-            angle = draw('angle', context @ p['angle_w']+p['angle_b'], np.ones(config['angle_bins'], bool))
-            action['angle'] = math.tau*angle/config['angle_bins']
-            if encoded['rotated']:
-                action['angle'] = (action['angle']+math.pi)%math.tau
-        return ([] if placement_unavailable else [action]), trace, hidden, value, logp, entropy
+            result['position'] = [float(xy[0]), float(xy[1]), 0]
+        return ([] if placement_unavailable else [result]), trace, trunk['state'], trunk['value'], logp, entropy
 
     def weight_hash(self):
         h = hashlib.sha256()

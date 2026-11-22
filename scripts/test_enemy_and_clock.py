@@ -9,7 +9,7 @@ from enemy_side import NATIVE, _natives, enemy_of
 from event_policy import EventActor
 from event_store import feature_identity
 from generals_identity import PLAYER_FACTIONS
-from generals_policy import HIDDEN_SCALARS, NeuralPolicy, visible_scalars
+from generals_policy import HIDDEN_SCALARS, NeuralPolicy, scalar_input_slices, visible_scalars
 from harvest_china_replays import TEMPLATES
 from nn_numpy import no_grad
 from test_fixtures import fixture
@@ -62,14 +62,15 @@ class EnemyAndClockTests(unittest.TestCase):
         row = {'encoded': self.encoded, 'target': self.target, 'hold_ticks': 6, 'scope': 'event'}
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key
-        h, entities, spatial = learner.model.events([self.encoded])
-        output = learner.model.teacher_heads([self.encoded], [self.target], h, entities, spatial)
+        output = learner.model.teacher_heads([self.encoded], [self.target], *learner.model.events([self.encoded]))
         np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), [self.logp(self.encoded)], rtol=3e-6, atol=2e-5)
         learner.batch([row], train=True)
-        self.assertGreater(float(learner.model.weights['enemy_identity_w'].grad.abs().sum().cpu()), 0)
-        gradient = learner.model.weights['scalar_w'].grad.abs().sum(dim=1).cpu().numpy()
-        self.assertFalse(gradient[list(HIDDEN_SCALARS)].any())
-        self.assertGreater(gradient[0], 0)
+        # AlphaGenerals: every scalar input is a row block of scalar_in_w (scalar_input_slices).
+        rows = scalar_input_slices(self.policy.config)
+        gradient = learner.model.weights['scalar_in_w'].grad.abs().sum(dim=1).cpu().numpy()
+        self.assertGreater(gradient[rows['enemy_identity']].sum(), 0)
+        self.assertFalse(gradient[rows['scalars']][list(HIDDEN_SCALARS)].any())
+        self.assertGreater(gradient[rows['scalars']][0], 0)
 
     def test_actor_passes_the_lobby_side(self):
         actor = EventActor(self.policy, 1)
@@ -137,7 +138,7 @@ class EnemyAndClockTests(unittest.TestCase):
     def test_location_is_one_distribution_over_every_bin(self):
         with no_grad():
             trunk = self.policy._trunk(self.encoded)
-            _, logits = self.policy._location(trunk[2], trunk[0])
+            logits = self.policy._location(trunk, 0, self.policy._selection_summary(trunk, []))
         n, fine = self.config['map_side'], self.config['position_bins']//self.config['map_side']
         self.assertEqual(logits.data.shape, (n*n, fine*fine))
         cell = logits.logsumexp(axis=1).data

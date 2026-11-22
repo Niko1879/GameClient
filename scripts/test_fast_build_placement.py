@@ -68,8 +68,7 @@ class FastPlacementTests(unittest.TestCase):
             _,_,_,_,reference,_=policy.decide(encoded,None,teacher=target)
         learner=EventLearner(policy,device='cpu')
         with torch.no_grad():
-            hidden,entities,spatial=learner.model.events([encoded])
-            output=learner.model.teacher_heads([encoded],[target],hidden,entities,spatial)
+            output=learner.model.teacher_heads([encoded],[target],*learner.model.events([encoded]))
         self.assertAlmostEqual(float(output['logp'][0]),float(reference.data),places=4)
         row=dict(encoded=encoded,target=target,frame=0,player=2,source_ticks_per_second=60)
         result=learner.batch([row],train=True)

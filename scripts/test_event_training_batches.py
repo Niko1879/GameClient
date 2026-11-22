@@ -71,7 +71,7 @@ class PreparedReaderTests(unittest.TestCase):
         fixture = EventTests('setUp'); fixture.setUp()
         self.dataset = fixture.shard_dataset(Path(self.temporary.name), validation=True)
         self.spec = PreparationSpec(self.dataset.config, self.dataset.key, device_type='cpu')
-        self.settings = dict(seed=3, epoch=0, batch_size=3)
+        self.settings = dict(seed=3, epoch=0, lanes=2, steps=2, part_lanes=1)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -97,7 +97,7 @@ class PreparedReaderTests(unittest.TestCase):
         from multiprocessing import shared_memory
         from queue import Queue
         from event_training_batches import _Slots, _pack, _unpack
-        update = prepare_update(self.spec, next(iter(self.dataset.batches('train', **self.settings)))[0], 4000)
+        update = prepare_update(self.spec, next(iter(self.dataset.batches('train', seed=3, epoch=0, batch_size=3)))[0], 4000)
         arrays = []
         skeleton = _pack(update, arrays)
         self.assertTrue(arrays)  # The fixture's updates do use the shared path.
@@ -139,14 +139,17 @@ class PreparedReaderTests(unittest.TestCase):
                                           'entries': entries})
         from event_dataset import EventDataset
         dataset = EventDataset(root/'dataset.json')
-        settings = dict(seed=3, epoch=1, batch_size=4, buffer_bytes=1)  # one chunk per window
-        self.assertEqual(len(dataset.windows('train', seed=3, epoch=1, buffer_bytes=1)), 5)
+        # Five one-episode games on two lanes of four steps, one part per lane: readers take parts in turn.
+        settings = dict(seed=3, epoch=1, lanes=2, steps=4, part_lanes=1)
+        self.assertEqual(len(dataset.episodes('train')), 5)
         inline = list(prepared(dataset, 'train', spec=self.spec, pair_budget=4000, **settings))
-        resume = inline[4][1]
+        self.assertGreater(len(inline), 4)
+        middle = len(inline)//2
+        resume = inline[middle][1]
         for processes in (2, 3):
             with self.subTest(processes=processes), PreparedReader(dataset, self.spec, 4000, 1, processes) as reader:
                 assert_same(self, list(reader.stream('train', **settings)), inline)
-                assert_same(self, list(reader.stream('train', **settings, cursor=resume)), inline[5:])
+                assert_same(self, list(reader.stream('train', **settings, cursor=resume)), inline[middle+1:])
 
     def test_reader_failure_reaches_consumer(self):
         with self.dataset.shard_path(self.dataset.entries[0]).open('ab') as stream:
