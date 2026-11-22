@@ -21,7 +21,7 @@ class CompiledLearnerTests(unittest.TestCase):
     def test_compile_is_refused_without_nvidia_triton(self):
         if CUDA:
             self.skipTest('compile is available here')
-        policy = NeuralPolicy({**self.config(), 'hidden': 16}, 1)
+        policy = NeuralPolicy(self.config(), 1)
         with self.assertRaisesRegex(ValueError, 'NVIDIA CUDA'):
             EventLearner(policy, device='cpu', compile_encoder=True)
 
@@ -33,7 +33,7 @@ class CompiledLearnerTests(unittest.TestCase):
             dataset = fixture.shard_dataset(Path(temporary), validation=True)
             spec = PreparationSpec(dataset.config, dataset.key)
             updates = [u for u, _ in prepared(dataset, 'train', spec=spec, pair_budget=4000, seed=3, epoch=0,
-                                               batch_size=3)]
+                                               lanes=2, steps=2, part_lanes=1)]
             self.assertGreater(len(updates), 2)
             for precision in ('fp32', 'bf16'):
                 learners = [EventLearner(NeuralPolicy(dataset.config, 5), device='cuda', precision=precision,
@@ -49,7 +49,7 @@ class CompiledLearnerTests(unittest.TestCase):
                 for left, right in zip(*(learner.model.parameters() for learner in learners)):
                     np.testing.assert_allclose(right.detach().cpu().numpy(), left.detach().cpu().numpy(),
                                                atol=2e-3 if precision == 'bf16' else 5e-4)
-                validation = [learner.run(updates[0], train=False) for learner in learners]
+                validation = [learner.run(updates[0], train=False, split='validation') for learner in learners]
                 np.testing.assert_allclose(validation[1]['loss_sum'], validation[0]['loss_sum'], rtol=2e-3)
                 learners[1].save(Path(temporary)/f'{precision}.npz', {})  # weights still save normally
 

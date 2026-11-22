@@ -33,7 +33,7 @@ class LearnerBenchTests(unittest.TestCase):
     def arguments(self, root, **changes):
         settings = dict(dataset=str(root/'dataset.json'), code=None, label=None, output=str(root/'run.json'),
                         device='cpu', precision='fp32', compile=False, warmup=1, updates=2,
-                        widths=None, width_scale=1.0, profile=0, lanes=2, unroll=2, part_lanes=1,
+                        widths=None, profile=0, lanes=2, unroll=2, part_lanes=1,
                         pair_budget=8_000_000, cache_mib=64, prefetch=0, readers=1, seed=3)
         return SimpleNamespace(**{**settings, **changes})
 
@@ -92,28 +92,25 @@ class LearnerBenchTests(unittest.TestCase):
                 learner_bench.summary(SimpleNamespace(reports=[str(root/'a.json')]))
             self.assertIn('GPU busy 50% over 3 samples -> CPU-bound', out.getvalue())
 
-    def test_width_sweep_scales_the_core_in_multiples_of_64(self):
-        # AlphaGenerals: the core is the width plan.md §6 sizes the model by; the rest are fixed.
+    def test_widths_are_model_only_settings(self):
+        # AlphaGenerals' network widths are fixed: a 'widths' override would change the feature key.
         config = {'map_hidden': 128}
-        self.assertEqual(learner_bench.model_widths(config, scale=1.5), {'widths': {'core': 1536}})
-        self.assertEqual(learner_bench.model_widths({'widths': {'core': 16, 'entity': 8}}, scale=2.0),
-                         {'widths': {'core': 64, 'entity': 8}})
         self.assertEqual(learner_bench.model_widths(config), {})
+        self.assertEqual(learner_bench.model_widths(config, '{"map_hidden": 64}'), {'map_hidden': 64})
         import cloud_bundle
         self.assertEqual(learner_bench.model_widths(config, 'default'), cloud_bundle.WIDTHS['default'])
-        with self.assertRaises(ValueError):
-            learner_bench.model_widths(config, 'default', 2.0)
-        with self.assertRaises(ValueError):
-            learner_bench.model_widths(config, '{"map_side": 32}')
+        for bad in ('{"map_side": 32}', '{"widths": {"core": 512}}'):
+            with self.assertRaises(ValueError):
+                learner_bench.model_widths(config, bad)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.dataset(root)
             with contextlib.redirect_stdout(io.StringIO()):
-                plain = learner_bench.run(self.arguments(root, widths=None, width_scale=1.0))
-                wide = learner_bench.run(self.arguments(root, widths=None, width_scale=8.0,
+                plain = learner_bench.run(self.arguments(root, widths=None))
+                wide = learner_bench.run(self.arguments(root, widths='{"map_hidden": 64}',
                                                         output=str(root/'wide.json')))
             self.assertEqual(plain['widths'], {})
-            self.assertGreater(wide['parameters'], plain['parameters'])
+            self.assertNotEqual(wide['parameters'], plain['parameters'])
             self.assertEqual(wide['updates'], 2)
 
     def test_run_imports_the_learner_from_another_source_directory(self):

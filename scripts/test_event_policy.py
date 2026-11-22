@@ -366,8 +366,11 @@ class EventTests(unittest.TestCase):
                     np.testing.assert_array_equal(a['exp_avg'].cpu().numpy(), b['exp_avg'].cpu().numpy())
 
     def test_model_width_does_not_invalidate_features(self):
-        config = copy.deepcopy(self.config); config['widths'] = {**config['widths'], 'core': 2*config['widths']['core']}
+        # Model-only settings (event_store.MODEL_ONLY) keep the key; the network's fixed widths do not.
+        config = copy.deepcopy(self.config); config['map_hidden'] = 2*config['map_hidden']
         self.assertEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
+        wider = copy.deepcopy(self.config); wider['widths'] = {**wider['widths'], 'core': 2*wider['widths']['core']}
+        self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(wider, parameters=False)))
         config['event_max_delay'], config['delay_ticks'] = 60, list(range(1, 61))
         self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
 

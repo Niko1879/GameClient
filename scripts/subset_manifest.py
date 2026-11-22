@@ -16,7 +16,7 @@ own directory.
   python -B code/subset_manifest.py subset --source data/dataset.json \\
       --output data/top10.json --min-rating 1574
   python -B code/subset_manifest.py subset --source data/dataset.json \\
-      --output data/wide.json --widths '{"widths": {"core": 1152}}'
+      --output data/wide.json --widths '{"map_hidden": 64}'
 """
 from __future__ import annotations
 

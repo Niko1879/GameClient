@@ -10,7 +10,7 @@ Gameplay checks stay local: the native engine is Windows-only.
 
   python -B scripts/cloud_bundle.py --output D:/bundles/v7-all --validation 1000
   python -B scripts/cloud_bundle.py --output ... --training 15000 --validation 1000
-  python -B scripts/cloud_bundle.py --output ... --widths '{"widths": {"core": 896}}'  # another core width
+  python -B scripts/cloud_bundle.py --output ... --widths '{"map_hidden": 64}'  # a model-only setting
 
 bundle.json records the learner's parameter count, which changes as inputs and
 heads are added; the preset names deliberately carry no size.
@@ -122,9 +122,9 @@ exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json 
   --max-gpu-mib $(( GPU_MIB * 9 / 10 )) --stop-file run/stop "$@"
 """
 
-# Model-only config overrides: the feature key and shards are unchanged. 'default' is AlphaGenerals'
-# fixed widths (generals_policy.WIDTHS, 47.3M parameters; notes/plan.md §6). Others are JSON, e.g.
-# '{"widths": {"core": 896}}'.
+# Model-only config overrides (event_store.MODEL_ONLY): the feature key and shards are unchanged.
+# 'default' is AlphaGenerals' fixed widths (generals_policy.WIDTHS, 47.3M parameters; notes/plan.md §6),
+# which cannot change without changing the feature key. Others are JSON, e.g. '{"map_hidden": 64}'.
 WIDTHS = {'default': {}}
 
 

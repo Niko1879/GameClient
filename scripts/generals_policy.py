@@ -26,7 +26,10 @@ from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transp
 # v6 (re-export, Nov 2026): logit caps on every head (exact shift gradient), weapon/armour inputs,
 # full production queue, no science action, visible-only enemies (observation v10). Older models
 # play from their own code snapshot (their run's sources.zip), never through compatibility branches.
-ARCHITECTURE = 'alphagenerals'
+# The name is the stored data's contract (config architecture, part of the feature key): AlphaGenerals
+# reads the same shards as the memory-free _old policy, so it keeps the name; checkpoints tell the two
+# networks apart by their parameter names (policy_checkpoints).
+ARCHITECTURE = 'generals-relational-v6-event'
 OBSERVATION_VERSION = 11
 KINDS = ('wait', 'move', 'attack_move', 'attack', 'stop', 'sell', 'build', 'train', 'rally', 'dock',
          'resume_construction', 'upgrade', 'ability', 'enter', 'exit', 'evacuate',
@@ -126,7 +129,8 @@ LSTM_LAYERS = 3
 ARGUMENT_HEADS = ('delay', 'unit', 'target', 'position', 'slot', 'angle')
 # Widths SCC does not give: AlphaStar's where a counterpart exists, otherwise ours (plan.md Â§6).
 # 'core' is the pre-LSTM FC and every LSTM layer, chosen so the model has 45-49M parameters.
-# Fixed constants; a config 'widths' entry (model-only, event_store.MODEL_ONLY) shrinks them for tests.
+# Fixed constants. A config 'widths' entry shrinks them for tests; it is part of the feature key
+# (not in event_store.MODEL_ONLY), so it never rides on a real dataset.
 WIDTHS = {'entity': 256, 'ffn': 1024, 'heads': 2, 'head_width': 32, 'key': 32, 'pool_queries': 2,
           'scatter': 32, 'map_out': 32, 'map_embedding': 256, 'scalar': 512, 'scalar_out': 256,
           'core': 1024, 'action_embedding': 256, 'unit_query': 32}

@@ -49,12 +49,13 @@ class SubsetTests(unittest.TestCase):
                 subset(self.document, **options)
 
     def test_widths_change_only_model_widths(self):
-        # Network widths are generals_policy.WIDTHS, overridden through the model-only 'widths' entry.
-        result = subset(self.document, widths={'widths': {'core': 32}})
-        self.assertEqual(result['config'], {'widths': {'core': 32}, 'map_side': 16})
+        # Only event_store.MODEL_ONLY settings: the network's 'widths' would change the feature key.
+        result = subset(self.document, widths={'map_hidden': 64})
+        self.assertEqual(result['config'], {'widths': {'core': 8}, 'map_side': 16, 'map_hidden': 64})
         self.assertEqual(len(result['entries']), 6)
-        with self.assertRaises(ValueError):
-            subset(self.document, widths={'map_side': 8})
+        for bad in ({'map_side': 8}, {'widths': {'core': 32}}):
+            with self.assertRaises(ValueError):
+                subset(self.document, widths=bad)
 
 
 class SelectionScoreTests(unittest.TestCase):

@@ -32,8 +32,6 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 
 ROOT = Path(__file__).resolve().parents[1]
-# The width a sweep scales: AlphaGenerals' core (generals_policy.WIDTHS; plan.md §6 sizes the model by it).
-WIDTH_KEYS = ('core',)
 LEARNER = ('train_events.py', 'torch_training_inputs.py', 'torch_policy_v3.py', 'training_preparation.py',
            'event_training_batches.py', 'generals_policy.py')
 
@@ -159,21 +157,15 @@ def bundle(args):
     print(json.dumps(summary))
 
 
-def model_widths(config, widths=None, scale=1.0):
-    """Model-only config overrides: a cloud_bundle preset name or JSON object, or the
-    core width times `scale`, rounded to multiples of 64, as {'widths': {...}}. Shards and
-    the feature key are unchanged by either."""
+def model_widths(config, widths=None):
+    """Model-only config overrides (event_store.MODEL_ONLY): a cloud_bundle preset name or JSON
+    object. Shards and the feature key are unchanged. AlphaGenerals' network widths
+    (generals_policy.WIDTHS) are fixed: changing them would change the feature key."""
     from event_store import MODEL_ONLY
-    from generals_policy import widths as network_widths
-    if widths is not None and scale != 1.0:
-        raise ValueError('Give --widths or --width-scale, not both')
-    if widths is not None:
-        from cloud_bundle import WIDTHS
-        chosen = WIDTHS[widths] if widths in WIDTHS else json.loads(widths)
-    else:
-        current = network_widths(config)
-        chosen = ({'widths': {**config.get('widths', {}), **{key: max(64, round(current[key]*scale/64)*64)
-                                                              for key in WIDTH_KEYS}}} if scale != 1.0 else {})
+    if widths is None:
+        return {}
+    from cloud_bundle import WIDTHS
+    chosen = WIDTHS[widths] if widths in WIDTHS else json.loads(widths)
     if not isinstance(chosen, dict) or not set(chosen) <= MODEL_ONLY:
         raise ValueError('Widths must be model-only settings')
     return chosen
@@ -282,7 +274,7 @@ def run(args, ranks=None):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     dataset = EventDataset(args.dataset)
-    widths = model_widths(dataset.config, args.widths, args.width_scale)
+    widths = model_widths(dataset.config, args.widths)
     reference = NeuralPolicy({**dataset.config, **widths}, args.seed)
     parameters = sum(value.data.size for value in reference.parameters.values())
     ranks = ranks or _Solo()
@@ -437,7 +429,6 @@ def main():
     timing.add_argument('--unroll', type=int, default=64, help='Decisions per lane and update')
     timing.add_argument('--part-lanes', type=int, default=8, help='Lanes per reader part')
     timing.add_argument('--widths', help="Model-only widths: cloud_bundle preset ('default', 'big') or JSON")
-    timing.add_argument('--width-scale', type=float, default=1.0, help='Scale the trunk widths (multiples of 64)')
     timing.add_argument('--pair-budget', type=int, default=8_000_000)
     timing.add_argument('--cache-mib', type=int, default=256)
     timing.add_argument('--prefetch', type=int, default=2)
