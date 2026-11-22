@@ -116,6 +116,8 @@ def main():
     parser.add_argument('--a-faction', choices=chinas, default='FactionChina', help='China general of A')
     parser.add_argument('--b-faction', choices=chinas, default='FactionChina', help='China general of B')
     parser.add_argument('--engine', help='Engine exe in replay-runtime/game (default: the pinned runner.ENGINE)')
+    parser.add_argument('--device', help='Torch inference device passed to evaluate_events (cuda needs the ROCm '
+                        'venv); default: the NumPy policy on the CPU')
     parser.add_argument('--record-replays', action='store_true',
                         help='Keep a viewable games/<name>/episode.rep per game (evaluate_events --record-replay)')
     args = parser.parse_args()
@@ -210,6 +212,8 @@ def main():
                     command += ['--opponent-rating', str(args.b_rating)]
                 if args.record_replays:
                     command += ['--record-replay']
+                if args.device:
+                    command += ['--device', args.device]
                 if args.a_rating_input:
                     command += ['--rating-input']
                 if args.b_rating_input:

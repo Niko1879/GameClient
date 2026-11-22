@@ -14,7 +14,7 @@ writes them locally and the user uploads them with their own rclone.
 `pull` installs rclone RCLONE_VERSION (the release the user verified) on the instance, copies only
 that remote's section of the local rclone config there (never the rest of the file), streams each
 part through tar into the bundle, deletes the config, and hashes every shard against
-data/dataset.json as cloud_upload --verify does. It is resumable: a part is marked done once fully
+data/dataset.json on the instance (cloud_upload --verify does the same). It is resumable: a part is marked done once fully
 extracted, so a rerun fetches only the rest.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import shlex
 import subprocess
 import tempfile
 
-from cloud_upload import parts, shard_source, verify
+from cloud_upload import parts, shard_source
 from engine_runtime import disable_power_throttling
 
 RCLONE_VERSION = 'v1.76.0'
@@ -130,12 +130,14 @@ def pull(args):
         subprocess.run(ssh+['rm -f .rclone/rclone.conf'])
     if result.returncode:
         raise SystemExit('Pull failed; rerun to resume')
-    with tempfile.TemporaryDirectory() as folder:
-        local = Path(folder)
-        (local/'data').mkdir()
-        manifest = subprocess.run(ssh+[f'cat {remote}/data/dataset.json'], capture_output=True, check=True).stdout
-        (local/'data/dataset.json').write_bytes(manifest)
-        verify(args, local, ssh)
+    # Hash the shards on the instance against its own manifest. Copying the ~0.5 GB manifest home first
+    # took hours on a host with ~270 KB/s egress (20 Nov 2026) and checked against the same file anyway.
+    check = ('import json, subprocess, sys; d = json.load(open("data/dataset.json")); '
+             'lines = "".join(e["archive_sha256"]+"  "+e["path"]+"\\n" for e in d["entries"]); '
+             'sys.exit(subprocess.run(["sha256sum", "-c", "--quiet", "-"], input=lines.encode(), cwd="data").returncode '
+             'or print(json.dumps({"verified": len(d["entries"])})))')
+    if subprocess.run(ssh+[f'cd {remote} && python3 -c {shlex.quote(check)}']).returncode:
+        raise SystemExit('Shard verification failed on the instance')
 
 
 def main():

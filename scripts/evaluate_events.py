@@ -41,8 +41,15 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
     from policy_checkpoints import live_policy, load_policy
     policy, _, checkpoint = load_policy(args.checkpoint)
     policy.rating_input = args.rating_input
-    if args.headed:
-        policy = live_policy(policy)
+    device = getattr(args, 'device', None) or ('cuda' if args.headed else None)
+
+    def live(reference):
+        # Without a device, headless games use the NumPy reference policy.
+        if device is None:
+            return reference
+        return live_policy(reference, device=device)
+
+    policy = live(policy)
     with GeneralsEnv(args.exe, log_path=output/'engine.log', headed=args.headed) as env:
         engine_sha256 = _digest(args.exe)
         deployment = checkpoint['metadata']['deployment']
@@ -58,6 +65,7 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
         if args.opponent_kind == 'policy':
             other, _, _ = load_policy(args.opponent or args.checkpoint)
             other.rating_input = args.opponent_rating_input if args.opponent else args.rating_input
+            other = live(other)
             actors.append(EventActor(other, args.seed+1, deterministic=args.deterministic,
                                      science=science(args.opponent_policy_faction)))
             actors[1].configure_ratings(*rating_view(args.opponent_rating, args.rating, args.rating_view))
@@ -109,6 +117,8 @@ def make_parser():
     parser.add_argument('--map', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--headed', action='store_true', help='Run windowed at normal speed with GPU inference')
+    parser.add_argument('--device', help='Torch inference device (cuda = the ROCm/CUDA GPU, cpu); default: headless '
+                        'games use the NumPy policy, headed games cuda')
     parser.add_argument('--keep-window', action='store_true', help='Keep a headed game open after victory or defeat')
     parser.add_argument('--opponent-kind', choices=('policy', 'hard_ai', 'human'), default='hard_ai')
     parser.add_argument('--opponent', help='Opponent checkpoint for policy games; defaults to the same checkpoint')

@@ -231,9 +231,9 @@ class EventDataset:
         for reference in references:
             rows.extend(self.read(reference))
         rng = np.random.default_rng(np.random.SeedSequence([seed, epoch, window, 1]))
+        # No entity-count sort (20 Nov 2026): it made each update single-phase (all early or all
+        # late game), worse the larger the batch. microbatches() groups by size within an update.
         rng.shuffle(rows)
-        # Stable sorting keeps random order inside entity-count buckets.
-        rows.sort(key=lambda row: len(row['encoded']['numeric'])//16)
         batches = [rows[first:first+batch_size] for first in range(0, len(rows), batch_size)]
         positions = rng.permutation(len(batches))
         for position in range(start, len(positions)):
@@ -241,7 +241,7 @@ class EventDataset:
 
     def batches(self, split, *, seed, epoch, batch_size=256, buffer_bytes=64*1024*1024,
                 cursor=(0, 0)):
-        """Shuffle chunks, then bucket a byte-bounded window by entity count.
+        """Shuffle chunks, then shuffle rows within a byte-bounded window.
 
         Cursor is (window, batch). Rebuilding it needs neither earlier decoded
         data nor neural state. All windows use their own deterministic RNG.

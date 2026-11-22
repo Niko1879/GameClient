@@ -46,15 +46,20 @@ SOURCE = rc.ROOT/'replays/gamereplays'
 SOURCE3 = rc.ROOT/'replays/gamereplays3'
 # GenTool's upload archive (scripts/harvest_gentool.py), one folder per day.
 GENTOOL = rc.ROOT/'replays/gentool'
+# Expert players' own folders (user-supplied, screened 14 Nov 2026): special/<download>/<player>/*.rep.
+# Screened-out files sit under special/_screened/ and are never part of the archive.
+SPECIAL = rc.ROOT/'replays/special'
 
 
 def archive_files():
-    return sorted(SOURCE.glob('*.rep')) + sorted(SOURCE3.glob('*.rep')) + sorted(GENTOOL.glob('*/*.rep'))
+    return (sorted(SOURCE.glob('*.rep')) + sorted(SOURCE3.glob('*.rep')) + sorted(GENTOOL.glob('*/*.rep'))
+            + sorted(p for p in SPECIAL.glob('*/*/*.rep') if p.parts[-3] != '_screened'))
 
 
 def in_archive(path):
     path = Path(path).resolve()
-    return path.parent in (SOURCE.resolve(), SOURCE3.resolve()) or path.parent.parent == GENTOOL.resolve()
+    return (path.parent in (SOURCE.resolve(), SOURCE3.resolve()) or path.parent.parent == GENTOOL.resolve()
+            or (path.parent.parent.parent == SPECIAL.resolve() and path.parent.parent.name != '_screened'))
 RETAIL = rc.ROOT/'replay-runtime/retail-104'
 RETAIL_ENGINE = RETAIL/'game/generalszh.exe'
 # VC6 build of TheSuperHackers 85135752c with the uncommitted GeneralsAI exporter port
