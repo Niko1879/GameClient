@@ -64,7 +64,9 @@ class UnitTaskTests(unittest.TestCase):
         obs['own_entities'][0]['task'] = task('attack', target={'status': 'current', 'id': 99},
             combat_target={'status': 'current', 'id': 99})
         encoded = self.encode(obs)
-        for actor, role, target in ((10, 'target', 99), (10, 'combat_target', 99), (20, 'builder', 10)):
+        # What a unit is attacking; no builder, producer or last-order links (user review, 26 Nov).
+        self.assertEqual(RELATIONS, ('target', 'combat_target'))
+        for actor, role, target in ((10, 'target', 99), (10, 'combat_target', 99)):
             row, column = encoded['ids'][actor], RELATIONS.index(role)
             self.assertTrue(encoded['task_relation_valid'][row, column])
             self.assertEqual(encoded['task_relations'][row, column], encoded['ids'][target])
@@ -82,7 +84,7 @@ class UnitTaskTests(unittest.TestCase):
             obs[key].reverse()
         obs['last_submission']['actors'] = [rename[i] for i in obs['last_submission']['actors']]
         changed = self.encode(obs)
-        for name in ('task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features', 'task_commands'):
+        for name in ('task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features'):
             np.testing.assert_array_equal(original[name], changed[name])
         with no_grad():
             for a, b in zip(trunk_arrays(self.policy._trunk(original)), trunk_arrays(self.policy._trunk(changed))):
@@ -112,7 +114,7 @@ class UnitTaskTests(unittest.TestCase):
                     entity['task']['destination'][:2] = (1000-np.asarray(entity['task']['destination'][:2])).tolist()
         obs['last_submission']['position'][:2] = (1000-np.asarray(obs['last_submission']['position'][:2])).tolist()
         rotated = self.encode(obs, home_position=[900, 900])
-        for name in ('numeric', 'task_numeric', 'task_relation_features', 'task_commands'):
+        for name in ('numeric', 'task_numeric', 'task_relation_features'):
             np.testing.assert_allclose(original[name], rotated[name], atol=1e-15)
 
     def test_unseen_validation_receipts_start_neutral_and_preserve_actual_task(self):
@@ -134,14 +136,25 @@ class UnitTaskTests(unittest.TestCase):
             return list(encoded_events(self.policy, {'rows': rows, 'map': self.terrain,
                 'player': 2, 'source_ticks_per_second': 60, 'replay_sha256': RECORDING}, Counter()))[0]
         left, right = convert('stop'), convert('attack')
-        for name in ('task_numeric', 'task_relations', 'task_commands'):
+        for name in ('task_numeric', 'task_relations'):
             np.testing.assert_array_equal(left['encoded'][name], right['encoded'][name])
 
-    def test_task_ages_are_seconds_at_both_source_rates(self):
-        for rate, frame in ((30, 3), (60, 6)):
-            row = normalize_demonstration(raw_row(frame, copy.deepcopy(self.obs)), rate)
-            encoded = self.encode(row['observation'], source_ticks_per_second=rate)
-            np.testing.assert_array_equal(encoded['task_commands'], self.encode()['task_commands'])
+    def test_the_players_last_order_never_reaches_the_model(self):
+        # Memory-free (user review, 26 Nov): no receipt of the last order, no membership of it, no click offset.
+        before = self.encode()
+        obs = copy.deepcopy(self.obs)
+        obs['last_submission'] = {'available': True, 'kind': 'attack', 'actors': [10], 'position': [900, 600, 0],
+                                  'target': {'status': 'current', 'id': 99}, 'result': 'submitted', 'age_seconds': 3}
+        after = self.encode(obs)
+        with no_grad():
+            for a, b in zip(trunk_arrays(self.policy._trunk(before)), trunk_arrays(self.policy._trunk(after))):
+                np.testing.assert_array_equal(a, b)
+
+    def test_using_an_ability_is_its_own_task(self):
+        obs = copy.deepcopy(self.obs)
+        obs['own_entities'][0]['task'] = task('ability')
+        encoded = self.encode(obs)
+        self.assertEqual(encoded['task_numeric'][encoded['ids'][10], TASKS.index('ability')], 1)
 
     def test_replay_pretraining_keeps_unseen_receipt_inputs_neutral(self):
         before = self.encode()
@@ -171,7 +184,7 @@ class UnitTaskTests(unittest.TestCase):
         left = self.encode(obs)
         obs['own_entities'][0]['ai_state'] = 'unrelated-engine-debug-state'
         right = self.encode(obs)
-        for name in ('scalars', 'numeric', 'extra_numeric', 'task_numeric', 'task_commands'):
+        for name in ('scalars', 'numeric', 'extra_numeric', 'task_numeric'):
             np.testing.assert_array_equal(left[name], right[name])
 
     def test_empty_owned_and_target_tables_keep_defeat_inputs_defined(self):
@@ -192,6 +205,9 @@ class UnitTaskTests(unittest.TestCase):
             'target': {'status': 'current', 'id': 99}, 'result': 'rejected',
             'reason': 'unavailable_target', 'age_seconds': .05}
         obs['build_placements'] = [grid(np.ones((16, 16), bool), angle=0, frame=6)]
+        # A unit attacking something, so both relation blocks learn.
+        obs['own_entities'][0]['task'] = task('attack', target={'status': 'current', 'id': 99},
+                                              combat_target={'status': 'current', 'id': 99})
         actions = [[], [{'kind': 'stop', 'units': [10]}],
             [{'kind': 'move', 'units': [10], 'position': [300, 400, 0]}],
             [{'kind': 'attack', 'units': [10], 'target': 99}],
@@ -217,13 +233,8 @@ class UnitTaskTests(unittest.TestCase):
                 expected = [float(self.policy.decide(row['encoded'], None, teacher=row['target'])[4].data) for row in rows]
             np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
         learner.batch(portable, train=True)
-        for name in ('task_w', 'task_builder_w', 'task_validation_target_w'):
+        for name in ('task_w', 'task_target_w', 'task_combat_target_w'):
             self.assertGreater(float(learner.model.weights[name].grad.abs().sum().cpu()), 0, name)
-        # AlphaGenerals: the command and validation receipts are row blocks of scalar_in_w.
-        from generals_policy import scalar_input_slices
-        for name in ('task_command', 'task_validation'):
-            rows = scalar_input_slices(self.policy.config)[name]
-            self.assertGreater(float(learner.model.weights['scalar_in_w'].grad[rows].abs().sum().cpu()), 0, name)
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary)/'checkpoint.npz'
             learner.save(checkpoint, {})
@@ -259,7 +270,7 @@ class UnitTaskTests(unittest.TestCase):
                 expected = [float(self.policy.decide(row['encoded'], None, teacher=row['target'])[4].data) for row in batch]
             np.testing.assert_allclose(output['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
         learner.batch(rows[:1], train=True)
-        gradient = learner.model.weights['task_builder_w'].grad
+        gradient = learner.model.weights['task_target_w'].grad
         self.assertIsNotNone(gradient)
         self.assertEqual(float(gradient.abs().sum().cpu()), 0)
 

@@ -161,7 +161,7 @@ def visible_scalars(scalars):
 
 def visible_task_commands(commands):
     """Stored command receipts as the model sees them: their age is the same clock as since_command."""
-    from unit_tasks import COMMANDS
+    from unit_tasks_old import COMMANDS
     # unit_tasks.encode writes [present, *command one-hot, log age, ...]; that file is a hashed feature source.
     visible = np.array(commands)
     visible[..., 1+len(COMMANDS)] = 0
@@ -688,7 +688,7 @@ class Encoder:
                        entity_command_states=command_states, player_flags=player_flags,
                        purchasable_sciences=purchasable_sciences,
                        player_identity=self.identity.player_identity(p['faction']))
-        from unit_tasks import encode
+        from unit_tasks_old import encode
         # Unit-task coordinates remain native world coordinates in the
         # transport snapshot; this helper rotates them exactly once.
         encode(self.config, observation, encoded, rotated=rotated, types=self.types)
@@ -796,7 +796,7 @@ class NeuralPolicy:
         # scalar_context: what AlphaStar gates its action head and autoregressive embedding with.
         w('gate_identity_w', (e, s), .5, generator=identity_rng); w('gate_enemy_w', (e, s), .5, generator=identity_rng)
         w('gate_actions_w', (kinds, s), .5); b('gate_b', s)
-        from unit_tasks import NUMERIC, RELATIONS, RELATION_FEATURES, COMMAND_FEATURES, VALIDATION_COLUMNS
+        from unit_tasks_old import NUMERIC, RELATIONS, RELATION_FEATURES, COMMAND_FEATURES, VALIDATION_COLUMNS
         w('task_w', (NUMERIC, d), .5)
         self.parameters['task_w'].data[list(VALIDATION_COLUMNS)] = 0
         for role in RELATIONS:
@@ -1295,7 +1295,7 @@ class NeuralPolicy:
                 + upgrades @ p['entity_w'][offset+3*e:offset+4*e]
                 + commands @ p['entity_w'][offset+4*e:offset+5*e]
                 + p['entity_b']).tanh()
-        from unit_tasks import RELATIONS
+        from unit_tasks_old import RELATIONS
         addition = Tensor(encoded['task_numeric']) @ p['task_w']
         for i, role in enumerate(RELATIONS):
             linked = base[encoded['task_relations'][:, i]]

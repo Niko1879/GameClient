@@ -11,7 +11,6 @@ from engine_runtime import PROFILE_ENV, isolation_profile
 from event_policy import LOOK_TICKS, science_buyer
 from generals_env import GeneralsEnv, run_episode
 from generals_policy import PLAY_APM, PLAY_RATING
-from openers import NAMED, named_templates
 from prepared_io import _digest, _write_json
 from replay_bootstrap import check_live_provenance, check_live_rules
 
@@ -71,7 +70,6 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
         policy.constant_pace = args.constant_pace
         actors = [actor_class(policy)(policy, args.seed, deterministic=args.deterministic, science=science(args.faction))]
         actors[0].configure_ratings(*rating_view(args.rating, args.opponent_rating, args.rating_view))
-        actors[0].configure_opener(named_templates(policy.config, args.opener))
         configure_timing(actors[0], args.apm, args.look_ms)
         if args.opponent_kind == 'policy':
             other, _, _ = load_policy(args.opponent or args.checkpoint)
@@ -81,7 +79,6 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
             actors.append(actor_class(other)(other, args.seed+1, deterministic=args.deterministic,
                                              science=science(args.opponent_policy_faction)))
             actors[1].configure_ratings(*rating_view(args.opponent_rating, args.rating, args.rating_view))
-            actors[1].configure_opener(named_templates(other.config, args.opponent_opener))
             configure_timing(actors[1], args.opponent_apm, args.look_ms)
             if args.learning_side == 1:
                 actors.reverse()
@@ -110,7 +107,6 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
                    factions=dict(checkpoint=args.faction, opponent=args.opponent_policy_faction),
                    ratings=dict(checkpoint=args.rating, opponent=args.opponent_rating, view=args.rating_view,
                                 checkpoint_input=args.rating_input, opponent_input=args.opponent_rating_input),
-                   openers=dict(checkpoint=args.opener, opponent=args.opponent_opener),
                    apm=dict(checkpoint=args.apm, opponent=args.opponent_apm), look_ms=args.look_ms,
                    constant_pace=dict(checkpoint=args.constant_pace, opponent=args.opponent_constant_pace))
     _write_json(output/'summary.json', summary)
@@ -150,10 +146,6 @@ def make_parser():
     parser.add_argument('--deterministic', action='store_true')
     parser.add_argument('--rating', type=float, default=PLAY_RATING, help='Rating input of the --checkpoint side')
     parser.add_argument('--opponent-rating', type=float, default=PLAY_RATING, help='Rating input of the --opponent side')
-    parser.add_argument('--opener', choices=('none', *sorted(NAMED)), default='none',
-                        help='Strategy input z of the --checkpoint side (scripts/openers.py NAMED)')
-    parser.add_argument('--opponent-opener', choices=('none', *sorted(NAMED)), default='none',
-                        help='Strategy input z of the --opponent side')
     parser.add_argument('--apm', type=float, help='APM input of the --checkpoint side (default %d). A memory-free checkpoint '
                         'has no such input: there it fixes the commands per game minute, waits masked' % PLAY_APM)
     parser.add_argument('--opponent-apm', type=float, help='The same for the --opponent side')

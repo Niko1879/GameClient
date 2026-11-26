@@ -12,8 +12,7 @@ import numpy as np
 
 from generals_policy import (DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, MAP_POOL, SCATTER_SCALE, UNIT_GROUPS,
                              UNKNOWN_APM, UNRATED, NeuralPolicy, coarse_pixels, command_target, count_channels, derived_inputs,
-                             pool_grid, unit_groups,
-                             visible_task_commands)
+                             pool_grid, unit_groups)
 from training_legality import cached_legality
 
 # Modelled encoder cost: per microbatch, per padded token, per padded pair. The fixed cost is the CPU launch
@@ -104,7 +103,6 @@ def encode_values(spec, encoded):
     # GENERALS_RATING_INPUT=1 turns it on without a config key, for checkpoints trained before rating_input became
     # model-only (event_store.DATA_CONFIG, 26 Nov); their run directories hold a RATING_INPUT marker.
     rated = bool(spec.config.get('rating_input', False)) or os.environ.get('GENERALS_RATING_INPUT') == '1'
-    no_opener = np.zeros(len(spec.config['templates'])+1, dtype=spec.float_dtype)
     # Columns as generals_policy._entity_inputs: stored numeric, extra, then derived.
     numeric = np.zeros((batch, count, derived_end), dtype=spec.float_dtype)
     types = np.zeros((batch, count), dtype=np.int64)
@@ -170,10 +168,7 @@ def encode_values(spec, encoded):
         'enemy_identities': ([row.get('enemy_identity', (0, 0)) for row in encoded], 'int64'),
         'ratings': (np.stack([np.asarray(row.get('ratings', UNRATED) if rated else UNRATED, dtype=spec.float_dtype) for row in encoded]), 'float'),
         # The player's own pace (generals_policy.apm_inputs), set per row by event_dataset; absent means unknown.
-        'apm': (np.stack([np.asarray(row.get('apm', UNKNOWN_APM), dtype=spec.float_dtype) for row in encoded]), 'float'),
-        # Strategy input z (generals_policy.opener_inputs), set per row by event_dataset; absent means none.
-        'opener': (np.stack([np.asarray(row['opener'], dtype=spec.float_dtype) if 'opener' in row else no_opener
-                             for row in encoded]), 'float')}
+        'apm': (np.stack([np.asarray(row.get('apm', UNKNOWN_APM), dtype=spec.float_dtype) for row in encoded]), 'float')}
     # v11 effect and sound-cue tokens (generals_policy.Encoder._effects), padded per chunk; padding is never a key.
     effects = max(len(row['effect_numeric']) for row in encoded)
     effect_numeric = np.zeros((batch, effects, EFFECT_FEATURES), dtype=spec.float_dtype)
@@ -204,9 +199,6 @@ def encode_values(spec, encoded):
     for name, dtype in (('task_numeric', 'float'), ('task_relation_valid', 'bool'),
                         ('task_relation_features', 'float')):
         values[name] = np.concatenate([np.asarray(row[name])[rows] for row, rows in zip(encoded, owned)]), dtype
-    values['task_commands'] = visible_task_commands(np.stack([row['task_commands'] for row in encoded])), 'float'
-    for name, dtype in (('task_command_templates', 'int64'), ('task_command_template_present', 'bool')):
-        values[name] = np.stack([row[name] for row in encoded]), dtype
     # Unit groups (generals_policy.unit_groups) as gather indices into each row's tokens: its
     # entities (padded to `count`), then its effect tokens. Padding is never a group member.
     groups = unit_groups(own, owners, real)
@@ -373,7 +365,6 @@ def prepare_update(spec, rows, pair_budget):
                       'rows': [{'target': row['target'], 'frame': row.get('frame'),
                                 'source_ticks_per_second': row.get('source_ticks_per_second', 60),
                                 'rating': row.get('rating'), 'match_key': row.get('match_key'),
-                                'player': row.get('player'), 'general': acting_general(row),
-                                'opener': row.get('opener')} for row in micro],
+                                'player': row.get('player'), 'general': acting_general(row)} for row in micro],
                       'entity_count': numeric.shape[1]})
     return {'rows': len(rows), 'microbatches': parts}

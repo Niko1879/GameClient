@@ -81,17 +81,9 @@ class TorchPolicyV3(nn.Module):
 
     def encode_batch(self, encoded):
         """Pad only this chunk's entity dimension; padding never enters attention/pooling."""
-        from training_preparation import encode_values
-        from generals_policy_old import ARMS_FEATURES, arms_inputs, visible_scalars
+        # This network's own, frozen input preparation (weapon/armour inputs, hidden clocks, task receipts).
+        from training_preparation_old import encode_values
         values, _ = encode_values(self, encoded)
-        # The current pipeline dropped these inputs (26 Nov): this network still reads its weapon/armour columns
-        # after the derived ones, and never sees its hidden clocks.
-        numeric = values['numeric'][0]
-        arms = np.zeros((*numeric.shape[:2], ARMS_FEATURES), dtype=numeric.dtype)
-        for index, row in enumerate(encoded):
-            arms[index, :len(row['numeric'])] = arms_inputs(row)
-        values['numeric'] = np.concatenate([numeric, arms], axis=2), 'float'
-        values['scalars'] = visible_scalars(values['scalars'][0]), 'float'
         # encode_values pools the map for the current network; this one reads the stored 128x128 grids.
         pixels, statics, seen = np.zeros_like(values['scatter_pixels'][0]), [], set()
         for index, row in enumerate(encoded):
@@ -192,7 +184,7 @@ class TorchPolicyV3(nn.Module):
                     + (F.embedding(ids, p['entity_command_charging_embedding'])
                        + F.embedding(ids, p['entity_command_progress_embedding'])*progress)*charging).sum(dim=2)
         entity = torch.tanh(torch.cat([features, types, upgrades, commands], dim=-1) @ p['entity_w'] + p['entity_b'])
-        from unit_tasks import RELATIONS
+        from unit_tasks_old import RELATIONS
         hidden = config['entity_hidden']
         base = entity.reshape(batch*count, hidden)
         rows = inputs['task_rows'].numel()

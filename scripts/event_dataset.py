@@ -15,8 +15,7 @@ import zipfile
 import numpy as np
 
 from event_store import SCHEMA
-from generals_policy import ARCHITECTURE, OPENER_WINDOW_SECONDS, UNRATED, apm_inputs, opener_inputs, rating_inputs
-from openers import blanked
+from generals_policy import ARCHITECTURE, UNRATED, apm_inputs, rating_inputs
 from prepared_io import COMMON_FIELDS, _digest, _json_bytes
 from tensor_replay_store import ARRAY_FIELDS, LIST_FIELDS, MASK_FIELDS, decode_columns
 
@@ -257,18 +256,10 @@ class EventDataset:
         # Pre-match ratings by player index (None: unrated), set by run_prepared_training.selection
         # like enemy_identity; each row is one player's view.
         inputs = player_rating_inputs(entry.get('ratings', {}))
-        # Strategy input z (scripts/openers.py), set by run_prepared_training.selection per shard player index;
-        # absent means no opener for anyone, like ratings (cloud_bundle refuses a selection without any).
-        openers = entry.get('openers', {})
         for row in rows:
             own = tuple(row['encoded']['player_identity'])
             row['encoded']['enemy_identity'] = (identities[1] if own == identities[0] else identities[0])                 if len(identities) == 2 and own in identities else (0, 0)
             row['encoded']['ratings'] = inputs.get(str(row['player']), UNRATED)
-            opener = openers.get(str(row['player']))
-            seconds = row['frame']/60  # Stored frames are canonical 60 Hz, whatever the recording's rate.
-            row['opener'] = ('none' if opener is None else 'after' if seconds >= OPENER_WINDOW_SECONDS
-                             else 'blanked' if blanked(entry['match_key'], row['player']) else 'given')
-            row['encoded']['opener'] = opener_inputs(self.config, opener['templates'] if row['opener'] == 'given' else None)
             row['apm'], row['encoded']['apm'] = pace, apm_inputs(shown)
             # The acting player's pre-match rating (estimated or not), for reporting only (train_events by_rating).
             rating = entry.get('ratings', {}).get(str(row['player']))

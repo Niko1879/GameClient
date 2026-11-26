@@ -26,12 +26,13 @@ def variant_config(network='alphastar', **extra):
 class AlphaStarNetworkTests(unittest.TestCase):
     network = 'alphastar'
     extra = {}
+    seed = 5
     # Parameters behind a zero-started output layer: no gradient on the first update.
     first_step_silent = set()
 
     def setUp(self):
         self.config, observation, terrain = variant_config(self.network, **self.extra)
-        self.policy = NeuralPolicy(self.config, 5)
+        self.policy = NeuralPolicy(self.config, self.seed)
         self.rows = self.prepared(rows_for(self.policy, observation, terrain))
 
     def prepared(self, rows):
@@ -236,6 +237,8 @@ class EffectsMapNetworkTests(AlphaStarNetworkTests):
     """effects='map' on memory-free: no effect tokens; effects painted on the map; units read their cell."""
     network = 'memoryfree'
     extra = {'effects': 'map'}
+    # The 3-channel test map is nearly dead after its ReLU at seed 5 (units would read zeros); 6 is alive.
+    seed = 6
 
     def test_parameters_replace_the_lstm_and_linear_action_layer(self):
         names = set(self.policy.parameters)

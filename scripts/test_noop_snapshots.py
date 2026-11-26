@@ -72,18 +72,6 @@ class DatasetTests(unittest.TestCase):
         self.assertIsNone(episode_apm({'commands': APM_MIN_COMMANDS-1, 'ticks': 10_000}))
         self.assertAlmostEqual(np.mean([apm_blanked(f'm{i}', 2) for i in range(4000)]), .15, delta=.02)
 
-    def test_thirty_hertz_rows_use_canonical_seconds(self):
-        # Stored frames are canonical 60 Hz: the opener window closes at 240 s for both rates.
-        rows = [raw_row(f, self.obs, STOP) for f in (0, 239*60, 241*60)]
-        for rate in (30, 60):
-            data = self.dataset(rows, rate)
-            document = json.loads((self.root/'dataset.json').read_text())
-            document['entries'][0]['openers'] = {'2': {'templates': [0]*6}}
-            _write_json(self.root/'dataset.json', document)
-            with patch('event_dataset.blanked', return_value=False):
-                stored = EventDataset(self.root/'dataset.json').episode_rows('train', 0, 0, 10)
-            self.assertEqual([r['opener'] for r in stored if r['target']['kind'] != 'wait'], ['given', 'given', 'after'])
-
 
 class PilotRuleTests(unittest.TestCase):
     """noop_pilot.report on simulated players: a constant-rate sample passes, each planted leak fails its own rule."""

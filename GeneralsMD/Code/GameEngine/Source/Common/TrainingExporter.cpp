@@ -44,6 +44,8 @@
 #include "GameLogic/Module/PoisonedBehavior.h"
 #include "GameLogic/Module/DumbProjectileBehavior.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
+#include "GameLogic/Module/SpecialPowerUpdateModule.h"
+#include "GameLogic/Module/HackInternetAIUpdate.h"
 #include "Common/SpecialPower.h"
 #include "Common/SpecialPowerType.h"
 #include "Common/GameAudio.h"
@@ -664,7 +666,7 @@ struct PowerCue {
     unsigned sourceAudience = 0, targetAudience = 0;
 };
 std::vector<PowerCue> powerCues;
-const unsigned CUE_SECONDS = 5;
+const unsigned CUE_SECONDS = 10;  // User review, 26 Nov 2026 (was 5).
 unsigned soundAudience(const AudioEventRTS *sound)
 {
     if (!sound || sound->getEventName().isEmpty() || !TheAudio) return 0;
@@ -716,6 +718,18 @@ Json taskReference(ObjectID id, Player *owner, Json result = Json())
     return taskStatus("unavailable", std::move(result));
 }
 
+// Using a special ability now (Red Guard capture, Dragon firewall, Black Lotus, a hacker at work): unit task 'ability'
+// (feature review, 26 Nov 2026).
+bool usingAbility(Object *object, AIUpdateInterface *ai)
+{
+    for (BehaviorModule **module = object->getBehaviorModules(); *module; ++module) {
+        SpecialPowerUpdateInterface *power = (*module)->getSpecialPowerUpdateInterface();
+        if (power && power->isSpecialAbility() && power->isActive()) return true;
+    }
+    HackInternetAIInterface *hack = ai ? ai->getHackInternetAIInterface() : nullptr;
+    return hack && (hack->isHacking() || hack->isHackingPackingOrUnpacking());
+}
+
 Json unitTask(Object *object, Json j = Json())
 {
     ExportTimer timer(EXPORT_TASK);
@@ -762,6 +776,7 @@ Json unitTask(Object *object, Json j = Json())
         case AI_GUARD: case AI_GUARD_TUNNEL_NETWORK: case AI_GUARD_RETALIATE: setString(j["kind"], "guard"); break;
         default: setString(j["kind"], "other"); break;
         }
+        if (usingAbility(object, ai)) setString(j["kind"], "ability");
         ObjectID goal = targetTask ? ai->getGoalObjectID() : INVALID_ID;
         DozerAIInterface *dozer = ai->getDozerAIInterface();
         if (dozer && dozer->getCurrentTask() != DOZER_TASK_INVALID) {

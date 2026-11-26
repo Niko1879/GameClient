@@ -30,22 +30,14 @@ class EnemyAndClockTests(unittest.TestCase):
 
     def test_rank_progress_is_stored_clipped_and_read(self):
         self.assertEqual(len(self.encoded['scalars']), SCALAR_FEATURES)
-        self.assertAlmostEqual(self.encoded['scalars'][5], .25)
+        self.assertAlmostEqual(self.encoded['scalars'][4], .25)
         for given, stored in ((-1, 0.), (.999, .999), (7, 1.)):
             obs = copy.deepcopy(self.obs)
             obs['player']['rank_progress'] = given
-            self.assertAlmostEqual(self.policy.encoder.encode(obs, self.terrain, 300)['scalars'][5], stored)
+            self.assertAlmostEqual(self.policy.encoder.encode(obs, self.terrain, 300)['scalars'][4], stored)
         scalars = self.encoded['scalars'].copy()
-        scalars[5] = .9
+        scalars[4] = .9
         self.assertNotEqual(self.logp({**self.encoded, 'scalars': scalars}), self.logp(self.encoded))
-
-    def test_the_receipt_age_never_reaches_the_model(self):
-        from unit_tasks import COMMANDS
-        COMMAND_AGE = 1+len(COMMANDS)
-        commands = self.encoded['task_commands'].copy()
-        self.assertGreater(commands[0, COMMAND_AGE], 0, 'The fixture receipt has an age')
-        commands[:, COMMAND_AGE] += 3
-        self.assertEqual(self.logp({**self.encoded, 'task_commands': commands}), self.logp(self.encoded))
 
     def test_enemy_side_changes_decisions_and_defaults_to_unknown(self):
         identity = self.policy.encoder.identity
@@ -130,9 +122,9 @@ class EnemyAndClockTests(unittest.TestCase):
             self.assertEqual(encoded['rotated'], rotated)
             sign = -1 if rotated else 1
             row = encoded['numeric'][encoded['ids'][seen['id']]]
-            np.testing.assert_allclose(row[16:21], [sign*.3, sign*-.6, sign*1, 0, 1], atol=1e-12)
+            np.testing.assert_allclose(row[15:20], [sign*.3, sign*-.6, sign*1, 0, 1], atol=1e-12)
             row = encoded['numeric'][encoded['ids'][hidden['id']]]
-            np.testing.assert_allclose(row[16:21], [0, 0, sign*1, 0, 1], atol=1e-12, err_msg='Hidden motion is unknown')
+            np.testing.assert_allclose(row[15:20], [0, 0, sign*1, 0, 1], atol=1e-12, err_msg='Hidden motion is unknown')
 
     def test_location_is_one_distribution_over_every_bin(self):
         with no_grad():

@@ -7,8 +7,8 @@ import unittest
 import numpy as np
 
 from event_store import feature_identity
-from generals_policy import (BURNING_COLUMN, EFFECT_FEATURES, ENTITY_FEATURES, FIRING_COLUMN, POISONED_COLUMN,
-                             SCALAR_FEATURES, SUPERWEAPON_SECONDS, NeuralPolicy)
+from generals_policy import (CUE_SECONDS, EFFECT_FEATURES, ENTITY_FEATURES, FIRING_COLUMN, SCALAR_FEATURES, SUPERWEAPON_SECONDS,
+                             NeuralPolicy)
 from nn_numpy import no_grad
 from test_fixtures import fixture
 from train_events import EventLearner
@@ -51,7 +51,8 @@ class CurrentPerceptionTests(unittest.TestCase):
         self.assertEqual(e['numeric'].shape[1], ENTITY_FEATURES)
         dozer, enemy = e['ids'][10], e['ids'][99]
         self.assertEqual(e['numeric'][dozer, FIRING_COLUMN], 1)
-        self.assertEqual(e['numeric'][enemy, [POISONED_COLUMN, BURNING_COLUMN]].tolist(), [1, 1])
+        # Poisoned and burning are not inputs (user review, 26 Nov): hazards are on the map.
+        self.assertEqual(e['numeric'][enemy, FIRING_COLUMN], 0)
         self.assertEqual(len(e['scalars']), SCALAR_FEATURES)
         np.testing.assert_allclose(e['scalars'][-6:], [1, 120/SUPERWEAPON_SECONDS, 0, 1, 0, 1])
         self.assertFalse(self.plain['scalars'][-6:].any())
@@ -66,7 +67,7 @@ class CurrentPerceptionTests(unittest.TestCase):
         powers = self.config['powers']
         self.assertEqual([powers[p-1] for p in e['effect_powers'][2:]], ['SuperweaponArtilleryBarrage', 'SuperweaponCarpetBomb'])
         self.assertEqual(barrage[[3, 9, 12]].tolist(), [1, 1, 1])
-        self.assertAlmostEqual(barrage[13], 30/60/5)
+        self.assertAlmostEqual(barrage[13], 30/60/CUE_SECONDS)
         self.assertEqual(carpet[[0, 1, 2, 3]].tolist(), [0, 0, 0, 0], 'A cue heard far away has no position')
         self.assertEqual(self.plain['effect_numeric'].shape, (0, EFFECT_FEATURES))
 

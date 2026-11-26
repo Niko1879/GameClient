@@ -256,13 +256,12 @@ class TorchPolicyV3(nn.Module):
         identities = inputs['enemy_identities']
         enemy = p['base_faction_embedding'][identities[:, 0]]+p['general_embedding'][identities[:, 1]]
         batch = identity.shape[0]
-        counts = torch.zeros((batch, len(self.config['types'])), dtype=self.dtype, device=self.device).scatter_add(
-            1, inputs['types'], inputs['real'])
-        parts = [inputs['scalars'], identity, enemy, inputs['ratings'], inputs['apm'], inputs['opener'], inputs['player_flags'],
-                 counts.sqrt(), inputs['available_actions']]
-        for i in range(2):
-            template = self.type_embedding(inputs['task_command_templates'][:, i])
-            parts += [inputs['task_commands'][:, i], template*inputs['task_command_template_present'][:, i, None]]
+        # Unit counts per type, square-rooted: own units, then enemy units visible now (generals_policy.unit_counts).
+        def counts(members):
+            return torch.zeros((batch, len(self.config['types'])), dtype=self.dtype, device=self.device).scatter_add(
+                1, inputs['types'], members.to(self.dtype)).sqrt()
+        parts = [inputs['scalars'], identity, enemy, inputs['ratings'], inputs['apm'], inputs['player_flags'],
+                 counts(inputs['pool_own']), counts(inputs['pool_visible']), inputs['available_actions']]
         x = F.relu(torch.cat([part.to(identity.dtype) for part in parts], dim=1) @ p['scalar_in_w']+p['scalar_in_b'])
         return F.relu(x @ p['scalar_hidden_w']+p['scalar_hidden_b'])
 

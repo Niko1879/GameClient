@@ -20,7 +20,6 @@ from test_replay_actions import command, sample
 from test_replay_training import fixture as audit_fixture
 from train_events import EventLearner
 from training_legality import build_legality
-from unit_tasks import COMMAND_FEATURES, COMMANDS
 
 
 def fixture_resume():
@@ -89,11 +88,6 @@ class ResumeConstructionTests(unittest.TestCase):
             self.assertEqual(result['actions'], [{'kind': 'resume_construction', 'builder': 1, 'target': 30}]
                              if len(candidates) == 1 else [])
 
-    def test_command_context_includes_resume_construction(self):
-        encoded = self.encode()
-        self.assertEqual(encoded['task_commands'].shape, (2, COMMAND_FEATURES))
-        self.assertEqual(encoded['task_commands'][0, 1+COMMANDS.index('resume_construction')], 1)
-
     def test_raw_audit_requires_owned_legality_and_rejects_enemy_legality(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)/'replay.jsonl'
@@ -141,12 +135,9 @@ class ResumeConstructionTests(unittest.TestCase):
                 expected = [float(self.policy.decide(r['encoded'], None, teacher=r['target'])[4].data) for r in rows]
             np.testing.assert_allclose(actual['logp'].detach().cpu().numpy(), expected, rtol=4e-6, atol=3e-5)
         learner.batch(portable, train=True)
-        # AlphaGenerals: the target head's query and key projections; the command receipt is a scalar_in_w block.
+        # AlphaGenerals: the target head's query and key projections.
         for name in ('target_in_w', 'target_score_k_w'):
             self.assertGreater(float(learner.model.weights[name].grad.abs().sum().cpu()), 0)
-        from generals_policy import scalar_input_slices
-        rows = scalar_input_slices(self.policy.config)['task_command']
-        self.assertGreater(float(learner.model.weights['scalar_in_w'].grad[rows].abs().sum().cpu()), 0)
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary)/'checkpoint.npz'
             learner.save(checkpoint, {})

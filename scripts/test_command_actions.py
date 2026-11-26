@@ -134,7 +134,10 @@ class CommandActionTests(unittest.TestCase):
         self.assertEqual(encoded['entity_upgrades'][center].tolist()[:1],
                          [self.config['upgrades'].index('Upgrade_InfantryCaptureBuilding')+1])
         self.assertEqual(encoded['player_flags'].tolist(), [1, 0, 0, 0, 1, 1])
-        self.assertEqual(encoded['extra_numeric'].shape[1], 14)
+        # Own extras: inside a container, a container's fill (user review, 26 Nov).
+        self.assertEqual(encoded['extra_numeric'].shape[1], 2)
+        # Production readiness is stored for the training mask, never an input.
+        self.assertTrue(encoded['production_ready'][center, 1])
 
     def test_replay_adapter_uses_engine_resolution_and_masks_unresolved_commands(self):
         resolved = command('MSG_DO_SPECIAL_POWER_AT_OBJECT', 5, 2, 0, 0)

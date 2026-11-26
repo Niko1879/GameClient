@@ -86,6 +86,7 @@ void directTask(DirectOutput &out, DirectCursor &parent, Object *object)
         case AI_GUARD: case AI_GUARD_TUNNEL_NETWORK: case AI_GUARD_RETALIATE: kind = "guard"; break;
         default: kind = "other"; break;
         }
+        if (usingAbility(object, ai)) kind = "ability";
         ObjectID goal = targetTask ? ai->getGoalObjectID() : INVALID_ID;
         DozerAIInterface *dozer = ai->getDozerAIInterface();
         if (dozer && dozer->getCurrentTask() != DOZER_TASK_INVALID) {

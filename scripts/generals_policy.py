@@ -50,14 +50,18 @@ QUEUE_SLOTS = 9
 PAIR_FIELDS = {'dock': 'dock_targets', 'enter': 'enter_targets', 'repair': 'repair_targets',
                'get_repaired': 'repair_depots'}
 COMMAND_KINDS = ('upgrade', 'ability')
-# v11 (15 Nov 2026) appends firing, poisoned and burning: what a player sees on a visible unit now.
-ENTITY_FEATURES = 25
+# Position, health, ownership, construction, the production queue (current item's progress), cooldown, under attack,
+# motion, facing, veterancy, supply boxes and firing now. No ghost age, poisoned or burning (user review, 26 Nov).
+ENTITY_FEATURES = 22
 # Divides world units per second, so a fast ground unit is near 1.
 VELOCITY_SCALE = 100
 # Numeric columns read back when building model inputs.
-OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN, COOLDOWN_COLUMN, UNDER_ATTACK_COLUMN = 5, 6, 7, 14, 15
-SUPPLY_COLUMN, FIRING_COLUMN, POISONED_COLUMN, BURNING_COLUMN = 21, 22, 23, 24
-EXTRA_ENTITY_FEATURES = 14
+HEALTH_COLUMN, CONSTRUCTED_COLUMN = 3, 8
+OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN, COOLDOWN_COLUMN, UNDER_ATTACK_COLUMN = 5, 6, 7, 13, 14
+SUPPLY_COLUMN, FIRING_COLUMN = 20, 21
+# Own (and garrisonable) entities: inside a container, and a container's fill. Menus, buttons and charging are the
+# type embedding's and the button inputs' (user review, 26 Nov).
+EXTRA_ENTITY_FEATURES = 2
 ENTITY_UPGRADE_SLOTS = 4
 # Upgrade/ability buttons per owned entity: (available, ready fraction) each. Vanilla
 # China's command center has the most (its menu plus the faction shortcuts, 14).
@@ -75,17 +79,17 @@ RATING_FEATURES = 6
 # training it contains the episode's future, as a coarse style input; live it is set freely (wait_snapshots.md).
 # Rating explains only ~9% of its variance (23 Nov 2026), so it is its own input. 50 is the median at 1800-2000.
 APM_CENTER, PLAY_APM, APM_FEATURES = 50, 50, 2
-# Cash, power made and used, radar, rank, progress to the next rank [0, 1) (the engine's level-down/level-up skill
-# points; 0 at max rank), science points, game clock, own and seen counts, map extent, source rate; then the public
-# superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
-SCALAR_FEATURES = 19
+# Cash, net power (made - used, negative when short), radar, rank, progress to the next rank [0, 1) (the engine's
+# level-down/level-up skill points; 0 at max rank), science points, game clock, own unit count, map extent, source rate;
+# then the public superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
+SCALAR_FEATURES = 17
 SUPERWEAPON_SECONDS = 600
-# v11 current perception (TrainingExporter: effects, audio_cues), one token group sharing the entity
-# attention but never an actor or target: projectiles and hazards visible now, and special-power
-# launch sounds heard in the last CUE_SECONDS. Columns: x, y, z, has position, velocity x/y/z,
+# Current perception (TrainingExporter: effects, audio_cues): projectiles and hazards visible now, and special-power
+# launch sounds heard in the last CUE_SECONDS (10 s, user review 26 Nov; the cue age tells fresh from old). Painted
+# on the map where the source or target is visible (effects='map'). Columns: x, y, z, has position, velocity x/y/z,
 # radius, own, enemy, projectile, hazard, cue, cue age.
 EFFECT_FEATURES = 14
-CUE_SECONDS = 5
+CUE_SECONDS = 10
 EFFECT_RADIUS_SCALE = 50
 # Width of the map summary (map_fc), AlphaStar's 256 whatever the entity width (15 Nov 2026).
 MAP_EMBEDDING = 256
@@ -191,15 +195,13 @@ def action_object(target):
 
 
 def scalar_input_slices(config):
-    """{input: rows of scalar_in_w}, in the scalar input's concatenation order (NeuralPolicy._scalars)."""
-    from unit_tasks import COMMAND_FEATURES
+    """{input: rows of scalar_in_w}, in the scalar input's concatenation order (NeuralPolicy._scalars).
+
+    Unit counts per type (square-rooted, as AlphaStar's): own units, and enemy units visible now."""
     e = config['embedding']
     widths = [('scalars', SCALAR_FEATURES), ('player_identity', e), ('enemy_identity', e), ('ratings', RATING_FEATURES),
-              ('apm', APM_FEATURES),
-              ('opener', len(config['templates'])+1), ('player_flags', len(config['upgrades'])+2*len(config['sciences'])),
-              ('unit_counts', len(config['types'])), ('available_actions', len(KINDS)),
-              ('task_command', COMMAND_FEATURES), ('task_command_template', e),
-              ('task_validation', COMMAND_FEATURES), ('task_validation_template', e)]
+              ('apm', APM_FEATURES), ('player_flags', len(config['upgrades'])+2*len(config['sciences'])),
+              ('own_counts', len(config['types'])), ('enemy_counts', len(config['types'])), ('available_actions', len(KINDS))]
     slices, start = {}, 0
     for name, width in widths:
         slices[name] = slice(start, start+width)
@@ -207,9 +209,19 @@ def scalar_input_slices(config):
     return slices
 
 
+def unit_counts(encoded):
+    """(own mask, visible enemy mask, types) of a row's real entities, for the per-type counts (scalar_input_slices),
+    from stored arrays only (as training_preparation's pool_own and pool_visible)."""
+    count = encoded['entity_count'] if 'entity_count' in encoded else len(encoded['entities'])
+    numeric = np.asarray(encoded['numeric'])[:count]
+    own = np.asarray(encoded['own'], dtype=bool)[:count]
+    enemy = ~own & (numeric[:, ENEMY_COLUMN] > .5) & (numeric[:, VISIBLE_COLUMN] > .5)
+    return own, enemy, np.asarray(encoded['types'])[:count]
+
+
 def scalar_input_size(config):
     """Width of the scalar input concatenation (NeuralPolicy._scalars)."""
-    return scalar_input_slices(config)['task_validation_template'].stop
+    return scalar_input_slices(config)['available_actions'].stop
 
 
 def selection_limit(config, kind):
@@ -237,15 +249,6 @@ def entity_key(entity):
     # IDs are only used to resolve commands. They are never neural features.
     return (not entity['own'], not entity['visible'], entity['owner'] < 2, entity['type'],
             tuple(entity['position']), entity['last_seen_frame'])
-
-
-def visible_task_commands(commands):
-    """Stored command receipts as the model sees them, without their age (since_command, unfloored)."""
-    from unit_tasks import COMMANDS
-    # unit_tasks.encode writes [present, *command one-hot, log age, ...]; that file is a hashed feature source.
-    visible = np.array(commands)
-    visible[..., 1+len(COMMANDS)] = 0
-    return visible
 
 
 def entity_command_inputs(p, ids, states, e):
@@ -288,25 +291,6 @@ def apm_inputs(apm):
 
 
 UNKNOWN_APM = apm_inputs(None)
-
-
-# Strategy input z (scripts/openers.py, 17 Nov 2026): the counts of each production template among a player's
-# first OPENER_BUILDINGS build orders, /OPENER_BUILDINGS, then a given flag; all zero = no opener. Shown only during
-# the first OPENER_WINDOW_SECONDS of game time (95% of top-20% players order their sixth building by 222 s).
-OPENER_BUILDINGS = 6
-OPENER_WINDOW_SECONDS = 240
-
-
-def opener_inputs(config, templates=None, seconds=0.):
-    """Model opener input from a player's first OPENER_BUILDINGS build templates (policy template indices) or
-    None, `seconds` of game time in."""
-    values = np.zeros(len(config['templates'])+1)
-    if templates is not None and seconds < OPENER_WINDOW_SECONDS:
-        if len(templates) != OPENER_BUILDINGS:
-            raise ValueError('An opener is exactly %d build orders' % OPENER_BUILDINGS)
-        np.add.at(values, np.asarray(templates, dtype=np.int64), 1/OPENER_BUILDINGS)
-        values[-1] = 1
-    return values
 
 
 def position_bits(xy):
@@ -433,7 +417,6 @@ class Encoder:
         self.command_ids = {name: i+1 for i, name in enumerate(config['commands'])}
         # Per-game inputs, found by the identity of the game's terrain record.
         self._extent, self._static, self._player, self._home = None, {}, {}, None
-        self._menus = {}
 
     def _bounds(self, terrain):
         extent = self._extent
@@ -489,13 +472,6 @@ class Encoder:
                            + [name in owned_sciences for name in sciences]
                            + [name in purchasable for name in sciences], dtype=float),
                 np.asarray([name in purchasable for name in sciences], dtype=bool))
-        return flags
-
-    def _menu_flags(self, name):
-        flags = self._menus.get(name)
-        if flags is None:
-            menus = self.config['menus']
-            flags = self._menus[name] = (bool(menus.get(name+'|build')), bool(menus.get(name+'|train')))
         return flags
 
     def floor(self, ticks):
@@ -591,11 +567,11 @@ class Encoder:
                 np.log1p(np.maximum(maximum, 0)) / 10,
                 np.asarray(owns, dtype=float), np.asarray(visibles, dtype=float),
                 np.asarray([e['owner'] >= 2 and not e['own'] for e in entities], dtype=float),
-                np.log1p(np.maximum(0, self.floor(frame) - self.floor(column('last_seen_frame'))) / 60) / 10,
                 (construction == -1).astype(float),
                 np.maximum(0, construction) / 100,
                 np.asarray([min(len(q), 20) / 20 for q in queues], dtype=float),
-                np.asarray([np.mean([item['progress'] for item in q]) / 100 if q else 0 for q in queues], dtype=float),
+                # The item in production now (slot 0); the rest wait.
+                np.asarray([q[0]['progress'] / 100 if q else 0 for q in queues], dtype=float),
                 np.asarray([min(sum(item['remaining_quantity'] for item in q), 20) / 20 for q in queues], dtype=float),
                 # Exported for owned entities only. Native frames become seconds and canonical ticks.
                 # A weapon that cannot fire again reports a huge next-shot frame.
@@ -608,17 +584,16 @@ class Encoder:
                 column('veterancy', 0) / 3,
                 # Public: a seen pile's depletion; a fogged sighting keeps its last count.
                 np.log1p(column('supply_boxes')) / SUPPLY_BOX_SCALE,
-                # v11: visible now (the exporter clears them on fog ghosts).
-                column('firing'), column('poisoned'), column('burning')])
+                # Visible now (the exporter clears it on fog ghosts).
+                column('firing')])
         else:
             # A zero row keeps pooling and pointer shapes defined after defeat.
             numeric = np.asarray([[0] * ENTITY_FEATURES])
         p = observation['player']
         scalars = np.concatenate([np.minimum(np.maximum(np.asarray([
-            np.log1p(p['cash']) / 10, p['power_production'] / 100, p['power_consumption'] / 100,
+            np.log1p(p['cash']) / 10, (p['power_production'] - p['power_consumption']) / 100,
             float(p['radar']), p['rank'] / 5, min(max(p['rank_progress'], 0.), 1.), p['science_points'] / 10,
-            np.log1p(self.floor(frame) / 60) / 10,
-            len(observation['own_entities']) / 100, len(observation['known_nonowned_entities']) / 100,
+            np.log1p(self.floor(frame) / 60) / 10, len(observation['own_entities']) / 100,
             span[0] / 4000, span[1] / 4000]), -10), 10),
             [source_ticks_per_second/60],
             self._superweapons(observation)])
@@ -641,7 +616,6 @@ class Encoder:
         entity_commands = np.zeros((max(real_count, 1), ENTITY_COMMAND_SLOTS), dtype=int)
         command_states = np.zeros((max(real_count, 1), ENTITY_COMMAND_SLOTS, 2))
         command_ids = self.command_ids
-        info = self.config['command_info']
         grid_xy = np.clip((numeric[:real_count, :2] * side).astype(int), 0, side-1)
         cells = (grid_xy[:, 1]*side+grid_xy[:, 0]).tolist()
         # Every queue slot (re-export fix 6): a unit type (catalog id, -1 when the slot holds none)
@@ -649,18 +623,18 @@ class Encoder:
         queue_units = np.full((max(real_count, 1), QUEUE_SLOTS), -1, dtype=int)
         queue_upgrades = np.zeros((max(real_count, 1), QUEUE_SLOTS), dtype=int)
         extra_rows, extra_index = [], []
+        # Whether each own entity can place a building / queue a unit now: the training action mask's superset
+        # (NeuralPolicy.object_masks), stored but never a model input.
+        production_ready = np.zeros((max(real_count, 1), 2), dtype=bool)
         for index, e in enumerate(entities):
             if not e['own']:
-                # Owner-only command capabilities; nonowned rows stay zero.
-                if 'occupants' in e or 'buildable_templates' in e or 'trainable_templates' in e:
+                # A seen container's garrison, where the observation carries it; otherwise zero.
+                if e.get('occupants') and e.get('capacity'):
                     extra_index.append(index)
-                    extra_rows.append([False, False, min(len(e.get('buildable_templates', [])), 20)/20,
-                                       min(len(e.get('trainable_templates', [])), 20)/20,
-                                       0., 0., 0., 0., 0., 0, 0, 0., e.get('occupants', 0), 0])
+                    extra_rows.append([0., min(e['occupants']/e['capacity'], 1.)])
                 continue
-            has_build, has_train = self._menu_flags(e['type'])
+            production_ready[index] = bool(e.get('buildable_templates')), bool(e.get('trainable_templates'))
             commands = e.get('commands', [])
-            kinds = [info.get(name, ('', ''))[0] for name in commands]
             charging = e.get('command_cooldowns', [])
             capacity = e.get('capacity', 0)
             # Each button's own state: ready now, or charging with its progress
@@ -675,14 +649,7 @@ class Encoder:
                 entity_commands[index, :len(slots)] = [slot[0] for slot in slots]
                 command_states[index, :len(slots)] = [slot[1:] for slot in slots]
             extra_index.append(index)
-            extra_rows.append([has_build, has_train,
-                               min(len(e.get('buildable_templates', [])), 20)/20,
-                               min(len(e.get('trainable_templates', [])), 20)/20,
-                               float('ability' in kinds), float('upgrade' in kinds), float('evacuate' in kinds),
-                               min(len(commands), 10)/10, float(bool(charging)),
-                               min(c['ready_percent'] for c in charging)/100 if charging else 0,
-                               float(bool(e.get('container_id', 0))), float(capacity > 0),
-                               e.get('occupants', 0)/max(capacity, 1), float(bool(e.get('enter_targets')))])
+            extra_rows.append([float(bool(e.get('container_id', 0))), e.get('occupants', 0)/max(capacity, 1)])
             names = e.get('upgrades')
             if names:
                 known = [upgrade_ids[name] for name in names if name in upgrade_ids]
@@ -703,7 +670,7 @@ class Encoder:
                                                                     source_ticks_per_second)
         encoded.update(effect_numeric=effect_numeric, effect_types=effect_types, effect_powers=effect_powers)
         encoded.update(map_visibility=visibility, map_static=base, cells=np.asarray(cells or [0]),
-                       extra_numeric=extra,
+                       extra_numeric=extra, production_ready=production_ready,
                        queue_units=queue_units, queue_upgrades=queue_upgrades,
                        entity_upgrades=entity_upgrades, entity_commands=entity_commands,
                        entity_command_states=command_states, player_flags=player_flags,
@@ -712,7 +679,7 @@ class Encoder:
         from unit_tasks import encode
         # Unit-task coordinates remain native world coordinates in the
         # transport snapshot; this helper rotates them exactly once.
-        encode(self.config, observation, encoded, rotated=rotated, types=self.types)
+        encode(self.config, observation, encoded, rotated=rotated)
         return encoded
 
 
@@ -797,14 +764,11 @@ class NeuralPolicy:
         for name in ('entity_command_ready', 'entity_command_charging', 'entity_command_progress'):
             w(name+'_embedding', (len(config['commands'])+1, e), .5)
             self.parameters[name+'_embedding'].data[0] = 0
-        from unit_tasks import NUMERIC, RELATIONS, RELATION_FEATURES, COMMAND_FEATURES, VALIDATION_COLUMNS
+        from unit_tasks import NUMERIC, RELATIONS, RELATION_FEATURES
         w('task_w', (NUMERIC, d), .5)
-        self.parameters['task_w'].data[list(VALIDATION_COLUMNS)] = 0
         for role in RELATIONS:
             w('task_'+role+'_w', (d, d), .25)
             w('task_'+role+'_features_w', (RELATION_FEATURES, d), .25)
-        self.parameters['task_validation_target_w'].data[:] = 0
-        self.parameters['task_validation_target_features_w'].data[:] = 0
         # Group transformer (plan Â§1b): per layer and query group, one self- and three cross-attention
         # blocks with their own weights, concatenated into the group's FC; pre-norm, per-group FFN.
         groups = token_groups(config)
@@ -843,8 +807,6 @@ class NeuralPolicy:
         # Scalars (plan Â§1e): every scalar input concatenated, FC-ReLU, FC-ReLU. The task validation
         # receipt starts with no effect, as its entity counterpart (task_w's validation columns).
         w('scalar_in_w', (scalar_input_size(config), W['scalar']), math.sqrt(2)); b('scalar_in_b', W['scalar'])
-        rows = scalar_input_slices(config)
-        self.parameters['scalar_in_w'].data[rows['task_validation'].start:rows['task_validation_template'].stop] = 0
         w('scalar_hidden_w', (W['scalar'], W['scalar_out']), math.sqrt(2)); b('scalar_hidden_b', W['scalar_out'])
         # Core: FC-ReLU, then a residual LSTM of LSTM_LAYERS layer-normed layers (AlphaStar's internals).
         pooled = len(GROUPS)*W['pool_queries']*inner
@@ -1274,16 +1236,16 @@ class NeuralPolicy:
         The stored arrays hold no per-unit prerequisites, so this is a superset of the exact
         choices; the teacher's object is always in it (test_alphagenerals)."""
         config = self.config
-        numeric, extra = np.asarray(encoded['numeric']), np.asarray(encoded['extra_numeric'])
+        numeric, ready = np.asarray(encoded['numeric']), np.asarray(encoded['production_ready'])
         own = np.asarray(encoded['own'], dtype=bool)
-        complete = own & (numeric[:, 9] > .5)
-        alive = complete & (numeric[:, 3] > 0)
+        complete = own & (numeric[:, CONSTRUCTED_COLUMN] > .5)
+        alive = complete & (numeric[:, HEALTH_COLUMN] > 0)
         types = np.asarray(encoded['types'])
         index = self._template_positions
         masks = {}
-        for kind, column in (('build', 2), ('train', 3)):
+        for kind, column in (('build', 0), ('train', 1)):
             mask = np.zeros(len(config['templates']), dtype=bool)
-            for t in np.unique(types[complete & (extra[:, column] > 0)]):
+            for t in np.unique(types[complete & ready[:, column]]):
                 mask[[index[name] for name in self._production_menu(config['types'][t], kind) if name in index]] = True
             masks[kind] = mask
         ids, states = np.asarray(encoded['entity_commands'])[alive], np.asarray(encoded['entity_command_states'])[alive]
@@ -1454,18 +1416,14 @@ class NeuralPolicy:
         # Known from the lobby in fair play. (0, 0) is the unknown row.
         faction, general = encoded.get('enemy_identity', (0, 0))
         enemy = p['base_faction_embedding'][faction]+p['general_embedding'][general]
-        counts = np.bincount(np.asarray(encoded['types'])[:len(encoded['entities'])], minlength=len(self.config['types']))
-        opener = encoded['opener'] if 'opener' in encoded else np.zeros(len(self.config['templates'])+1)
+        own, seen, types = unit_counts(encoded)
+        size = len(self.config['types'])
         parts = [Tensor(np.asarray(encoded['scalars'], dtype=float)), identity, enemy,
                  # Set per game by the dataset or the live actor; absent means both unrated.
                  Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)),
-                 Tensor(np.asarray(encoded.get('apm', UNKNOWN_APM), dtype=float)), Tensor(np.asarray(opener, dtype=float)),
-                 Tensor(encoded['player_flags']), Tensor(np.sqrt(counts)),
+                 Tensor(np.asarray(encoded.get('apm', UNKNOWN_APM), dtype=float)), Tensor(encoded['player_flags']),
+                 Tensor(np.sqrt(np.bincount(types[own], minlength=size))), Tensor(np.sqrt(np.bincount(types[seen], minlength=size))),
                  Tensor(np.asarray(self.verb_mask(encoded), dtype=float))]
-        commands = visible_task_commands(encoded['task_commands'])
-        for i in range(2):  # The last command receipt, then the last validation receipt.
-            template = self.type_embedding(encoded['task_command_templates'][i:i+1])[0]
-            parts += [Tensor(commands[i]), template*float(encoded['task_command_template_present'][i])]
         x = (concatenate(parts) @ p['scalar_in_w']+p['scalar_in_b']).relu()
         return (x @ p['scalar_hidden_w']+p['scalar_hidden_b']).relu()
 

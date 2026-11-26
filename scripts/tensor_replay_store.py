@@ -14,11 +14,10 @@ import numpy as np
 from prepared_io import COMMON_FIELDS, _dtype, _json_bytes
 
 VERSION = 1
-ARRAY_FIELDS = ('numeric', 'extra_numeric', 'types', 'queue_units', 'queue_upgrades',
+ARRAY_FIELDS = ('numeric', 'extra_numeric', 'production_ready', 'types', 'queue_units', 'queue_upgrades',
                 'cells', 'own', 'map_visibility', 'scalars', 'player_identity',
                 'map_static', 'low', 'span', 'build_mask', 'build_signature', 'build_features',
                 'task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features',
-                'task_commands', 'task_command_templates', 'task_command_template_present',
                 'entity_upgrades', 'entity_commands', 'entity_command_states', 'player_flags', 'purchasable_sciences',
                 'effect_numeric', 'effect_types', 'effect_powers')
 MASK_FIELDS = ('owners', 'visible', 'verb', 'actor', 'unit_masks', 'target',

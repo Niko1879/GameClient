@@ -11,7 +11,7 @@ import numpy as np
 from event_schedule import canonical_frame, native_deadline
 from generals_identity import vanilla_china_production
 from generals_policy import (ARCHITECTURE, OBSERVATION_VERSION, PLAY_APM, PLAY_RATING, UNRATED, apm_inputs, initial_home,
-                             opener_inputs, rating_inputs)
+                             rating_inputs)
 from nn_numpy import no_grad
 from replay_sequences import normalize_demonstration
 
@@ -157,8 +157,6 @@ class EventActor:
         # games (rated flag off) since 7 Nov 2026; models from before saw only
         # rated matches, so pass None only to a model trained with them.
         self.ratings = rating_inputs(PLAY_RATING, PLAY_RATING)
-        # Strategy input z: no opener unless configure_opener names one; persists across reset().
-        self.opener = None
         self.look_ticks = LOOK_TICKS
         self.apm = apm_inputs(PLAY_APM)
         log = os.environ.get(DECISION_LOG_ENV)
@@ -194,12 +192,6 @@ class EventActor:
         None marks a side unrated (rated flag off); pass it only to a model
         trained with unrated matches (selection since 7 Nov 2026)."""
         self.ratings = rating_inputs(own, opponent)
-
-    def configure_opener(self, templates=None):
-        """The opener to follow: policy template indices of OPENER_BUILDINGS build orders
-        (openers.named_templates), or None for none. Shown only in the opening window, as in training."""
-        opener_inputs(self.policy.config, templates)  # validates
-        self.opener = None if templates is None else list(templates)
 
     def configure_apm(self, apm=PLAY_APM):
         """The pace to play at, as the model's APM input (commands per minute); None is unknown."""
@@ -259,7 +251,6 @@ class EventActor:
         rated = self.policy.config.get('rating_input', False) or getattr(self.policy, 'rating_input', False)
         encoded['ratings'] = self.ratings if rated else UNRATED
         encoded['apm'] = self.apm
-        encoded['opener'] = opener_inputs(self.policy.config, self.opener, frame/60)
         if self.policy.config['placement_mode'] == 'full_mask':
             if not hasattr(self, 'placement_query'):
                 raise ValueError('Placement-aware event actor needs a placement-capable environment')

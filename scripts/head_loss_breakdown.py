@@ -5,7 +5,7 @@ click cell, click offset, ...), split by action, order kind, game minute and rat
 train/validation gap; and, with an early and a final checkpoint, which heads still moved (still learnable)
 versus which stayed flat (likely the noise floor of human play given what the model sees).
 
-Rows come from the bundle's dataset manifest through event_dataset.EventDataset, so ratings, openers and enemy
+Rows come from the bundle's dataset manifest through event_dataset.EventDataset, so ratings, APM and enemy
 identity are exactly as in training; the loss is train_events.loss_terms over the trainer's own teacher_heads,
 so a row's summed terms equal its training loss (mean over a whole split = report.json's mean_nll).
 Each row is scored alone (the core's state is not carried), which is exact for a memory-free core and is the
