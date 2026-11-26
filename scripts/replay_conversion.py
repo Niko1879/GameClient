@@ -343,7 +343,9 @@ def due(db,pipeline,match_keys=None):
 def job_directory(job,identity):
     sha=job['replay_sha256']
     if len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):raise ValueError('Invalid replay SHA-256')
-    return WORK/'jobs'/(identity['pipeline'][:16]+'-'+sha)
+    # Short on purpose: the engine names its export after the replay inside this folder with ANSI file APIs, so the
+    # whole path must stay under MAX_PATH (260). The old 81-character name blocked 496 long special replays (24 Nov).
+    return WORK/'jobs'/(identity['pipeline'][:8]+'-'+sha[:32])
 
 
 def remove_owned(path,root=WORK):

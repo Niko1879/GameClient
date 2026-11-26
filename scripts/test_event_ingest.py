@@ -31,7 +31,7 @@ class IngestTests(unittest.TestCase):
             proof = dict(path=str(export), original_replay=str(raw), sha256=_digest(export),
                 replay_sha256=_digest(raw), match_key=match, audit=dict(observation_policy_version=11, placement_mode='fast'))
             self.proofs[str(export)] = proof
-            self.games[str(export)] = dict(path=str(export), player=2, map=terrain, source_ticks_per_second=60,
+            self.games[str(export)] = dict(path=str(export), player=2, map=terrain, source_ticks_per_second=60, replay_sha256=proof['replay_sha256'],
                 rows=[raw_row(0, obs), raw_row(30, obs, [{'kind':'stop','units':[10]}]), raw_row(60, obs, terminal=True)])
             self.entries.append(dict(trajectory=str(export), sha256=proof['sha256'],
                 replay_sha256=proof['replay_sha256'], match_key=match, split='train'))

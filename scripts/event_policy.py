@@ -1,15 +1,16 @@
-"""Event policy configuration and the deadline-driven deployed actor."""
+"""Event policy configuration and the deployed actor, which looks at a fixed interval."""
 from __future__ import annotations
 
 from collections import Counter
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 
 from event_schedule import canonical_frame, native_deadline
 from generals_identity import vanilla_china_production
-from generals_policy import (ARCHITECTURE, OBSERVATION_VERSION, PLAY_RATING, UNRATED, TemplateTable, initial_home,
+from generals_policy import (ARCHITECTURE, OBSERVATION_VERSION, PLAY_APM, PLAY_RATING, UNRATED, TemplateTable, apm_inputs, initial_home,
                              opener_inputs, rating_inputs)
 from nn_numpy import no_grad
 from replay_sequences import normalize_demonstration
@@ -38,8 +39,9 @@ def default_config(vocabulary, placement_mode='fast'):
               # Widths are model-only and never change shard columns; the rest are generals_policy.WIDTHS.
               'embedding': 64, 'map_side': 16, 'map_hidden': 128, 'max_group': 64,
               'position_bins': 256, 'angle_bins': 16,
-              'event_max_delay': 120, 'delay_ticks': list(range(1, 121)), 'event_observation_ms': 100,
-              'variant_l2': 1e-4, 'delay_loss_weight': .2,
+              # The exporter's quiet grid, and how many no-op snapshots a second the shards store.
+              'event_observation_ms': 100, 'snapshot_rate': .5,
+              'variant_l2': 1e-4,
               'argument_loss_weights': {'verb': 2.0, 'unit': .5, 'target': .5,
                                         'template': 1.0, 'command': 1.0, 'slot': 1.0,
                                         'cell': .75, 'offset': .5, 'angle': .1}}
@@ -104,8 +106,49 @@ def science_buyer(faction):
     return buyer
 
 
+# Live play's default look interval (canonical ticks): 200 ms. Nothing about it is learned.
+LOOK_TICKS = 12
+# At most ten orders a second, whatever the look interval.
+MIN_ORDER_TICKS = 6
+# A file each actor appends one line per look to (play_headed --decisions); unset: no log.
+DECISION_LOG_ENV = 'GENERALS_DECISION_LOG'
+
+
+def decision_line(frame, actions, trace):
+    """One look, roughly: game time, P(act) at this look, and no-op or the order."""
+    seconds = frame/60
+    acting = trace.get('act_probability')
+    head = '%02d:%04.1f  p(act) %s  ' % (seconds//60, seconds % 60, '  -  ' if acting is None else '%.3f' % acting)
+    if not actions:
+        return head+('no-op (no placement)' if trace.get('placement_unavailable') else 'no-op')+top_orders(trace)
+    order = actions[0]
+    parts = [order['kind']]
+    for key in ('template', 'command'):
+        if isinstance(order.get(key), str):
+            parts.append(order[key])
+    units = order.get('units')
+    parts.append('%d unit%s' % (len(units), '' if len(units) == 1 else 's') if units else '')
+    if 'target' in order:
+        parts.append('-> unit %s' % order['target'])
+    elif 'position' in order or 'x' in order:
+        parts.append('-> point')
+    return head+'  '.join(part for part in parts if part)+top_orders(trace)
+
+
+def top_orders(trace):
+    """The look's likeliest orders (NeuralPolicy._top_orders) on a second line, or nothing."""
+    top = trace.get('top')
+    return '\n           top: '+',  '.join('%s %.*f%%' % (name, 1 if p < .1 else 0, 100*p) for name, p in top) if top else ''
+
+
 class EventActor:
-    """One instance per player, sharing immutable weights during collection."""
+    """One instance per player, sharing immutable weights during collection.
+
+    The actor looks every look_ticks and decides each time whether to act (notes/wait_snapshots.md).
+    Training rows are every command but only a known rate of no-op moments, so the pace they imply is
+    rate x P(act)/P(no-op) orders a second, and a look acts with that pace x the time since the last look
+    (NeuralPolicy.decide). The core memory advances at
+    rows, as in training: at an order, and at a no-op look with probability rate x time."""
     def __init__(self, policy, seed=1, deterministic=False, science=None):
         self.policy, self.rng, self.deterministic = policy, np.random.default_rng(seed), deterministic
         self.science = science if science is not None else ScienceBuyer()
@@ -116,17 +159,24 @@ class EventActor:
         self.ratings = rating_inputs(PLAY_RATING, PLAY_RATING)
         # Strategy input z: no opener unless configure_opener names one; persists across reset().
         self.opener = None
+        self.look_ticks = LOOK_TICKS
+        self.apm = apm_inputs(PLAY_APM)
+        log = os.environ.get(DECISION_LOG_ENV)
+        self.decision_log = open(log, 'a', encoding='utf-8', buffering=1) if log else None
+        if log:
+            policy.explain = True  # decide adds the top orders to the trace (decision_line)
         self.reset()
 
     def reset(self):
-        self.previous_frame = None
+        # The last committed row's frame, the last look's frame and the next look's.
+        self.previous_frame = self.last_look = None
         self.next_decision_frame = 0
         self.home_position = None
         self.rate = 60
         self.enemy_identity = (0, 0)
         self.counters = Counter()
         self.last = {}
-        # The policy's core LSTM state, carried from this player's previous decision (None: game start).
+        # The policy's core LSTM state at this player's last committed row (None: game start).
         self.memory = None
         # The game's weapon/armour stats (generals_policy.TemplateTable), built from every observation.
         self.templates = None
@@ -153,6 +203,17 @@ class EventActor:
         opener_inputs(self.policy.config, templates)  # validates
         self.opener = None if templates is None else list(templates)
 
+    def configure_apm(self, apm=PLAY_APM):
+        """The pace to play at, as the model's APM input (commands per minute); None is unknown."""
+        self.apm = apm_inputs(apm)
+
+    def configure_look(self, milliseconds=1000*LOOK_TICKS/60):
+        """Game time between looks: reaction time and compute. 100-200 ms by design."""
+        ticks = round(milliseconds*60/1000)
+        if not 1 <= ticks <= 60:
+            raise ValueError('The look interval must be in 17..1000 ms')
+        self.look_ticks = ticks
+
     @property
     def next_deadline_native(self):
         return native_deadline(self.next_decision_frame, self.rate)
@@ -169,6 +230,27 @@ class EventActor:
         if frame < self.next_decision_frame:
             self.counters['skipped_inferences'] += 1
             return bought
+        return self._look(bought, observation, terrain, frame)
+
+    def _look(self, bought, observation, terrain, frame):
+        encoded = self._encode(observation, terrain, frame)
+        elapsed = self.look_ticks if self.last_look is None else frame-self.last_look
+        # Snapshots the training rows would hold in this time: the action rate, and the memory's commit rate.
+        expected = self.policy.snapshot_rate*elapsed/60
+        with no_grad():
+            actions, trace, memory, value, logp, entropy = self.policy.decide(
+                encoded, self.memory, rng=self.rng, deterministic=self.deterministic, snapshots=expected)
+        self.last_look = frame
+        self.next_decision_frame = frame + (max(self.look_ticks, MIN_ORDER_TICKS) if actions else self.look_ticks)
+        if actions or self.rng.random() < expected:
+            self.memory, self.previous_frame = memory, frame
+            self.counters['memory_commits'] += 1
+        self._decided(encoded, trace, frame, actions, value, logp, entropy)
+        if self.decision_log is not None:
+            self.decision_log.write(decision_line(frame, actions, trace)+'\n')
+        return bought + actions
+
+    def _encode(self, observation, terrain, frame):
         observation = normalize_demonstration({'frame': 0, 'hold_ticks': 0,
             'observation': observation}, self.rate)['observation']
         if self.home_position is None:
@@ -182,22 +264,20 @@ class EventActor:
         # config does not record; evaluate_events --rating-input).
         rated = self.policy.config.get('rating_input', False) or getattr(self.policy, 'rating_input', False)
         encoded['ratings'] = self.ratings if rated else UNRATED
+        encoded['apm'] = self.apm
         encoded['opener'] = opener_inputs(self.policy.config, self.opener, frame/60)
         encoded.update(self.templates.arrays())
         if self.policy.config['placement_mode'] == 'full_mask':
             if not hasattr(self, 'placement_query'):
                 raise ValueError('Placement-aware event actor needs a placement-capable environment')
             encoded['placement_query'] = self.placement_query
-        with no_grad():
-            actions, trace, self.memory, value, logp, entropy = self.policy.decide(
-                encoded, self.memory, rng=self.rng, deterministic=self.deterministic)
-        self.previous_frame = frame
-        self.next_decision_frame = frame + self.policy.config['delay_ticks'][trace['delay']]
+        return encoded
+
+    def _decided(self, encoded, trace, frame, actions, value, logp, entropy):
         self.counters['decisions'] += 1
         self.counters['commands' if actions else 'defers'] += 1
         self.last = {'encoded': encoded, 'trace': trace, 'frame': frame,
                      'value': float(value.data), 'logp': float(logp.data), 'entropy': float(entropy.data)}
-        return bought + actions
 
     def feedback(self, feedback):
         for result in feedback:

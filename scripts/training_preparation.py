@@ -10,9 +10,8 @@ import os
 
 import numpy as np
 
-from event_schedule import delay_mask
 from generals_policy import (ARMS_FEATURES, DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, MAP_POOL, SCATTER_SCALE, UNIT_GROUPS,
-                             UNRATED, NeuralPolicy, arms_inputs, coarse_pixels, command_target, count_channels, derived_inputs,
+                             UNKNOWN_APM, UNRATED, NeuralPolicy, arms_inputs, coarse_pixels, command_target, count_channels, derived_inputs,
                              pool_grid, unit_groups, visible_scalars,
                              visible_task_commands)
 from training_legality import cached_legality
@@ -172,6 +171,8 @@ def encode_values(spec, encoded):
         'identities': ([row['player_identity'] for row in encoded], 'int64'),
         'enemy_identities': ([row.get('enemy_identity', (0, 0)) for row in encoded], 'int64'),
         'ratings': (np.stack([np.asarray(row.get('ratings', UNRATED) if rated else UNRATED, dtype=spec.float_dtype) for row in encoded]), 'float'),
+        # The player's own pace (generals_policy.apm_inputs), set per row by event_dataset; absent means unknown.
+        'apm': (np.stack([np.asarray(row.get('apm', UNKNOWN_APM), dtype=spec.float_dtype) for row in encoded]), 'float'),
         # Strategy input z (generals_policy.opener_inputs), set per row by event_dataset; absent means none.
         'opener': (np.stack([np.asarray(row['opener'], dtype=spec.float_dtype) if 'opener' in row else no_opener
                              for row in encoded]), 'float')}
@@ -180,13 +181,21 @@ def encode_values(spec, encoded):
     effect_numeric = np.zeros((batch, effects, EFFECT_FEATURES), dtype=spec.float_dtype)
     effect_types, effect_powers = np.zeros((batch, effects), dtype=np.int64), np.zeros((batch, effects), dtype=np.int64)
     effect_valid = np.zeros((batch, effects), dtype=bool)
+    # Where each effect is painted when effects go on the map (network_alphastar effect_image): its pixel on
+    # the entities' scatter grid; effects without a position (column 3 clear) are not painted.
+    effect_pixels, effect_placed = np.zeros((batch, effects), dtype=np.int64), np.zeros((batch, effects), dtype=spec.float_dtype)
     for index, row in enumerate(encoded):
         length = len(row['effect_numeric'])
         effect_numeric[index, :length] = row['effect_numeric']
         effect_types[index, :length], effect_powers[index, :length] = row['effect_types'], row['effect_powers']
         effect_valid[index, :length] = True
+        if length:
+            grid = np.clip((np.asarray(row['effect_numeric'])[:, :2]*side).astype(np.int64), 0, side-1)
+            effect_pixels[index, :length] = coarse_pixels(grid[:, 1]*side+grid[:, 0], side)
+            effect_placed[index, :length] = np.asarray(row['effect_numeric'])[:, 3] > 0
     values.update(effect_numeric=(effect_numeric, 'float'), effect_types=(effect_types, 'int64'),
-                  effect_powers=(effect_powers, 'int64'), effect_valid=(effect_valid, 'bool'))
+                  effect_powers=(effect_powers, 'int64'), effect_valid=(effect_valid, 'bool'),
+                  effect_pixels=(effect_pixels, 'int64'), effect_placed=(effect_placed, 'float'))
     # unit_tasks fills task inputs only for owned entities; every other
     # row is zero and adds exactly nothing. Stage owned rows compactly,
     # with relation targets as flat (row*count+entity) indices.
@@ -241,9 +250,6 @@ def teacher_plan(spec, encoded, teachers, entity_count):
     actions = [reference.action_choice(t) for t in teachers]
     categorical('decision', [reference.action_mask(row, mask['verb']) for row, mask in zip(encoded, masks)], actions)
     add('actions', actions)
-    delay_masks = [delay_mask(config, row.get('event_rate', 60)) for row in encoded]
-    choices = [t.get('delay', int(np.flatnonzero(mask)[0])) for t, mask in zip(teachers, delay_masks)]
-    categorical('event_delay', delay_masks, choices)
     command_rows = np.asarray([i for i, target in enumerate(teachers) if target['kind'] != 'wait'], dtype=np.int64)
     add('command_rows', command_rows)
     plan = {'values': values, 'categories': categories, 'command_rows': command_rows,
@@ -318,7 +324,7 @@ def teacher_plan(spec, encoded, teachers, entity_count):
 def head_counts(plan):
     """Scored tokens per row and head: the loss averages each argument head over its tokens."""
     batch = plan['batch']
-    counts = {'decision': np.ones(batch, dtype=int), 'delay': np.ones(batch, dtype=int)}
+    counts = {'decision': np.ones(batch, dtype=int)}
     for name, rows in plan['categories'].items():
         if name != 'decision':
             np.add.at(counts.setdefault(name, np.zeros(batch, dtype=int)), rows, 1)
@@ -332,6 +338,25 @@ def acting_general(row):
     return GENERALS[identity[1]] if identity is not None else '<unknown>'
 
 
+# A delay shorter than one canonical tick (same-tick orders) counts as one tick: the rate stays finite.
+MIN_DELAY_TICKS = 1
+
+
+def pace_plan(plan, rows):
+    """network='paced': each row's own order rate (per second; the play default when unknown) and the pace head's
+    rows (orders with a known own pace) with their delay to the next order in seconds and whether it was observed
+    (False: at least that long; event_dataset.delay_targets)."""
+    from generals_policy import PLAY_APM
+    rate = np.asarray([(row.get('apm') or PLAY_APM)/60 for row in rows])
+    scored = [i for i, row in enumerate(rows) if row.get('delay') and row.get('apm')]
+    delay = np.asarray([max(rows[i]['delay'][0], MIN_DELAY_TICKS)/60 for i in scored], dtype=float)
+    observed = np.asarray([float(rows[i]['delay'][1]) for i in scored], dtype=float)
+    plan['values'].update(order_rate=(rate, 'float'), pace_rows=(np.asarray(scored, dtype=np.int64), 'int64'),
+                          pace_delay=(delay, 'float'), pace_observed=(observed, 'float'))
+    if scored:
+        plan['categories']['pace'] = np.asarray(scored, dtype=np.int64)
+
+
 def prepare_update(spec, rows, pair_budget):
     """Everything an update needs from the CPU, independent of the learner's device."""
     parts = []
@@ -339,8 +364,11 @@ def prepare_update(spec, rows, pair_budget):
         encoded = [row['encoded'] for row in micro]
         values, numeric = encode_values(spec, encoded)
         teachers = [row['target'] for row in micro]
+        plan = teacher_plan(spec, encoded, teachers, numeric.shape[1])
+        if spec.config.get('network') == 'paced':
+            pace_plan(plan, micro)
         parts.append({'values': values, 'numeric': numeric,
-                      'plan': teacher_plan(spec, encoded, teachers, numeric.shape[1]),
+                      'plan': plan,
                       # Sequence training: each row's lane and step in its update (plan §2).
                       'lanes': np.asarray([row.get('lane', -1) for row in micro], dtype=np.int64),
                       'steps': np.asarray([row.get('step', -1) for row in micro], dtype=np.int64),

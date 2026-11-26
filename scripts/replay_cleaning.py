@@ -78,13 +78,22 @@ GENTOOL = ROOT/'replays/gentool'
 # sidecars as CORPUS, so they scan like it.
 CHINA_GENERALS = ROOT/'replays/china-generals'
 GENTOOL_RATING = None
+# Expert players' own folders (retail_conversion.SPECIAL): special/<download>/<player>/*.rep; _screened/ is never
+# scanned. Rated like the archive here; real ratings come from expert-accounts.csv where the user confirmed them.
+SPECIAL = ROOT/'replays/special'
+
+
+def special_files():
+    return sorted(p for p in SPECIAL.glob('*/*/*.rep') if p.parts[-3] != '_screened')
 
 
 def archive_source(path):
-    """'gamereplays', 'gentool' or None for a replay path."""
+    """'gamereplays', 'gentool', 'special' or None for a replay path."""
     parent = Path(path).resolve().parent
     if parent in (ARCHIVE.resolve(), ARCHIVE3.resolve()):
         return 'gamereplays'
+    if parent.parent.parent == SPECIAL.resolve() and parent.parent.name != '_screened':
+        return 'special'
     return 'gentool' if parent.parent == GENTOOL.resolve() else None
 METRICS = ROOT/'replays/catalog/cleaning-metrics.jsonl'
 # scripts/rating_estimator.py joint: one row per player of every scanned match.
@@ -328,7 +337,7 @@ def scan(args):
     paths = sorted(Path(args.corpus).glob('*/*.rep'))
     if Path(args.corpus).resolve() == CORPUS.resolve() and ARCHIVE.is_dir():
         paths += (sorted(ARCHIVE.glob('*.rep')) + sorted(ARCHIVE3.glob('*.rep')) + sorted(GENTOOL.glob('*/*.rep'))
-                  + sorted(CHINA_GENERALS.glob('*/*.rep')))
+                  + sorted(CHINA_GENERALS.glob('*/*.rep')) + special_files())
     if args.limit:
         paths = paths[:args.limit]
     output = Path(args.output)

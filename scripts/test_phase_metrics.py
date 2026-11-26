@@ -9,7 +9,7 @@ class PhaseMetricTests(unittest.TestCase):
     def test_source_frames_map_to_game_minute_buckets(self):
         self.assertEqual(phase({'frame': 0, 'source_ticks_per_second': 60}), '00-05')
         self.assertEqual(phase({'frame': 60*60*12, 'source_ticks_per_second': 60}), '10-15')
-        self.assertEqual(phase({'frame': 30*60*12, 'source_ticks_per_second': 30}), '10-15')
+        self.assertEqual(phase({'frame': 60*60*12, 'source_ticks_per_second': 30}), '10-15')
         self.assertEqual(phase({'frame': 60*60*45, 'source_ticks_per_second': 60}), '30+')
 
     def test_summary_reports_each_phase_and_keeps_overall_metrics(self):

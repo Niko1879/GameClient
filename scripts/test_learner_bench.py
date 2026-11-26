@@ -10,19 +10,19 @@ from event_dataset import EventDataset
 from event_store import write_shard
 from generals_policy import NeuralPolicy
 from prepared_io import _write_json
-from test_fixtures import fixture, raw_row
+from test_fixtures import RECORDING, fixture, raw_row
 from train_events import EventLearner
 import learner_bench
 
 
 class LearnerBenchTests(unittest.TestCase):
-    def dataset(self, root):
+    def dataset(self, root, splits=('train', 'train', 'validation')):  # One training game per lane.
         config, obs, terrain = fixture()
         policy = NeuralPolicy(config, 5)
         rows = [raw_row(0, obs)]+[raw_row(f, obs, [{'kind': 'stop', 'units': [10]}]) for f in range(30, 331, 30)]
-        game = {'rows': rows, 'map': terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         entries = []
-        for index, split in enumerate(('train', 'validation')):
+        for index, split in enumerate(splits):
             name = f'shards/{index}.zip'
             result = write_shard(root/name, [game], policy, {'match_key': f'test:{index}', 'path': 'absent'})
             entries.append({**result, 'path': name, 'match_key': f'test:{index}', 'split': split})
@@ -125,7 +125,7 @@ class LearnerBenchTests(unittest.TestCase):
     def test_splits_keep_the_checkpoint_dataset_order(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            policy = self.dataset(root)
+            policy = self.dataset(root, ('train', 'validation'))
             dataset = EventDataset(root/'dataset.json')
             learner = EventLearner(policy)
             learner.save(root/'best.npz', {'event_dataset_sha256': dataset.digest, 'event_match_partitions':

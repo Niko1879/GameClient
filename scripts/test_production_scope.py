@@ -16,7 +16,7 @@ from generals_identity import hierarchy_config, vanilla_china_production
 from generals_policy import NeuralPolicy, Unrepresentable
 from prepared_io import _write_json
 from replay_events import decisions, encoded_events
-from test_fixtures import SMALL, observation_fixture
+from test_fixtures import RECORDING, SMALL, observation_fixture
 
 
 class ProductionScopeTests(unittest.TestCase):
@@ -93,7 +93,7 @@ class ProductionScopeTests(unittest.TestCase):
         self.assertEqual(played['template'],'Nuke_ChinaVehicleDozer')
         rows=[self.row(0,[action]),self.row(30,[action])]
         for row in rows: row['observation']=obs
-        counts=Counter(); events=list(decisions(rows,self.config,counts))
+        counts=Counter(); events=list(decisions(rows,self.config,counts,lambda frame: True))
         self.assertEqual([event['source']['frame'] for event in events],[0,30])
         self.assertEqual(counts['truncated:production_scope'],0)
 
@@ -103,16 +103,14 @@ class ProductionScopeTests(unittest.TestCase):
         encoded=self.policy.encoder.encode(obs,self.terrain,0)
         self.assertFalse(self.policy.actor_mask(encoded,'train').any())
 
-    def test_foreign_production_ends_episode_and_censors_final_delay(self):
+    def test_foreign_production_ends_episode(self):
         stop=[dict(kind='stop',units=[10])]
         train=[dict(kind='train',producer=20,template='ChinaVehicleDozer')]
         for foreign in (dict(kind='train',producer=30,template='GLATankScorpion'),
                         dict(kind='build',builder=32,template='AmericaPowerPlant',position=[300,400,0])):
             rows=[self.row(0,stop),self.row(30,train),self.row(60,[foreign]),self.row(90,stop)]
-            counts=Counter(); events=list(decisions(rows,self.config,counts))
+            counts=Counter(); events=list(decisions(rows,self.config,counts,lambda frame: True))
             self.assertEqual([event['source']['frame'] for event in events],[0,30])
-            self.assertEqual(events[0]['delay_ticks'],30)
-            self.assertIsNone(events[1]['delay_ticks'])
             self.assertEqual(counts['excluded:production_scope'],1)
             self.assertEqual(counts['truncated:production_scope'],1)
             self.assertEqual(counts['production_scope_cutoff_frame'],60)
@@ -125,9 +123,8 @@ class ProductionScopeTests(unittest.TestCase):
                                     ([foreign],[dict(name='unsupported')])):
             row=self.row(10,actions); row['unsupported']=unsupported
             counts=Counter()
-            events=list(decisions([self.row(0,[stop]),row,self.row(60,[stop])],self.config,counts))
+            events=list(decisions([self.row(0,[stop]),row,self.row(60,[stop])],self.config,counts,lambda frame: True))
             self.assertEqual([event['source']['frame'] for event in events],[0])
-            self.assertIsNone(events[0]['delay_ticks'])
             self.assertEqual(counts['truncated:production_scope'],1)
 
     def test_first_event_cutoff_does_not_consume_or_encode_the_suffix(self):
@@ -136,7 +133,7 @@ class ProductionScopeTests(unittest.TestCase):
             raise AssertionError('Consumed replay beyond its production cutoff')
         counts=Counter()
         self.assertEqual(list(encoded_events(self.policy,dict(rows=rows(),map=self.terrain,
-            source_ticks_per_second=60,player=2),counts)),[])
+            source_ticks_per_second=60,player=2,replay_sha256=RECORDING),counts)),[])
         self.assertEqual(counts['production_scope_cutoff_frame'],0)
 
     def test_portable_shards_keep_scoped_targets_and_foreign_entities(self):
@@ -144,10 +141,10 @@ class ProductionScopeTests(unittest.TestCase):
               self.row(30,[dict(kind='train',producer=20,template='ChinaVehicleDozer')]),
               self.row(60,[dict(kind='train',producer=30,template='GLATankScorpion')]),
               self.row(90,[dict(kind='stop',units=[31])])]
-        game=dict(rows=rows,map=self.terrain,source_ticks_per_second=60,player=2)
+        game=dict(rows=rows,map=self.terrain,source_ticks_per_second=60,player=2,replay_sha256=RECORDING)
         other=dict(rows=[self.row(0,[dict(kind='stop',units=[31])]),
                          self.row(90,[dict(kind='stop',units=[31])])],
-                   map=self.terrain,source_ticks_per_second=60,player=3)
+                   map=self.terrain,source_ticks_per_second=60,player=3,replay_sha256=RECORDING)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
             result=write_shard(root/'shards/a.zip',[game,other],self.policy,dict(match_key='test:scope'))
@@ -164,7 +161,6 @@ class ProductionScopeTests(unittest.TestCase):
             self.assertEqual(sorted(row['frame'] for row in loaded if row['player']==3),[0,90])
             teacher=next(row for row in loaded if row['frame']==30)
             self.assertEqual(self.config['templates'][teacher['target']['template']],'ChinaVehicleDozer')
-            self.assertNotIn('delay',teacher['target'])
             mask=teacher['encoded']['_training_legality']
             self.assertFalse(mask['actor'][self.encoded['ids'][30]])
             self.assertEqual(len(mask['template']),len(self.config['templates']))
@@ -188,7 +184,7 @@ class ProductionScopeTests(unittest.TestCase):
               self.row(60,[dict(kind='train',producer=30,template='GLATankScorpion')]),
               self.row(90,[dict(kind='stop',units=[31])])]
         events=list(encoded_events(self.policy,dict(rows=rows,map=self.terrain,
-            source_ticks_per_second=60,player=2),Counter()))
+            source_ticks_per_second=60,player=2,replay_sha256=RECORDING),Counter()))
         learner=EventLearner(self.policy,device='cpu',threads=1)
         result=learner.batch(events,train=True)
         # The flat action holds one train and one build entry per scoped template (two here).

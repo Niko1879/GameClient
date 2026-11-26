@@ -52,7 +52,7 @@ class EarlyStoppingTests(unittest.TestCase):
 
     def run_loop(self,**changes):
         class Dataset:
-            config={'hidden':2};digest='dataset';key='feature';document={}
+            config={'hidden':2};digest='dataset';key='feature';document={};snapshot_rate=.5
             entries=[dict(match_key='t',split='train',index={'source':{}}),dict(match_key='v',split='validation',index={'source':{}})]
             def __init__(self,*unused):pass
             # One update per epoch (lane_schedule's length; batches stands in for the prepared stream).
@@ -155,7 +155,7 @@ class ValidationRoundTests(unittest.TestCase):
     """Mid-epoch validation over a fake 4-update epoch; validation loss depends only on the update count."""
     def run_training(self,root,scores=None,**changes):
         class Dataset:
-            config={'hidden':2};digest='dataset';key='feature';document={}
+            config={'hidden':2};digest='dataset';key='feature';document={};snapshot_rate=.5
             entries=[dict(match_key='t',split='train',index={'source':{}}),dict(match_key='v',split='validation',index={'source':{}})]
             def __init__(self,*unused):pass
             def lane_schedule(self,split,**unused):return iter(range(4))

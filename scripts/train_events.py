@@ -201,7 +201,7 @@ class DistributedRanks(SingleProcess):
 
 
 def phase(row):
-    minutes = row['frame']/row.get('source_ticks_per_second', 60)/60
+    minutes = row['frame']/3600  # Stored frames are canonical 60 Hz.
     low, high = next(bounds for bounds in PHASES if bounds[1] is None or minutes < bounds[1])
     return f'{low:02d}-{high:02d}' if high is not None else f'{low:02d}+'
 
@@ -229,9 +229,7 @@ def loss_terms(config, target, by_head, counts):
     terms = {}
     for name, logp in by_head.items():
         if name == 'decision':
-            factor = 1.0
-        elif name == 'delay':
-            factor = config.get('delay_loss_weight', .2) if 'delay' in target else 0.0
+            factor = 1
         else:
             factor = weights.get(name, 1)/max(int(counts[name]), 1)
         if factor and float(logp):
@@ -244,9 +242,7 @@ def event_losses(model, rows, output):
     weights = model.config.get('argument_loss_weights', {})
     factors = {}
     for name in output['by_head']:
-        if name == 'delay':
-            factors[name] = [model.config.get('delay_loss_weight', .2) if 'delay' in row['target'] else 0 for row in rows]
-        elif name != 'decision':
+        if name != 'decision':
             factors[name] = weights.get(name, 1)/np.maximum(output['head_counts'][name], 1)
     # One staged upload: a pageable copy per head waits for the GPU each time.
     staged = model.stager.stage({name: (value, 'float') for name, value in factors.items()}) if factors else {}
@@ -264,7 +260,7 @@ class EventLearner:
         # FP32 matmul/convolution. fp16/bf16: autocast of the encoder with FP32
         # master weights; fp16 adds dynamic loss scaling. The core LSTM and the heads stay FP32.
         import torch
-        from torch_policy_v3 import TorchPolicyV3
+        from torch_policy_v3 import torch_policy
         if (reference.config.get('architecture') != ARCHITECTURE or threads < 1 or pair_budget < 1
                 or precision not in PRECISIONS or (precision != 'fp32' and device != 'cuda')):
             raise ValueError('Invalid event learner configuration')
@@ -282,7 +278,7 @@ class EventLearner:
         self.torch, self.reference = torch, reference
         self.ranks = ranks or SingleProcess()
         self.outliers = []  # Extreme-loss decisions since train() last wrote them.
-        self.model = TorchPolicyV3(reference, device=device, dtype=torch.float32)
+        self.model = torch_policy(reference, device=device, dtype=torch.float32)
         self.parameter_list = list(self.model.parameters())
         if compile_encoder:
             # Fuses the encoder, where most launched ops are; the core and heads stay eager.
@@ -364,11 +360,11 @@ class EventLearner:
         if state is None or state[0][0].shape[0] != lanes:
             state = model.initial_state(lanes)
         parts = prepared['microbatches']
-        decisions, delays, losses_by_part, heads_by_part, counts_by_part = [], [], [], [], []
+        decisions, losses_by_part, heads_by_part, counts_by_part = [], [], [], []
         position_errors, wait_sums = [], []  # Validation only.
         norm = None
         with torch.set_grad_enabled(train):
-            encoded, places, encoders, pieces = [], [], [], []
+            encoded, places, encoders, pieces, positions = [], [], [], [], []
             for part in parts:
                 if 'ready' in part:  # Uploaded by StagedUpdates: a GPU-side wait, not a CPU one.
                     torch.cuda.current_stream(model.device).wait_event(part['ready'])
@@ -388,6 +384,8 @@ class EventLearner:
                     out = tuple(value.requires_grad_() for value in out)
                     encoders.append(encode)
                 encoded.append(out)
+                # Entity positions, read by the movement network's location head (network_alphastar.movement_context).
+                positions.append({'pixels': staged['scatter_pixels'], 'real': staged['real']})
                 places.append((model.indices(part['lanes']), model.indices(part['steps'])))
             if parts:
                 lane_index, step_index = (torch.cat(values) for values in zip(*places))
@@ -398,32 +396,32 @@ class EventLearner:
             if split is not None:
                 self.states[split] = [(h.detach(), c.detach()) for h, c in state]
             core_values = core.detach() if parts else None
-            for part, (lane, step), (_, keys, summary, spatial) in zip(parts, places, encoded):
+            for part, (lane, step), (_, keys, summary, spatial), position in zip(parts, places, encoded, positions):
                 rows, plan = part['rows'], part['plan']
                 rows_core = core_values[lane, step]
                 counts = head_counts(plan)
-                names = ['decision', 'delay']+[name for name in ('unit', 'slot', 'target', 'angle', 'cell', 'offset')
-                                               if name in plan['categories']]
+                names = ['decision']+[name for name in ('unit', 'slot', 'target', 'angle', 'cell', 'offset', 'pace')
+                                      if name in plan['categories']]
                 factors = model.stager.stage(loss_factors(model.config, rows, counts, names))
                 if train:
                     rows_core.requires_grad_()
-                    output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
+                    output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial, **position}, plan,
                                            loss_only=True)
                     losses = head_losses(model, rows, output['by_head'], None, factors)
-                    decision, delay = output['predictions'][0][2], output['predictions'][1][2]
+                    decision = output['predictions'][0][2]
                     by_head = {name: output['by_head'][name] for name in names}
                     self.scaler.scale(losses.sum()/rows_total).backward()
                     pieces.append(rows_core.grad)
                 else:
-                    output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial}, plan,
+                    output = teacher_heads(model, rows_core, {'keys': keys, 'summary': summary, 'map': spatial, **position}, plan,
                                            loss_only=True, position_metrics=True)
                     by_head = output['by_head']
                     losses = head_losses(model, rows, by_head, None, factors)
-                    decision, delay = output['predictions'][0][2], output['predictions'][1][2]
+                    decision = output['predictions'][0][2]
                     if 'position_errors' in output:
                         position_errors.append((part, *output['position_errors']))
                     wait_sums.append(output['wait_probability'].sum())
-                decisions.append(decision.detach()); delays.append(delay.detach())
+                decisions.append(decision.detach())
                 losses_by_part.append(losses.detach())
                 heads_by_part.append({name: value.detach() for name, value in by_head.items()})
                 counts_by_part.append(counts)
@@ -448,17 +446,17 @@ class EventLearner:
                 self.step_count += 1
                 totals['updates'] = 1
         if losses_by_part:
-            guesses = torch.cat([torch.stack([d, e]) for d, e in zip(decisions, delays)], dim=1).cpu().numpy()
+            guesses = torch.cat(decisions).cpu().numpy()
             # After the rows: the gradient norm.
             values = torch.cat(losses_by_part+([norm.reshape(1).to(losses_by_part[0].dtype)] if norm is not None else []))
         else:  # This rank's share of a small final update was empty; it still joined the update.
-            guesses = np.zeros((2, 0), dtype=np.int64)
+            guesses = np.zeros(0, dtype=np.int64)
             values = norm.reshape(1).float() if norm is not None else torch.zeros(0)
         values = values.cpu().numpy()
         start = 0
         for index, (part, row_losses) in enumerate(zip(parts, np.split(values, np.cumsum([len(p['rows']) for p in parts])))):
             rows = part['rows']
-            self._count(totals, rows, guesses[0, start:start+len(rows)], guesses[1, start:start+len(rows)], row_losses)
+            self._count(totals, rows, guesses[start:start+len(rows)], row_losses)
             self._outliers(totals, part, row_losses, (heads_by_part[index], counts_by_part[index]), train)
             start += len(rows)
             totals['microbatches'] += 1
@@ -494,14 +492,14 @@ class EventLearner:
                                {name: count[row] for name, count in counts.items()})
             self.outliers.append({'split': 'train' if train else 'validation', 'update': self.step_count,
                                   'match_key': source.get('match_key'), 'player': source.get('player'), 'frame': frame,
-                                  'minute': None if frame is None else frame/source.get('source_ticks_per_second', 60)/60,
+                                  'minute': None if frame is None else frame/3600,
                                   'rating': source.get('rating'), 'nll': float(row_losses[row]),
                                   'terms': terms, 'target': _plain(source['target']), 'after_update': bool(train)})
             totals['outliers'] += 1
             totals['outlier_loss_sum'] += float(row_losses[row])
 
-    def _count(self, totals, rows, predicted, delay_predictions, row_losses):
-        """Per-row decision/delay statistics of one microbatch, vectorised; same sums and order."""
+    def _count(self, totals, rows, predicted, row_losses):
+        """Per-row decision statistics of one microbatch, vectorised; same sums and order."""
         kinds = self.model.reference.kinds
         targets = [row['target'] for row in rows]
         labels = np.fromiter((kinds.index(t['kind']) for t in targets), dtype=np.int64, count=len(rows))
@@ -527,8 +525,7 @@ class EventLearner:
             totals['opener:'+status+':correct'] += int(hit)
         timed = np.fromiter((row['frame'] is not None for row in rows), dtype=bool, count=len(rows))
         if timed.any():  # prepared shards record each event's source frame
-            minutes = np.array([row['frame']/row.get('source_ticks_per_second', 60)/60
-                                for row, keep in zip(rows, timed) if keep])
+            minutes = np.array([row['frame']/3600 for row, keep in zip(rows, timed) if keep])
             buckets = np.searchsorted([bounds[1] for bounds in PHASES[:-1]], minutes, side='right')
             names = [f'{low:02d}-{high:02d}' if high is not None else f'{low:02d}+' for low, high in PHASES]
             # bincount adds in row order, as the per-row loop did.
@@ -545,14 +542,6 @@ class EventLearner:
                 totals[category] += int(members.sum())
                 totals[category+'_correct'] += int(hits[members].sum())
         totals.update('kind:'+t['kind'] for t in targets)
-        delayed = [i for i, t in enumerate(targets) if 'delay' in t]
-        totals['delay_labels'] += len(delayed)
-        if delayed:
-            ticks = np.asarray(self.model.config['delay_ticks'])
-            guess = delay_predictions[delayed].astype(np.int64)
-            label = np.array([targets[i]['delay'] for i in delayed])
-            totals['delay_abs_ticks'] += int(np.abs(ticks[guess]-ticks[label]).sum())
-            totals['delay_correct'] += int((guess == label).sum())
 
     @property
     def lr(self):
@@ -697,8 +686,7 @@ def summarize(counts):
             **({'wait_share': counts['defers']/max(1, counts['decisions']),
                 'expected_wait_share': counts['expected_defers']/max(1, counts['decisions'])}
                if 'expected_defers' in counts else {}),
-            'command_accuracy': counts['commands_correct']/max(1, counts['commands']),
-            'delay_mae_ticks': counts['delay_abs_ticks']/max(1, counts['delay_labels'])}
+            'command_accuracy': counts['commands_correct']/max(1, counts['commands'])}
 
 
 class EarlyStopping:
@@ -983,6 +971,8 @@ def train(args, ranks=None):
         optimizer = Adam(reference.parameters, args.lr)
     if feature_identity(reference) != dataset.key:
         raise ValueError('Event data use a different feature/label implementation')
+    # The no-op rows' rate after thinning, as live play reads it from the checkpoint (the pace report needs it).
+    reference.snapshot_rate = dataset.snapshot_rate
     learner = EventLearner(reference, optimizer, device=args.device, threads=args.threads, pair_budget=args.pair_budget,
                            precision=settings['precision'], compile_encoder=settings['compile'], ranks=ranks)
     if ranks.world > 1:  # Same seed or checkpoint: every rank must start from identical weights.
@@ -1011,6 +1001,8 @@ def train(args, ranks=None):
         raise ValueError('Event training implementation changed; start a separately identified run')
     metadata = {'event_dataset_sha256': dataset.digest, 'event_settings': settings,
                 'event_code': code_hashes, 'sources': source_proofs,
+                # Live play needs the rate after thinning (NeuralPolicy.load).
+                'event_snapshot_rate': dataset.snapshot_rate,
                 'deployment': dataset.document.get('deployment'), 'event_cursor': {}}
     metadata['event_match_partitions'] = {e['match_key']: e['split'] for e in dataset.entries}
     metadata['event_resource_limits'] = guard
@@ -1219,6 +1211,8 @@ def train(args, ranks=None):
                 break
             epoch += 1; cursor = 0; validations_done = 0
             publish(improved)
+            if leader:  # One kept checkpoint per epoch: later screens compare at equal budgets.
+                copy_checkpoint(latest, output/f'epoch{epoch}.npz')
     finally:
         if reader is not None:
             reader.close()

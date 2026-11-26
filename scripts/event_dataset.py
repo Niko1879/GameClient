@@ -15,7 +15,7 @@ import zipfile
 import numpy as np
 
 from event_store import SCHEMA
-from generals_policy import ARCHITECTURE, OPENER_WINDOW_SECONDS, UNRATED, opener_inputs, rating_inputs
+from generals_policy import ARCHITECTURE, OPENER_WINDOW_SECONDS, UNRATED, apm_inputs, opener_inputs, rating_inputs
 from openers import blanked
 from prepared_io import COMMON_FIELDS, _digest, _json_bytes
 from tensor_replay_store import ARRAY_FIELDS, LIST_FIELDS, MASK_FIELDS, decode_columns
@@ -93,6 +93,56 @@ def player_rating_inputs(ratings):
             for player, rating in ratings.items()}
 
 
+# The APM input: hidden for this share of player-games (so the model also plays without it) and for games with
+# too few commands to have a pace.
+APM_BLANK, APM_SALT, APM_MIN_COMMANDS = .15, 'apm-blank-v1', 50
+THINNING_SALT = 'noop-thinning-v1'
+# The pace target (network='paced', user 26 Nov): the delay from each order to the player's next one, capped like
+# AlphaStar's delay head (~6 s; longer gaps count as "at least the cap").
+DELAY_CAP = 360
+
+
+def episode_apm(episode):
+    """A player's retained commands per minute over the episode, or None below APM_MIN_COMMANDS."""
+    if episode['commands'] < APM_MIN_COMMANDS or episode['ticks'] <= 0:
+        return None
+    return episode['commands']*3600/episode['ticks']
+
+
+def apm_blanked(match_key, player):
+    """Deterministic per player-game: APM_BLANK of them train without the APM input."""
+    digest = hashlib.sha256(f'{APM_SALT}|{match_key}|{player}'.encode()).digest()
+    return int.from_bytes(digest[:8], 'little') < APM_BLANK*2**64
+
+
+def delay_targets(rows):
+    """Set row['delay'] = (canonical ticks to the player's next order, observed) on each order row; gaps over
+    DELAY_CAP are (DELAY_CAP, False): at least the cap. The chunk's last order has no next one in the chunk:
+    defaulted to (DELAY_CAP, False) (user, 26 Nov: one order per chunk, not worth more)."""
+    by_player = {}
+    for row in rows:
+        if row['target']['kind'] != 'wait':
+            by_player.setdefault(row['player'], []).append(row)
+    for group in by_player.values():
+        group.sort(key=lambda row: row['frame'])
+        for row, following in zip(group, group[1:]+[None]):
+            gap = None if following is None else following['frame']-row['frame']
+            row['delay'] = (gap, True) if gap is not None and gap <= DELAY_CAP else (DELAY_CAP, False)
+
+
+def thinned_rows(match_key, player, descriptor, share):
+    """Which of a chunk's rows remain when each no-op row is kept with probability `share`, or None for all.
+
+    A row's draw never changes, so a lower share keeps a subset, and it is independent of every row's
+    content: a thinned constant-rate process is still constant-rate. Commands always remain."""
+    if share >= 1:
+        return None
+    count = descriptor['rows']
+    noops = np.unpackbits(np.frombuffer(bytes.fromhex(descriptor['noops']), dtype=np.uint8), count=count).astype(bool)
+    digest = hashlib.sha256(f'{THINNING_SALT}|{match_key}|{player}|{descriptor["start"]}'.encode()).digest()
+    return ~noops | (np.random.default_rng(int.from_bytes(digest[:8], 'little')).random(count) < share)
+
+
 # Games' shared map data kept decoded: sequence training reads one game per lane at a time.
 SHARED_GAMES = 1024
 
@@ -108,6 +158,14 @@ class EventDataset:
         self.config = self.document['config']
         if self.config.get('architecture') != ARCHITECTURE:
             raise ValueError('Not an event policy dataset')
+        # No-op rows kept per second of game time (subset_manifest --snapshot-rate), at most the stored rate.
+        stored = self.config['snapshot_rate']
+        self.snapshot_rate = self.document.get('snapshot_rate', stored)
+        if not 0 < self.snapshot_rate <= stored:
+            raise ValueError('A dataset can only thin its no-op rows')
+        self.noop_share = self.snapshot_rate/stored
+        if self.config.get('network') == 'paced':  # Order rows only: no-op is never trained there.
+            self.noop_share = 0.
         seen, keys = set(), set()
         for entry in self.document['entries']:
             if hashlib.sha256(_json_bytes(entry['index'])).hexdigest() != entry['index_sha256']:
@@ -121,7 +179,7 @@ class EventDataset:
         self.key = next(iter(keys))
         self.entries = self.document['entries']
         self.verified, self.shared = {}, OrderedDict()
-        self._episodes, self._chunks = {}, OrderedDict()
+        self._episodes, self._counts, self._chunks = {}, {}, OrderedDict()
 
     def shard_path(self, entry):
         path = (self.path.parent / entry['path']).resolve()
@@ -141,6 +199,13 @@ class EventDataset:
                     continue
                 for descriptor in episode['chunks']:
                     yield source, episode['shared'], descriptor
+
+    def kept_rows(self, reference):
+        """thinned_rows of one chunk reference."""
+        source, shared, descriptor = reference
+        entry = self.entries[source]
+        episode = next(item for item in entry['index']['episodes'] if item['shared'] == shared)
+        return thinned_rows(entry['match_key'], episode['player'], descriptor, self.noop_share)
 
     def read(self, reference):
         source, shared, descriptor = reference
@@ -177,6 +242,15 @@ class EventDataset:
         if len(metadata) != descriptor['rows']:
             raise ValueError('Event column row count mismatch')
         rows = chunk_rows(columns, metadata, self.shared[identity], self.key)
+        if self.config.get('network') == 'paced':
+            delay_targets(rows)
+        kept = self.kept_rows(reference)
+        if kept is not None:
+            rows = [row for row, keep in zip(rows, kept.tolist()) if keep]
+        episode = next(item for item in entry['index']['episodes'] if item['shared'] == shared)
+        # The acting player's own pace: the true value for reporting, the input unless blanked.
+        pace = episode_apm(episode)
+        shown = None if pace is None or apm_blanked(entry['match_key'], episode['player']) else pace
         # Not stored in the shard: run_prepared_training.selection adds both players' identities from the
         # replay; a row's enemy is the one that is not its own (mixed vanilla/Tank/Nuke matches, 13 Nov 2026).
         identities = [tuple(i) for i in (entry.get('faction_identities') or ())]
@@ -191,10 +265,11 @@ class EventDataset:
             row['encoded']['enemy_identity'] = (identities[1] if own == identities[0] else identities[0])                 if len(identities) == 2 and own in identities else (0, 0)
             row['encoded']['ratings'] = inputs.get(str(row['player']), UNRATED)
             opener = openers.get(str(row['player']))
-            seconds = row['frame']/row.get('source_ticks_per_second', 60)
+            seconds = row['frame']/60  # Stored frames are canonical 60 Hz, whatever the recording's rate.
             row['opener'] = ('none' if opener is None else 'after' if seconds >= OPENER_WINDOW_SECONDS
                              else 'blanked' if blanked(entry['match_key'], row['player']) else 'given')
             row['encoded']['opener'] = opener_inputs(self.config, opener['templates'] if row['opener'] == 'given' else None)
+            row['apm'], row['encoded']['apm'] = pace, apm_inputs(shown)
             # The acting player's pre-match rating (estimated or not), for reporting only (train_events by_rating).
             rating = entry.get('ratings', {}).get(str(row['player']))
             row['rating'] = rating['rating'] if isinstance(rating, dict) else rating
@@ -264,7 +339,7 @@ class EventDataset:
         episodes stay skipped, as in chunks()."""
         cached = self._episodes.get(split)
         if cached is None:
-            cached = []
+            cached, counts = [], []
             for source, entry in enumerate(self.entries):
                 if entry['split'] != split:
                     continue
@@ -273,10 +348,12 @@ class EventDataset:
                     if str(episode['player']) in excluded:
                         continue
                     chunks = [(source, episode['shared'], descriptor) for descriptor in episode['chunks']]
-                    rows = sum(descriptor['rows'] for descriptor in episode['chunks'])
-                    if rows:
-                        cached.append((chunks, rows))
-            self._episodes[split] = cached
+                    sizes = [reference[2]['rows'] if (kept := self.kept_rows(reference)) is None else int(kept.sum())
+                             for reference in chunks]
+                    if sum(sizes):
+                        cached.append((chunks, sum(sizes)))
+                        counts.append(sizes)
+            self._episodes[split], self._counts[split] = cached, counts
         return cached
 
     def lane_schedule(self, split, *, seed, epoch, lanes, steps, shuffle=True):
@@ -285,8 +362,10 @@ class EventDataset:
 
         Each lane plays one episode from its first decision to its last, then takes the next
         episode of a seeded permutation (index order with shuffle=False), so an update holds
-        `lanes` different games at different phases. Lanes drain at the epoch's end; the last
-        updates are partly empty. A pure function of the index: a cursor is an update number."""
+        `lanes` different games at different phases. Lanes drain at the epoch's end. Without shuffle
+        (validation) the last updates are partly empty; a training epoch ends at its last full update:
+        the drain's updates (down to one game's 64 rows, at the full learning rate) collapsed the
+        22 Nov 2026 run to always waiting. A pure function of the index: a cursor is an update number."""
         if lanes < 1 or steps < 1:
             raise ValueError('Positive lane and step counts required')
         episodes = self.episodes(split)
@@ -294,6 +373,7 @@ class EventDataset:
                  if shuffle else np.arange(len(episodes)))
         queue = iter(order.tolist())
         current = [None]*lanes
+        first = True
         while True:
             episode = np.full((lanes, steps), -1, dtype=np.int64)
             row, reset = np.zeros((lanes, steps), dtype=np.int64), np.zeros((lanes, steps), dtype=bool)
@@ -312,8 +392,10 @@ class EventDataset:
                     reset[lane, step] = start == 0
                     step += take
                     current[lane] = None if start+take == episodes[number][1] else (number, start+take)
-            if (episode < 0).all():
+            # A dataset too small for one full update still gets one.
+            if (episode < 0).all() or (shuffle and not first and (episode < 0).any()):
                 return
+            first = False
             yield episode, row, reset
 
     def episode_rows(self, split, number, start, stop, cache_bytes=256*1024*1024):
@@ -323,8 +405,7 @@ class EventDataset:
         stored size each), so a lane reading its episode across updates decodes each chunk once."""
         chunks, _ = self.episodes(split)[number]
         rows, offset = [], 0
-        for reference in chunks:
-            count = reference[2]['rows']
+        for reference, count in zip(chunks, self._counts[split][number]):
             if offset < stop and offset+count > start:
                 key = reference[0], reference[2]['member']
                 cached = self._chunks.get(key)

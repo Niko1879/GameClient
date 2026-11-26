@@ -83,6 +83,15 @@ class TorchPolicyV3(nn.Module):
         """Pad only this chunk's entity dimension; padding never enters attention/pooling."""
         from training_preparation import encode_values
         values, _ = encode_values(self, encoded)
+        # encode_values pools the map for the current network; this one reads the stored 128x128 grids.
+        pixels, statics, seen = np.zeros_like(values['scatter_pixels'][0]), [], set()
+        for index, row in enumerate(encoded):
+            pixels[index, :len(row['cells'])] = row['cells']
+            if id(row['map_static']) not in seen:  # encode_values' map_static_index order.
+                seen.add(id(row['map_static'])); statics.append(row['map_static'])
+        values['scatter_pixels'] = pixels, 'int64'
+        values['map_statics'] = np.stack(statics), 'float'
+        values['map_visibility'] = np.stack([row['map_visibility'] for row in encoded]).astype(np.int64), 'int64'
         return self.encode_inputs(self.stager.stage(values))
 
     def conv(self, values, name, stride=1, padding=0):

@@ -15,7 +15,8 @@ from torch.nn import functional as F
 
 from generals_policy import (ARCHITECTURE, ATTENTION_LAYERS, GROUPS, LOCATION_BLOCKS, LOGIT_CAP, LSTM_LAYERS,
                              MAP_POOL, MAP_RESIDUAL_BLOCKS, MAP_STAGES, SCATTER_SCALE, SCATTER_VOLUME, SELECTED_UNIT_DIVISOR,
-                             UNDER_ATTACK_COLUMN, UNIT_GROUPS, group_sources, location_order, location_stages, widths)
+                             UNDER_ATTACK_COLUMN, UNIT_GROUPS, group_sources, location_order, location_stages, token_groups,
+                             widths)
 
 
 class TorchPolicyV3(nn.Module):
@@ -25,6 +26,8 @@ class TorchPolicyV3(nn.Module):
             raise ValueError('PyTorch learner requires the AlphaGenerals policy')
         self.reference, self.config = reference, reference.config
         self.widths = widths(self.config)
+        # The transformer's token groups: the unit groups, plus effect tokens unless effects are painted on the map.
+        self.groups = token_groups(self.config)
         self.weights = nn.ParameterDict(OrderedDict((name, nn.Parameter(torch.tensor(
             value.data, dtype=dtype, device=device))) for name, value in reference.parameters.items()))
         identity = reference.encoder.identity
@@ -147,31 +150,31 @@ class TorchPolicyV3(nn.Module):
 
         One projection per group carries its queries to every source and its keys and values for every
         query group; each (query group, source group) pair is one fused attention."""
-        p, x = self.weights, list(groups)
+        p, x, names = self.weights, list(groups), self.groups
         heads, width = self.widths['heads'], self.widths['head_width']
-        G = range(len(GROUPS))
+        G = range(len(names))
         some = [value.any(dim=-1)[:, None, None] for value in valid]
         masks = [(value | ~present[:, 0])[:, None, None] for value, present in zip(valid, some)]
         for layer in range(ATTENTION_LAYERS):
-            pair = lambda g, s, kind: p[f'attn{layer}_{GROUPS[g]}_{GROUPS[s]}_{kind}']
+            pair = lambda g, s, kind: p[f'attn{layer}_{names[g]}_{names[s]}_{kind}']
             projected = []
             for g, value in enumerate(x):
                 batch, n, _ = value.shape
                 weight = torch.cat([pair(g, s, 'q') for s in G]+[pair(q, g, kind) for kind in ('k', 'v') for q in G], dim=1)
                 # (batch, n, [q for each source | k for each query group | v for each query group], heads, width)
-                out = self.layer_norm(value, f'attn{layer}_{GROUPS[g]}_ln') @ weight
-                projected.append(out.reshape(batch, n, 3*len(GROUPS), heads, width).permute(2, 0, 3, 1, 4))
+                out = self.layer_norm(value, f'attn{layer}_{names[g]}_ln') @ weight
+                projected.append(out.reshape(batch, n, 3*len(names), heads, width).permute(2, 0, 3, 1, 4))
             updated = []
             for g, value in enumerate(x):
-                name, ffn = f'attn{layer}_{GROUPS[g]}', f'ffn{layer}_{GROUPS[g]}'
-                parts = [self.attend(projected[g][s], projected[s][len(GROUPS)+g], projected[s][2*len(GROUPS)+g], some[s], masks[s])
-                         for s in group_sources(g)]
+                name, ffn = f'attn{layer}_{names[g]}', f'ffn{layer}_{names[g]}'
+                parts = [self.attend(projected[g][s], projected[s][len(names)+g], projected[s][2*len(names)+g], some[s], masks[s])
+                         for s in group_sources(g, len(names))]
                 parts = torch.cat(parts, dim=1).transpose(1, 2).flatten(2)  # (batch, n, blocks*heads*width)
                 value = value+parts @ p[name+'_out_w']+p[name+'_out_b']
                 hidden = F.relu(self.layer_norm(value, ffn+'_ln') @ p[ffn+'_in_w']+p[ffn+'_in_b'])
                 updated.append(value+hidden @ p[ffn+'_out_w']+p[ffn+'_out_b'])
             x = updated
-        return [self.layer_norm(value, f'final_{GROUPS[g]}_ln') for g, value in enumerate(x)]
+        return [self.layer_norm(value, f'final_{names[g]}_ln') for g, value in enumerate(x)]
 
     def pool(self, value, valid, group):
         """Attention pooling (NeuralPolicy._pool): (batch, queries*heads*width); an empty group gives zeros."""
@@ -197,8 +200,18 @@ class TorchPolicyV3(nn.Module):
             result = result.scatter_add(1, rows[:, :, None].expand(-1, -1, width), value*mask[:, :, None].to(value.dtype))
         return result
 
-    def encode_map(self, inputs, scattered):
-        """(1x1 map (batch, map_out, n, n), embedding): NeuralPolicy._encode_map."""
+    def effect_image(self, inputs, tokens):
+        """Effects painted beside the scattered units, (batch, scatter, side, side), or None: effect tokens
+        go through the transformer instead (network_alphastar paints them for config effects='map')."""
+        return None
+
+    def cell_context(self, inputs, spatial, features, keys):
+        """(features, keys) of every entity after the map: unchanged here (network_alphastar adds what the
+        map holds at each unit's cell for config effects='map')."""
+        return features, keys
+
+    def encode_map(self, inputs, scattered, effects=None):
+        """(1x1 map (batch, map_out, n, n), embedding): NeuralPolicy._encode_map; effects: effect_image."""
         p, config = self.weights, self.config
         side = config['map_side']*SCATTER_SCALE//MAP_POOL
         batch, area = scattered.shape[0], side*side
@@ -213,6 +226,8 @@ class TorchPolicyV3(nn.Module):
         image = torch.zeros((batch, area, values.shape[-1]), dtype=values.dtype, device=self.device).scatter_add(
             1, pixels[:, :, None].expand(-1, -1, values.shape[-1]), values)
         image = image.reshape(batch, side, side, -1).permute(0, 3, 1, 2)
+        if effects is not None:
+            image = image+effects.to(image.dtype)
         # The same planes as generals_policy.map_planes, built here from compact inputs.
         static = inputs['map_statics'][inputs['map_static_index']].permute(0, 2, 1)
         visibility = inputs['map_visibility']
@@ -243,7 +258,7 @@ class TorchPolicyV3(nn.Module):
         batch = identity.shape[0]
         counts = torch.zeros((batch, len(self.config['types'])), dtype=self.dtype, device=self.device).scatter_add(
             1, inputs['types'], inputs['real'])
-        parts = [inputs['scalars'], identity, enemy, inputs['ratings'], inputs['opener'], inputs['player_flags'],
+        parts = [inputs['scalars'], identity, enemy, inputs['ratings'], inputs['apm'], inputs['opener'], inputs['player_flags'],
                  counts.sqrt(), inputs['available_actions']]
         for i in range(2):
             template = self.type_embedding(inputs['task_command_templates'][:, i])
@@ -256,20 +271,23 @@ class TorchPolicyV3(nn.Module):
         selection = (rows, indices, lengths), the selected units' [Mean, Max] summary."""
         p = self.weights
         entity, tokens = self.entity_inputs(inputs)
-        count = entity.shape[1]
-        flat = torch.cat([entity, tokens], dim=1)
-        index = [inputs[f'group{g}_index'] for g in range(len(GROUPS))]
-        valid = [inputs[f'group{g}_valid'] for g in range(len(GROUPS))]
+        count, names = entity.shape[1], self.groups
+        flat = torch.cat([entity, tokens], dim=1) if len(names) > UNIT_GROUPS else entity
+        index = [inputs[f'group{g}_index'] for g in range(len(names))]
+        valid = [inputs[f'group{g}_valid'] for g in range(len(names))]
         groups = [flat.gather(1, rows[:, :, None].expand(-1, -1, flat.shape[-1])) for rows in index]
         final = self.group_transformer(groups, valid)
         units = final[:UNIT_GROUPS]
         features = self.entity_order(units, index[:UNIT_GROUPS], valid[:UNIT_GROUPS], count)
-        keys = self.entity_order([value @ p[f'key_{GROUPS[g]}_w']+p[f'key_{GROUPS[g]}_b'] for g, value in enumerate(units)],
+        keys = self.entity_order([value @ p[f'key_{names[g]}_w']+p[f'key_{names[g]}_b'] for g, value in enumerate(units)],
                                  index[:UNIT_GROUPS], valid[:UNIT_GROUPS], count)
-        scattered = self.entity_order([F.relu(value @ p[f'scatter_{GROUPS[g]}_w']+p[f'scatter_{GROUPS[g]}_b'])
+        scattered = self.entity_order([F.relu(value @ p[f'scatter_{names[g]}_w']+p[f'scatter_{names[g]}_b'])
                                        for g, value in enumerate(units)], index[:UNIT_GROUPS], valid[:UNIT_GROUPS], count)
-        spatial, map_embedding = self.encode_map(inputs, scattered)
-        pools = [self.pool(value, valid[g], GROUPS[g]) for g, value in enumerate(final)]
+        spatial, map_embedding = self.encode_map(inputs, scattered, self.effect_image(inputs, tokens))
+        features, keys = self.cell_context(inputs, spatial, features, keys)
+        pools = [self.pool(value, valid[g], names[g]) for g, value in enumerate(final)]
+        if len(names) < len(GROUPS):  # Effects on the map: their pool reads the tokens without the transformer.
+            pools.append(self.pool(tokens, inputs['effect_valid'], GROUPS[-1]))
         core_input = torch.cat([self.scalars(inputs).to(map_embedding.dtype), *[pool.to(map_embedding.dtype) for pool in pools],
                                 map_embedding], dim=1)
         result = {'core_input': core_input, 'features': features, 'keys': keys, 'map': spatial}
@@ -344,9 +362,6 @@ class TorchPolicyV3(nn.Module):
 
     def action_logits(self, core):
         return core @ self.weights['action_w']+self.weights['action_b']
-
-    def delay_logits(self, core, actions):
-        return self.with_action(core, 'delay', actions) @ self.weights['delay_w']+self.weights['delay_b']
 
     def slot_logits(self, core, actions, summary):
         return self.with_action(core, 'slot', actions, summary) @ self.weights['slot_w']+self.weights['slot_b']
@@ -425,7 +440,11 @@ class TorchPolicyV3(nn.Module):
         """Stage encoded rows (live play) and run the encoder."""
         from training_preparation import encode_values
         values, _ = encode_values(self, encoded)
-        return self.encode_inputs(self.stager.stage(values))
+        staged = self.stager.stage(values)
+        out = self.encode_inputs(staged)
+        # Entity positions for the movement network's location head (network_alphastar.movement_context).
+        out['pixels'], out['real'] = staged['scatter_pixels'], staged['real']
+        return out
 
     def events(self, encoded=None, *, prepared=None):
         """(core outputs (rows, W), encoder outputs) of independent observations, each scored as its
@@ -448,3 +467,11 @@ class TorchPolicyV3(nn.Module):
                                          staged['selected_lengths'])
         return teacher_heads(self, core, {**bundle, 'summary': summary}, plan, loss_only=loss_only,
                              position_metrics=position_metrics)
+
+
+def torch_policy(reference, **options):
+    """The PyTorch module for a reference policy: AlphaGenerals, or a temporary comparison network."""
+    if reference.config.get('network'):
+        from network_alphastar import AlphaStarTorchPolicy
+        return AlphaStarTorchPolicy(reference, **options)
+    return TorchPolicyV3(reference, **options)

@@ -211,6 +211,55 @@ def position_errors(logits, cell_mask, cell_choices, offset_choices, config):
     return (joint*distance).sum(dim=1), distance.gather(1, joint.argmax(dim=1, keepdim=True)).squeeze(1)
 
 
+# Direction metric (head_loss_breakdown): sectors of the circle around the selected units, and the shortest click
+# distance (position-bin pixels) for which a direction counts.
+DIRECTION_SECTORS, DIRECTION_MIN_PIXELS = 16, 16
+
+
+def selection_centres(config, pixels, selected, lengths):
+    """(rows, 2) x, y in position-bin pixels: the mean of each row's selected units (scatter-pixel centres)."""
+    from generals_policy import MAP_POOL, SCATTER_SCALE
+    side = config['map_side']*SCATTER_SCALE//MAP_POOL
+    scale = config['position_bins']/side
+    chosen = pixels.gather(1, selected)
+    used = (torch.arange(selected.shape[1], device=pixels.device)[None] < lengths[:, None]).float()
+    x, y = ((chosen % side).float()+.5)*scale, (torch.div(chosen, side, rounding_mode='floor').float()+.5)*scale
+    count = used.sum(dim=1).clamp_min(1)
+    return torch.stack([(x*used).sum(dim=1)/count, (y*used).sum(dim=1)/count], dim=1)
+
+
+def direction_errors(logits, cell_mask, cell_choices, offset_choices, centres, config, chunk=256):
+    """Per spatial row, relative to the selected units' centre: (true distance px, -log p(true direction sector)
+    under the predicted position distribution, mode angle error in degrees, log(mode distance / true distance)).
+    Direction separates where units are sent from the exact point clicked (the user's movement accuracy)."""
+    n, fine = config['map_side'], config['position_bins']//config['map_side']
+    device = logits.device
+    cell, offset = torch.arange(n*n, device=device), torch.arange(fine*fine, device=device)
+    x = ((cell % n)[:, None]*fine+offset % fine).flatten().float()+.5
+    y = (torch.div(cell, n, rounding_mode='floor')[:, None]*fine+torch.div(offset, fine, rounding_mode='floor')).flatten().float()+.5
+    tx = ((cell_choices % n)*fine+offset_choices % fine).float()+.5
+    ty = (torch.div(cell_choices, n, rounding_mode='floor')*fine+torch.div(offset_choices, fine, rounding_mode='floor')).float()+.5
+    out = []
+    for start in range(0, len(logits), chunk):
+        part = slice(start, start+chunk)
+        joint = logits[part].float().masked_fill(~cell_mask[part, :, None], -torch.inf).flatten(1).softmax(dim=1)
+        cx, cy = centres[part, 0:1], centres[part, 1:2]
+        angle = torch.atan2(y[None]-cy, x[None]-cx)
+        sector = (((angle+math.pi)/(2*math.pi)*DIRECTION_SECTORS).long()).clamp_max(DIRECTION_SECTORS-1)
+        mass = torch.zeros((joint.shape[0], DIRECTION_SECTORS), device=device).scatter_add(1, sector, joint)
+        true_angle = torch.atan2(ty[part]-cy[:, 0], tx[part]-cx[:, 0])
+        true_sector = (((true_angle+math.pi)/(2*math.pi)*DIRECTION_SECTORS).long()).clamp_max(DIRECTION_SECTORS-1)
+        sector_nll = -mass.gather(1, true_sector[:, None])[:, 0].clamp_min(1e-12).log()
+        mode = joint.argmax(dim=1)
+        mx, my = x[mode], y[mode]
+        mode_angle = torch.atan2(my-cy[:, 0], mx-cx[:, 0])
+        error = torch.rad2deg(torch.remainder(mode_angle-true_angle+math.pi, 2*math.pi)-math.pi).abs()
+        true_distance = torch.hypot(tx[part]-cx[:, 0], ty[part]-cy[:, 0])
+        ratio = (torch.hypot(mx-cx[:, 0], my-cy[:, 0]).clamp_min(.5)/true_distance.clamp_min(.5)).log()
+        out.append(torch.stack([true_distance, sector_nll, error, ratio], dim=1))
+    return torch.cat(out)
+
+
 def teacher_heads(model, core, bundle, plan, *, loss_only=False, position_metrics=False):
     """Every head's teacher-forced log-probabilities for one microbatch.
 
@@ -227,33 +276,33 @@ def teacher_heads(model, core, bundle, plan, *, loss_only=False, position_metric
     def draw(name, logits):
         mask, choices = inputs[name+'_mask'], inputs[name+'_choices']
         return categorical(logits, mask, choices, details=not loss_only,
-                           predict=not loss_only or name in ('decision', 'event_delay'),
+                           predict=not loss_only or name == 'decision',
                            capped=name not in ('cell', 'offset'))
 
     actions = inputs['actions']
     logits = model.action_logits(core)
-    timing, entropy, decision = draw('decision', logits)
+    paced = config.get('network') == 'paced'
+    if paced:
+        timing, entropy, decision, wait = paced_decision(model, core, logits, inputs, plan, loss_only)
+    else:
+        timing, entropy, decision = draw('decision', logits)
     from training_preparation import head_counts
     outputs = {'by_head': {'decision': timing}, 'head_counts': head_counts(plan),
                'predictions': [('decision', np.arange(batch), model.action_kinds[decision])]}
-    if position_metrics or not loss_only:
+    if paced and len(plan['values']['pace_rows'][0]):
+        outputs['by_head']['pace'] = pace_loglikelihood(model, core, inputs, batch)
+    if (position_metrics or not loss_only) and not paced:
         with torch.no_grad():
             wait = cap_logits(logits, inputs['decision_mask']).masked_fill(
                 ~inputs['decision_mask'], -torch.inf).softmax(dim=1)[:, 0]
-        if position_metrics:  # Validation: p(wait) per row, for the report's expected wait share.
-            outputs['wait_probability'] = wait
+    if position_metrics:  # Validation: p(wait) per row, for the report's expected wait share.
+        outputs['wait_probability'] = wait
     if not loss_only:
         legal = inputs['decision_mask'] & (model.action_kinds != 0)[None]
         outputs.update(logp=timing, entropy=entropy, action_kinds=model.action_kinds,
                        event_prediction=(model.action_kinds[decision] != 0).long(),
                        conditional_prediction=model.action_kinds[logits.masked_fill(~legal, -torch.inf).argmax(dim=1)],
                        order_probability=1-wait)
-    lp, ent, prediction = draw('event_delay', model.delay_logits(core, actions))
-    outputs['by_head']['delay'] = lp
-    if not loss_only:
-        outputs['logp'] = outputs['logp']+lp
-        outputs['entropy'] = outputs['entropy']+ent
-    outputs['predictions'].append(('delay', np.arange(batch), prediction))
     if not count:
         return outputs
 
@@ -302,7 +351,12 @@ def teacher_heads(model, core, bundle, plan, *, loss_only=False, position_metric
     if len(plan['spatial_rows']):
         ix = inputs['spatial_rows']
         build = (inputs['build_spatial'], inputs['build_features']) if placement and inputs['build_spatial'].numel() else None
-        logits = model.location(bundle['map'][command[ix]].to(core.dtype), core[ix], acts[ix], summary[ix], build)
+        extra = {}
+        if config.get('network') == 'movement':
+            from network_alphastar import movement_context
+            extra['context'] = movement_context(model, bundle, command[ix], keys[ix], inputs['selected_indices'][ix],
+                                                inputs['selected_lengths'][ix])
+        logits = model.location(bundle['map'][command[ix]].to(core.dtype), core[ix], acts[ix], summary[ix], build, **extra)
         # One 256x256 distribution, scored as its map cell and then the offset within it.
         cell = draw('cell', logits.logsumexp(dim=2))
         choices = inputs['cell_choices']
@@ -310,14 +364,51 @@ def teacher_heads(model, core, bundle, plan, *, loss_only=False, position_metric
             with torch.no_grad():
                 outputs['position_errors'] = position_errors(logits.detach(), inputs['cell_mask'], choices,
                                                              inputs['offset_choices'], config)
+                if 'pixels' in bundle:  # Direction vs distance around the selected units (head_loss_breakdown).
+                    centres = selection_centres(config, bundle['pixels'][command[ix]], inputs['selected_indices'][ix],
+                                                inputs['selected_lengths'][ix])
+                    outputs['direction'] = direction_errors(logits.detach(), inputs['cell_mask'], choices,
+                                                            inputs['offset_choices'], centres, config)
         offset = draw('offset', logits[inputs['spatial_range'], choices])
         record('cell', cell)
         record('offset', offset)
     return outputs
 
 
+def paced_decision(model, core, logits, inputs, plan, loss_only):
+    """network='paced': (log p, entropy, prediction, p(no-op)) of the decision, over the orders (its rows are
+    orders only; no-op is never trained). p(no-op) is what the pace head implies for a row of the stored data:
+    snapshots at the policy's rate against orders at the row's own rate x exp(pace)."""
+    batch, command = plan['batch'], inputs['command_rows']
+    mask = inputs['decision_mask'] & (model.action_kinds != 0)[None]
+    timing = torch.zeros(batch, dtype=logits.dtype, device=logits.device)
+    entropy = torch.zeros_like(timing)
+    if plan['command_count']:
+        lp, ent, _ = categorical(logits[command], mask[command], inputs['decision_choices'][command], details=not loss_only,
+                                 predict=False)
+        timing = timing.index_add(0, command, lp)
+        if ent is not None:
+            entropy = entropy.index_add(0, command, ent)
+    with torch.no_grad():
+        decision = logits.masked_fill(~mask, -torch.inf).argmax(dim=1)
+        orders = inputs['order_rate']*model.pace(core).float().exp()
+        snapshots = model.reference.snapshot_rate
+        wait = snapshots/(snapshots+orders)
+    return timing, entropy, decision, wait
+
+
+def pace_loglikelihood(model, core, inputs, batch):
+    """Per row (zero off the pace rows): the exponential log-likelihood of the delay to the next order, at the
+    rate own orders/s x exp(pace): log(rate) - rate x delay when observed, -rate x delay when censored (at least
+    that long). The live look acts with the same constant-rate model (generals_policy.decide)."""
+    rows = inputs['pace_rows']
+    log_rate = inputs['order_rate'][rows].float().log()+model.pace(core[rows]).float()
+    loglik = inputs['pace_observed'].float()*log_rate-log_rate.exp()*inputs['pace_delay'].float()
+    return torch.zeros(batch, dtype=loglik.dtype, device=loglik.device).index_add(0, rows, loglik)
+
+
 def head_losses(model, rows, by_head, counts, factors=None):
-    """Per-row loss: the action and (weighted) delay, plus each argument head averaged over its tokens.
+    """Per-row loss: the action, plus each argument head averaged over its tokens. A no-op has only the action.
 
     factors: the staged per-row weights (loss_factors), when already on the device."""
     if factors is None:
@@ -334,9 +425,6 @@ def loss_factors(config, rows, counts, names):
     weights = config.get('argument_loss_weights', {})
     factors = {}
     for name in names:
-        if name == 'delay':
-            factors[name] = np.asarray([config.get('delay_loss_weight', .2) if 'delay' in row['target'] else 0
-                                        for row in rows], dtype=float), 'float'
-        elif name != 'decision':
+        if name != 'decision':
             factors[name] = weights.get(name, 1)/np.maximum(counts[name], 1), 'float'
     return factors

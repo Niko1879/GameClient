@@ -67,7 +67,8 @@ def parts(bundle, part_files, present=frozenset()):
     files = sorted(p.relative_to(bundle).as_posix() for p in bundle.iterdir() if p.is_file())
     files += sorted('code/'+p.name for p in (bundle/'code').iterdir())
     files += ['replay-runtime/science-orders.json']  # the scripted science buyer (cloud_bundle)
-    yield files+['data/dataset.json']
+    # Every dataset index (dataset.json and any thinned variant such as the pilot's dataset-r25.json).
+    yield files+sorted('data/'+p.name for p in (bundle/'data').glob('*.json'))
     doc = json.loads((bundle/'data/dataset.json').read_text(encoding='utf-8'))
     # Shards already on the instance (linked by --link-from) are not sent again.
     shards = sorted(e['path'] for e in doc['entries'] if e['path'] not in present)

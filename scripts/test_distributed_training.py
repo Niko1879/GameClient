@@ -4,6 +4,7 @@ CPU gloo ranks on this host; the CUDA/NCCL path differs only in backend.
 """
 from contextlib import redirect_stdout
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -11,6 +12,7 @@ import unittest
 
 import numpy as np
 
+from event_dataset import EventDataset
 from event_training_batches import assemble, lane_parts, prepare_part
 from generals_policy import NeuralPolicy
 from train_events import EventLearner, global_lanes, launch, rank_lanes, train
@@ -38,18 +40,26 @@ class DistributedTrainingTests(unittest.TestCase):
         cls.root = Path(cls.temporary.name)
         fixture = EventTests('setUp'); fixture.setUp()
         cls.data = fixture.shard_dataset(cls.root/'data', validation=True)
+        # Six games for the six lanes: several full updates per epoch, with lane state carried between them.
+        fixture.shard_dataset(cls.root/'six', validation=True)
+        path = cls.root/'six'/'dataset.json'
+        document = json.loads(path.read_text())
+        game = next(entry for entry in document['entries'] if entry['split'] == 'train')
+        document['entries'] += [{**game, 'match_key': f'test:copy{number}'} for number in range(5)]
+        path.write_text(json.dumps(document))
+        cls.six = EventDataset(path)
 
     @classmethod
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def single(self, name, **changes):
+    def single(self, name, data=None, **changes):
         with redirect_stdout(io.StringIO()):
-            report = train(SimpleNamespace(**settings(self.data, self.root/name, **changes)))
+            report = train(SimpleNamespace(**settings(data or self.six, self.root/name, **changes)))
         return report, *weights(report['checkpoint'])
 
-    def ranks(self, name, world, **changes):
-        args = SimpleNamespace(**settings(self.data, self.root/name, **changes))
+    def ranks(self, name, world, data=None, **changes):
+        args = SimpleNamespace(**settings(data or self.six, self.root/name, **changes))
         report = launch(args, world)
         return report, *weights(report['checkpoint'])
 
@@ -78,8 +88,8 @@ class DistributedTrainingTests(unittest.TestCase):
     def test_a_rank_with_an_empty_share_still_joins_the_update(self):
         # One training episode on two lanes of 11 steps: lane 1 has no episode, so rank 1's part is empty.
         self.assertEqual(len(self.data.episodes('train')), 1)
-        self.assert_close_runs(self.single('one-11', lanes=2, unroll=11, epochs=1),
-                               self.ranks('two-11', 2, lanes=2, unroll=11, epochs=1))
+        self.assert_close_runs(self.single('one-11', self.data, lanes=2, unroll=11, epochs=1),
+                               self.ranks('two-11', 2, self.data, lanes=2, unroll=11, epochs=1))
 
     def test_ranked_resume_matches_an_uninterrupted_ranked_run(self):
         full = self.ranks('full', 2)
@@ -96,7 +106,7 @@ class DistributedTrainingTests(unittest.TestCase):
     def test_resume_refuses_a_different_world_size(self):
         partial = self.ranks('world-change', 2, max_updates=1)
         with self.assertRaisesRegex(ValueError, 'identical data, sampler'), redirect_stdout(io.StringIO()):
-            train(SimpleNamespace(**settings(self.data, self.root/'world-change', resume=partial[0]['checkpoint'])))
+            train(SimpleNamespace(**settings(self.six, self.root/'world-change', resume=partial[0]['checkpoint'])))
 
     def test_a_failing_rank_stops_the_others(self):
         with self.assertRaisesRegex(RuntimeError, 'exited with code'):

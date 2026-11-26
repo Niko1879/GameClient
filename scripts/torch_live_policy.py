@@ -8,7 +8,7 @@ import torch
 
 from generals_policy import NeuralPolicy
 from nn_numpy import Tensor
-from torch_policy_v3 import TorchPolicyV3
+from torch_policy_v3 import torch_policy
 
 
 class TorchLivePolicy(NeuralPolicy):
@@ -18,11 +18,12 @@ class TorchLivePolicy(NeuralPolicy):
         if torch.device(device).type == 'cuda' and not torch.cuda.is_available():
             raise RuntimeError('GPU inference requires a PyTorch installation with a working ROCm or CUDA device')
         super().__init__(reference.config, parameters=False)
-        self.model = TorchPolicyV3(reference, device=device, dtype=dtype).eval()
+        self.model = torch_policy(reference, device=device, dtype=dtype).eval()
         # The live actor applies the checkpoint's rating switch when it prepares the row.
         self.model.config = {**self.config, 'rating_input': True}
         self.parameters = self.model.weights
         self.rating_input = getattr(reference, 'rating_input', False)
+        self.snapshot_rate = reference.snapshot_rate
 
     def _sampling_logits(self, logits):
         # Transfer just the current head. Sharing the NumPy draw preserves temperature,
@@ -38,16 +39,23 @@ class TorchLivePolicy(NeuralPolicy):
         core, state = model.core(out['core_input'][:, None], torch.zeros((1, 1), dtype=torch.bool, device=model.device),
                                  self.initial_state() if state is None else state)
         return {'core': core[:, 0], 'state': state, 'value': Tensor(float(model.values(core[:, 0])[0])),
-                'keys': out['keys'], 'features': out['features'], 'map': out['map']}
+                'keys': out['keys'], 'features': out['features'], 'map': out['map'],
+                'pixels': out['pixels'], 'real': out['real']}
 
     def _action(self, action):
         return self.model.indices([action])
 
+    def _pace(self, trunk):
+        # constant_pace (evaluate_events --constant-pace): act at the APM input's own rate whatever the state, no-op
+        # never drawn: pace switched off for network='paced', a forced constant rate for any other policy.
+        if getattr(self, 'constant_pace', False):
+            return 0.
+        if self.config.get('network') != 'paced':
+            return None
+        return float(self.model.pace(trunk['core'])[0])
+
     def _action_logits(self, trunk):
         return self.model.action_logits(trunk['core'])[0]
-
-    def _delay_logits(self, trunk, action):
-        return self.model.delay_logits(trunk['core'], self._action(action))[0]
 
     def _unit_begin(self, trunk, action):
         model = self.model
@@ -80,7 +88,13 @@ class TorchLivePolicy(NeuralPolicy):
     def _location(self, trunk, action, summary, build_features=None):
         build = None if build_features is None else (
             self.model.indices([0]), self.model.array(build_features[None]))
-        return self.model.location(trunk['map'], trunk['core'], self._action(action), summary, build)[0]
+        if self.config.get('network') != 'movement':
+            return self.model.location(trunk['map'], trunk['core'], self._action(action), summary, build)[0]
+        from network_alphastar import movement_context
+        selected = trunk.get('selected') or []
+        context = movement_context(self.model, trunk, self.model.indices([0]), trunk['keys'],
+                                   self.model.indices([selected or [0]]), self.model.indices([len(selected)]))
+        return self.model.location(trunk['map'], trunk['core'], self._action(action), summary, build, context)[0]
 
     @torch.inference_mode()
     def decide(self, *args, **kwargs):

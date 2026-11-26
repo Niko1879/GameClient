@@ -35,7 +35,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 INDEX=${{TORCH_INDEX:-https://download.pytorch.org/whl/cu130}}
 if command -v uv >/dev/null; then
-  uv venv --python {PYTHON} .venv
+  uv venv --clear --python {PYTHON} .venv  # --clear: setup.sh can be rerun
   uv pip install --python .venv "numpy=={NUMPY}" "torch=={TORCH}" --index-url "$INDEX" --extra-index-url https://pypi.org/simple
 else
   python{PYTHON} -m venv .venv
@@ -54,7 +54,7 @@ cd code && TEST_TORCH_DEVICE=cuda CUBLAS_WORKSPACE_CONFIG=:4096:8 ../.venv/bin/p
   test_event_policy test_event_training_batches test_scheduled_capture test_policy \\
   test_unit_tasks test_command_actions test_build_placement test_resume_construction \\
   test_event_dataset test_compiled_learner test_enemy_and_clock test_prepared_training test_learner_bench \\
-  test_distributed_training test_staged_updates test_alphagenerals
+  test_distributed_training test_staged_updates test_alphagenerals test_noop_snapshots test_network_alphastar
 """
 
 TRAIN = """#!/usr/bin/env bash
@@ -111,7 +111,8 @@ if [ "$GENERALS_RATING_INPUT" = 1 ]; then touch run/RATING_INPUT; fi
 EXTRA=()
 if [ "$COMPILE" = 1 ]; then EXTRA+=(--compile); fi
 if [ "$LR_SCHEDULE" = step ]; then EXTRA+=(--lr-step-decisions "$LR_STEP_DECISIONS"); fi
-exec .venv/bin/python -B code/train_events.py train --dataset data/dataset.json --output run \\
+DATASET=${DATASET:-data/dataset.json}  # Or a thinned manifest next to it, e.g. data/dataset-r25.json.
+exec .venv/bin/python -B code/train_events.py train --dataset "$DATASET" --output run \\
   --device cuda --epochs "$EPOCHS" --early-stopping-patience "$PATIENCE" --validations-per-epoch "$VALIDATIONS" \\
   --min-delta 0.005 --seed TRAIN_SEED --threads 1 \\
   --world-size "$WORLD" --lanes "$LANES" --unroll "$UNROLL" --part-lanes "$PART_LANES" --cache-mib "$CACHE_MIB" \\

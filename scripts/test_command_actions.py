@@ -82,7 +82,7 @@ class CommandActionTests(unittest.TestCase):
                      'repair', 'get_repaired'):
             self.assertTrue(verbs[KINDS.index(kind)], kind)
         for actions in ACTIONS:
-            teacher = {**self.policy.target(encoded, actions), 'delay': 3}
+            teacher = self.policy.target(encoded, actions)
             with no_grad():
                 decoded, trace, *_ = self.policy.decide(encoded, None, teacher=teacher)
             expected = copy.deepcopy(actions)
@@ -192,8 +192,8 @@ class CommandActionTests(unittest.TestCase):
         rows = []
         for actions in ([], *ACTIONS):
             encoded = self.encode()
-            target = {**self.policy.target(encoded, actions), 'delay': 5}
-            rows.append({'encoded': encoded, 'target': target, 'hold_ticks': 6, 'scope': 'event'})
+            target = self.policy.target(encoded, actions)
+            rows.append({'encoded': encoded, 'target': target, 'scope': 'event'})
         key = feature_identity(self.policy)
         for row in rows:
             row['encoded']['_training_legality'] = build_legality(self.policy, row['encoded'], row['target'], key)

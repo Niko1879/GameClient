@@ -30,6 +30,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import queue
+import sys
 import re
 import shutil
 import time
@@ -430,6 +431,9 @@ def main(argv=None):
     runner.add_argument('--limit', type=int, default=0)
     sub.add_parser('report')
     args = parser.parse_args(argv)
+    # Replay names can hold characters the Windows console code page can't encode; printing one killed whole runs
+    # (UnicodeEncodeError, 24 Nov). The log is UTF-8 either way.
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     from replay_converter import is_running
     if args.command == 'maps':
         print(json.dumps(dict(added=add_maps(args.roots))))

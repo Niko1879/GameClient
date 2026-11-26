@@ -176,6 +176,16 @@ def selection(args):
             if unscanned:raise ValueError(f'{len(unscanned)} candidates lack cleaning metrics (e.g. {unscanned[0]}); run replay_cleaning.py scan')
             before=len(candidates);candidates=[r for r in candidates if r['match_key'] not in dropped]
             cleaning.update(candidates_before=before,candidates_after=len(candidates))
+        listed=None
+        if getattr(args,'matches',None):
+            raw=load(args.matches)
+            keys={m if isinstance(m,str) else m['match_key'] for m in (raw['matches'] if isinstance(raw,dict) else raw)}
+            # A reused validation set may lie outside the list (all listed matches then train).
+            if args.validation_from:keys|={e['match_key'] for e in load(args.validation_from)['entries'] if e['split']=='validation'}
+            before=len(candidates);candidates=[r for r in candidates if r['match_key'] in keys]
+            listed=dict(source=str(args.matches),sha256=digest(Path(args.matches)),listed=len(keys),
+                        candidates_before=before,candidates_after=len(candidates),
+                        matches_found=len({r['match_key'] for r in candidates}))
         rung=None
         if getattr(args,'min_rating',None) is not None:
             from replay_cleaning import china_match_ratings
@@ -233,7 +243,7 @@ def selection(args):
             rung.update(players_below_floor_excluded=excluded,matches_kept_as_index_mismatch=mismatched)
         held=collections.Counter('/'.join(strata[r['match_key']]) for r in selected if r['split']=='validation')
         doc['selection']=dict(seed=args.seed,training=args.training,validation=args.validation,
-            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning,archive=archive,rung=rung,vanilla_from=vanilla,openers=openers,
+            split_policy='fresh_whole_match_and_raw_hash',feature_key=key,cleaning=cleaning,archive=archive,rung=rung,vanilla_from=vanilla,matches=listed,openers=openers,
             validation_strata=dict(length_minutes=LENGTH_BANDS,mean_rating=RATING_BANDS,floor=VALIDATION_FLOOR,
                                    reused=bool(reused),counts=dict(sorted(held.items()))))
         return doc,key
@@ -507,6 +517,8 @@ def add_archive_arguments(parser):
         '(estimates count) is at least this, for training and validation. Shares of ALL replays (12 Nov): top 10%% = 1574, top 20%% = 1356')
     parser.add_argument('--vanilla-from',help="Matches with a vanilla China player only from this dataset manifest's matches "
         "(Tank/Nuke-only matches unrestricted): a faction-mix arm then gains no vanilla games its baseline lacked")
+    parser.add_argument('--matches',help="Only these matches: a JSON list of match keys, or a top_matches.py ranking "
+        "({'matches': [{'match_key': ...}, ...]})")
 
 
 def main():

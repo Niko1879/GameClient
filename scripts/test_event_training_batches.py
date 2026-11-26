@@ -71,7 +71,7 @@ class PreparedReaderTests(unittest.TestCase):
         fixture = EventTests('setUp'); fixture.setUp()
         self.dataset = fixture.shard_dataset(Path(self.temporary.name), validation=True)
         self.spec = PreparationSpec(self.dataset.config, self.dataset.key, device_type='cpu')
-        self.settings = dict(seed=3, epoch=0, lanes=2, steps=2, part_lanes=1)
+        self.settings = dict(seed=3, epoch=0, lanes=1, steps=2, part_lanes=1)  # One episode: more lanes are never all full.
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -125,12 +125,12 @@ class PreparedReaderTests(unittest.TestCase):
         from event_store import write_shard
         from prepared_io import _write_json
         from test_event_policy import EventTests
-        from test_fixtures import raw_row
+        from test_fixtures import RECORDING, raw_row
         fixture = EventTests('setUp'); fixture.setUp()
         root = Path(self.temporary.name)/'many'
         rows = [raw_row(0, fixture.obs)]+[raw_row(f, fixture.obs, [{'kind': 'stop', 'units': [10]}])
                                           for f in range(30, 331, 30)]
-        game = {'rows': rows, 'map': fixture.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': fixture.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         entries = []
         for number in range(5):
             result = write_shard(root/f'shards/{number}.zip', [game], fixture.policy, {'match_key': f'test:{number}'})

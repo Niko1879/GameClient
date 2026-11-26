@@ -15,14 +15,14 @@ from types import SimpleNamespace
 import numpy as np
 
 from event_policy import SCIENCE_ORDERS, EventActor
-from event_schedule import delay_mask, native_deadline, step_ticks
+from event_schedule import native_deadline, step_ticks
 from event_dataset import EventDataset
 from event_store import feature_identity, write_shard
 from generals_policy import NeuralPolicy
 from nn_numpy import Tensor
 from prepared_io import _write_json
 from replay_events import decisions, encoded_events
-from test_fixtures import fixture, raw_row
+from test_fixtures import RECORDING, fixture, raw_row
 from train_events import EventLearner, train
 
 
@@ -47,58 +47,42 @@ class EventTests(unittest.TestCase):
                     patch('event_store._FEATURE_CODE', []):
                 self.assertNotEqual(feature_identity(self.policy), original)
 
-    def test_ui_bookkeeping_does_not_censor_delay_or_reset_history(self):
-        rows = [raw_row(0, self.obs), raw_row(5, self.obs, ui=True),
+    def test_ui_bookkeeping_is_never_a_row_and_does_not_reset_history(self):
+        rows = [raw_row(0, self.obs), raw_row(6, self.obs, ui=True),
                 raw_row(30, self.obs, [{'kind': 'move', 'units': [10], 'position': [200, 300, 0]}]),
-                raw_row(37, self.obs, ui=True), raw_row(60, self.obs, [{'kind': 'stop', 'units': [10]}])]
+                raw_row(36, self.obs, ui=True), raw_row(60, self.obs, [{'kind': 'stop', 'units': [10]}])]
         counts = Counter()
-        chosen = list(decisions(rows, self.config, counts))
+        chosen = list(decisions(rows, self.config, counts, lambda frame: True))
         self.assertEqual([r['source']['frame'] for r in chosen], [0, 30, 60])
-        self.assertEqual([r['delay_ticks'] for r in chosen], [30, 30, None])
         self.assertEqual(chosen[2]['previous_frame'], 30)
         self.assertEqual(counts['ui_only_messages'], 2)
 
-    def test_quiet_intervals_start_and_terminal_are_bounded_and_censored(self):
-        rows = [raw_row(f, self.obs) for f in range(0, 307, 6)]
-        rows[-1]['terminal_sample'] = True
-        chosen = list(decisions(rows, self.config, Counter()))
-        self.assertEqual([r['source']['frame'] for r in chosen], [0, 120, 240])
-        self.assertEqual([r['delay_ticks'] for r in chosen], [120, 120, None])
-        # Off-grid commands cannot cause a synthetic earlier observation.
-        rows = [raw_row(1, self.obs, [{'kind': 'stop', 'units': [10]}])]
-        rows += [raw_row(f, self.obs) for f in range(6, 259, 6)]
-        selected = list(decisions(rows, self.config, Counter()))
-        self.assertEqual(selected[1]['source']['frame'], 120)
-        self.assertLessEqual(max(r['delay_ticks'] or 0 for r in selected), 120)
-
-    def test_unsupported_events_are_boundaries_never_wait_labels(self):
+    def test_unsupported_events_are_neither_commands_nor_no_ops(self):
         stop = [{'kind': 'stop', 'units': [10]}]
-        rows = [raw_row(0, self.obs, stop), raw_row(40, self.obs, unsupported=True), raw_row(80, self.obs, stop)]
+        rows = [raw_row(0, self.obs, stop), raw_row(42, self.obs, unsupported=True), raw_row(84, self.obs, stop)]
         counts = Counter()
-        chosen = list(decisions(rows, self.config, counts))
-        self.assertEqual([r['source']['frame'] for r in chosen], [0, 80])
-        self.assertTrue(all(r['delay_ticks'] is None for r in chosen))
+        chosen = list(decisions(rows, self.config, counts, lambda frame: True))
+        self.assertEqual([r['source']['frame'] for r in chosen], [0, 84])
         self.assertEqual(counts['excluded:unsupported'], 1)
 
-    def test_future_command_time_changes_targets_only(self):
+    def test_future_command_time_changes_neither_inputs_nor_target(self):
         def convert(frame):
             rows = [raw_row(0, self.obs), raw_row(frame, self.obs, [{'kind': 'stop', 'units': [10]}])]
-            game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+            game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
             return list(encoded_events(self.policy, game, Counter()))
         a, b = convert(30), convert(70)
         for name in ('scalars', 'numeric', 'extra_numeric', 'map_visibility'):
             np.testing.assert_array_equal(a[0]['encoded'][name], b[0]['encoded'][name])
-        self.assertNotEqual(a[0]['target']['delay'], b[0]['target']['delay'])
+        self.assertEqual(a[0]['target'], b[0]['target'])
 
-    def test_structural_failure_censors_delay_without_committing_history(self):
+    def test_structural_failure_does_not_commit_history(self):
         stop = [{'kind': 'stop', 'units': [10]}]
         bad = [{'kind': 'attack', 'units': [10], 'target': 123456}]
         rows = [raw_row(0, self.obs, stop), raw_row(30, self.obs, bad), raw_row(40, self.obs, stop)]
-        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         counts = Counter()
         chosen = list(encoded_events(self.policy, game, counts))
         self.assertEqual([row['frame'] for row in chosen], [0, 40])
-        self.assertNotIn('delay', chosen[0]['target'])
         self.assertEqual(counts['structural_exclusions'], 1)
         expected = self.policy.encoder.encode(self.obs, self.terrain, 40, previous_frame=0)
         np.testing.assert_array_equal(chosen[1]['encoded']['scalars'], expected['scalars'])
@@ -106,9 +90,9 @@ class EventTests(unittest.TestCase):
     def test_clock_rounding_multi_actor_deadlines_and_no_early_inference(self):
         actor = EventActor(self.policy, deterministic=True)
         actor.configure_clock(30)
+        actor.configure_look(1000*8/60)
         self.assertEqual(native_deadline(7, 30), 4)
-        self.assertEqual([i+1 for i, enabled in enumerate(delay_mask(self.config, 30)) if enabled][:3], [2, 4, 6])
-        trace = ([], {'kind': 'wait', 'delay': 7}, None, Tensor(0), Tensor(0), Tensor(0))
+        trace = ([], {'kind': 'wait'}, None, Tensor(0), Tensor(0), Tensor(0))
         with patch.object(self.policy, 'decide', return_value=trace), patch.object(
                 self.policy.encoder, 'encode', wraps=self.policy.encoder.encode) as encoder:
             actor.act(self.obs, self.terrain, 0)
@@ -126,13 +110,12 @@ class EventTests(unittest.TestCase):
         rows = [raw_row(0, self.obs), *[raw_row(f, self.obs, stop) for f in (1, 2, 3)],
                 raw_row(6, self.obs)]
         counts = Counter()
-        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         chosen = list(encoded_events(self.policy, game, counts))
-        self.assertEqual([r['frame'] for r in chosen], [0, 1, 2, 3])
+        self.assertEqual([r['frame'] for r in chosen], [0, 1, 2, 3, 6])
         self.assertEqual(counts['commands'], 3)
-        self.assertEqual([r['target'].get('delay') for r in chosen], [0, 0, 0, None])
         expected = self.policy.encoder.encode(self.obs, self.terrain, 3, previous_frame=2)
-        np.testing.assert_array_equal(chosen[-1]['encoded']['scalars'], expected['scalars'])
+        np.testing.assert_array_equal(chosen[-2]['encoded']['scalars'], expected['scalars'])
 
     def test_actor_conditions_on_a_rated_opponent_by_default(self):
         from generals_policy import PLAY_RATING, rating_inputs
@@ -150,7 +133,7 @@ class EventTests(unittest.TestCase):
         np.testing.assert_array_equal(actor.ratings, rated)
         actor.reset()
         np.testing.assert_array_equal(actor.ratings, rated)
-        trace = ([], {'kind': 'wait', 'delay': 7}, None, Tensor(0), Tensor(0), Tensor(0))
+        trace = ([], {'kind': 'wait'}, None, Tensor(0), Tensor(0), Tensor(0))
         # The rating input is off by default (config rating_input): the model then plays unrated.
         with patch.object(self.policy, 'decide', return_value=trace) as decide:
             actor.act(self.obs, self.terrain, 0)
@@ -203,7 +186,7 @@ class EventTests(unittest.TestCase):
         obs['player'].update(sciences=[], purchasable_sciences=['SCIENCE_RedGuardTraining'])
         buy = {'kind': 'science', 'science': 'SCIENCE_RedGuardTraining'}
         stop = {'kind': 'stop', 'units': [10]}
-        trace = ([stop], {'kind': 'stop', 'delay': 29}, None, Tensor(0), Tensor(0), Tensor(0))
+        trace = ([stop], {'kind': 'stop'}, None, Tensor(0), Tensor(0), Tensor(0))
         with patch.object(self.policy, 'decide', return_value=trace):
             self.assertEqual(actor.act(obs, self.terrain, 0), [buy, stop])
             self.assertEqual(actor.act(obs, self.terrain, 5), [buy])  # a skipped inference still buys
@@ -211,20 +194,20 @@ class EventTests(unittest.TestCase):
             self.assertEqual(actor.act(obs, self.terrain, 6), [])
         self.assertEqual(actor.counters['science_purchases'], 2)
 
-    def test_uncapped_actor_keeps_learned_delay_after_acceptance_or_rejection(self):
-        for delay in (1, 90):
+    def test_actor_looks_at_its_interval_after_acceptance_or_rejection(self):
+        for look, gap in ((3, 6), (12, 12)):  # At most ten orders a second, however often it looks.
             for accepted in (False, True):
-                with self.subTest(delay=delay, accepted=accepted):
+                with self.subTest(look=look, accepted=accepted):
                     actor = EventActor(self.policy)
-                    trace = ([{'kind': 'stop', 'units': [10]}],
-                             {'kind': 'stop', 'delay': delay-1}, None, Tensor(0), Tensor(0), Tensor(0))
+                    actor.configure_look(1000*look/60)
+                    trace = ([{'kind': 'stop', 'units': [10]}], {'kind': 'stop'}, None, Tensor(0), Tensor(0), Tensor(0))
                     with patch.object(self.policy, 'decide', return_value=trace) as decide:
                         actor.act(self.obs, self.terrain, 0)
                         actor.feedback([{'accepted': accepted}])
-                        self.assertEqual(actor.next_deadline_native, delay)
-                        actor.act(self.obs, self.terrain, delay-1)
+                        self.assertEqual(actor.next_deadline_native, gap)
+                        actor.act(self.obs, self.terrain, gap-1)
                         self.assertEqual(decide.call_count, 1)
-                        actor.act(self.obs, self.terrain, delay)
+                        actor.act(self.obs, self.terrain, gap)
                         self.assertEqual(decide.call_count, 2)
 
     def test_event_queues_are_uncapped_and_follow_engine_availability(self):
@@ -243,7 +226,7 @@ class EventTests(unittest.TestCase):
     def shard_dataset(self, root, *, validation=False):
         rows = [raw_row(0, self.obs)]
         rows += [raw_row(f, self.obs, [{'kind': 'stop', 'units': [10]}]) for f in range(30, 331, 30)]
-        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         shard = root/'shards/a.zip'
         result = write_shard(shard, [game], self.policy, {'match_key': 'test:1', 'path': 'absent-export'})
         document = {'kind': 'generals_event_dataset', 'schema': 1, 'config': self.config,
@@ -276,7 +259,7 @@ class EventTests(unittest.TestCase):
         delivered['template_stats'] = {'weapons': [weapon], 'armors': [{'id': 0, 'damage_multipliers': [.5]*DAMAGE_TYPES}]}
         rows = [raw_row(0, armed), raw_row(15, delivered)]
         rows += [raw_row(f, armed, [{'kind': 'stop', 'units': [10]}]) for f in range(30, 331, 30)]
-        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = write_shard(root/'shards/a.zip', [game], self.policy, {'match_key': 'test:1', 'path': 'absent'})
@@ -328,8 +311,7 @@ class EventTests(unittest.TestCase):
 
     def test_reduced_precisions_need_cuda_and_take_finite_updates(self):
         encoded = self.policy.encoder.encode(self.obs, self.terrain, 0)
-        rows = [{'encoded': encoded, 'target': {**self.policy.target(encoded, [{'kind': 'stop', 'units': [10]}]),
-                                                'delay': 30}}]
+        rows = [{'encoded': encoded, 'target': self.policy.target(encoded, [{'kind': 'stop', 'units': [10]}])}]
         for precision in ('tf32', 'bf16', 'fp16'):
             with self.subTest(precision=precision):
                 with self.assertRaises(ValueError):
@@ -343,7 +325,7 @@ class EventTests(unittest.TestCase):
 
     def test_optimizer_checkpoint_continuation_is_exact(self):
         encoded = self.policy.encoder.encode(self.obs, self.terrain, 0)
-        rows = [{'encoded': encoded, 'target': {**self.policy.target(encoded, []), 'delay': 119}}]
+        rows = [{'encoded': encoded, 'target': self.policy.target(encoded, [])}]
         left = EventLearner(NeuralPolicy(self.config, 5), device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         right = EventLearner(NeuralPolicy(self.config, 5), device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         left.batch(rows, train=True); right.batch(rows, train=True)
@@ -354,8 +336,8 @@ class EventTests(unittest.TestCase):
             right = EventLearner(policy, optimizer, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
             right.restore_rng(document['metadata'])
             # New command heads receive their first gradient after resuming.
-            command = [{'encoded': encoded, 'target': {**self.policy.target(encoded,
-                       [{'kind': 'stop', 'units': [10]}]), 'delay': 119}}]
+            command = [{'encoded': encoded, 'target': self.policy.target(encoded,
+                       [{'kind': 'stop', 'units': [10]}])}]
             left.batch(command, train=True); right.batch(command, train=True)
             for name in left.model.weights:
                 np.testing.assert_array_equal(left.model.weights[name].detach().cpu().numpy(),
@@ -371,7 +353,7 @@ class EventTests(unittest.TestCase):
         self.assertEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
         wider = copy.deepcopy(self.config); wider['widths'] = {**wider['widths'], 'core': 2*wider['widths']['core']}
         self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(wider, parameters=False)))
-        config['event_max_delay'], config['delay_ticks'] = 60, list(range(1, 61))
+        config['snapshot_rate'] = .25
         self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
 
     def test_low_memory_preflight_prevents_dataset_and_model_allocation(self):
@@ -389,7 +371,7 @@ class EventTests(unittest.TestCase):
             root = Path(temporary)
             data = self.shard_dataset(root/'data')
             settings = dict(dataset=str(data.path), resume=None, device='cpu', epochs=1, max_updates=0,
-                seed=123, lr=3e-4, threads=1, lanes=2, unroll=3, part_lanes=1, pair_budget=2_000_000,
+                seed=123, lr=3e-4, threads=1, lanes=1, unroll=3, part_lanes=1, pair_budget=2_000_000,
                 cache_mib=1, checkpoint_seconds=600, min_free_ram_mib=4096, max_private_mib=8192)
             full = train(SimpleNamespace(**settings, output=str(root/'full')))
             stop_file = root/'stop.json'

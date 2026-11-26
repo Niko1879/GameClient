@@ -43,15 +43,14 @@ class FastPlacementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'construction outcome'):
             adapter.decode(sample(missing))
 
-    def test_rejected_request_does_not_reset_or_censor_decision_delay(self):
+    def test_rejected_request_is_not_a_row(self):
         config,obs,_ = fixture()
         stop=[dict(kind='stop',units=[10])]
         rejected=raw_row(30,obs,ui=True)
         rejected['rejected_build_requests']=1
         counts=Counter()
-        events=list(decisions([raw_row(0,obs,stop),rejected,raw_row(60,obs,stop)],config,counts))
+        events=list(decisions([raw_row(0,obs,stop),rejected,raw_row(60,obs,stop)],config,counts,lambda frame: True))
         self.assertEqual([e['source']['frame'] for e in events],[0,60])
-        self.assertEqual(events[0]['delay_ticks'],60)
         self.assertEqual(counts['rejected_build_requests'],1)
 
     def test_fast_training_needs_no_grid_and_torch_matches_reference(self):

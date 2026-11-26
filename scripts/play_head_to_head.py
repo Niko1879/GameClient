@@ -30,14 +30,18 @@ import run_prepared_training as runner
 from openers import NAMED
 
 MAPS = {'[RANK] TD NoBugsCars ZH v1': 'ed468fe5a5cb4e2145fa0b37bc5d2a1d4eec58b55fba58395deebe9f17dbd083',
-        'Tournament Desert': 'db429b884bc593971feb9d545ada1f1d0aea114f2262b052fe46d81f9f034d01'}
+        'Tournament Desert': 'db429b884bc593971feb9d545ada1f1d0aea114f2262b052fe46d81f9f034d01',
+        # The top-10k training set's commonest map (10.6% of its matches; the TD maps are 3.5%).
+        '[RANK] Vendetta ZH v1': 'bb57fdd9ae1a876d3a1296690ae452dadc35b76b8dd4f741ca1bf2231dda5ab4'}
+DEFAULT_MAPS = ('[RANK] TD NoBugsCars ZH v1', 'Tournament Desert')
 START_RAM, STOP_RAM = 3*1024**3, 1024**3
 FPS = 60
 
 
-def games(seeds):
+def games(seeds, maps=DEFAULT_MAPS):
     out = []
-    for m, name in enumerate(MAPS):
+    for name in maps:
+        m = list(MAPS).index(name)
         for s in range(seeds):
             for side in (0, 1):
                 out.append(dict(name=f'm{m}-s{s}-a{side}', map=name, side=side, seed=902000+100*m+s))
@@ -98,6 +102,8 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--seeds', type=int, default=5, help='Seeds per map; each seed is played from both sides')
     parser.add_argument('--parallel', type=int, default=4)
+    parser.add_argument('--maps', nargs='+', choices=sorted(MAPS), default=list(DEFAULT_MAPS),
+                        help='Maps to play (default: the two Tournament Desert evaluation maps)')
     parser.add_argument('--minutes', type=float, default=20)
     parser.add_argument('--stagger', type=float, default=20,
                         help='Seconds between game starts: loading two checkpoints peaks well above a running game, '
@@ -109,6 +115,11 @@ def main():
     parser.add_argument('--a-opener', choices=('none', *sorted(NAMED)), default='none',
                         help='Strategy input z of A (scripts/openers.py NAMED)')
     parser.add_argument('--b-opener', choices=('none', *sorted(NAMED)), default='none', help='Strategy input z of B')
+    parser.add_argument('--a-apm', type=float, help='Pace of A (evaluate_events --apm)')
+    parser.add_argument('--b-apm', type=float, help='Pace of B')
+    parser.add_argument('--a-constant-pace', action='store_true', help='A acts at its APM rate, never no-op (evaluate_events --constant-pace)')
+    parser.add_argument('--b-constant-pace', action='store_true', help='The same for B')
+    parser.add_argument('--look-ms', type=float, help='Game time between looks of both sides (evaluate_events --look-ms)')
     parser.add_argument('--a-rating-input', action='store_true',
                         help='A was trained with the rating input (its run directory holds RATING_INPUT)')
     parser.add_argument('--b-rating-input', action='store_true', help='B was trained with the rating input')
@@ -140,15 +151,20 @@ def main():
     meta = dict(a=str(Path(args.a).resolve()), b=str(Path(args.b).resolve()),
                 a_sha256=cycle.digest(frozen['a']), b_sha256=cycle.digest(frozen['b']),
                 engine=str(engine_path), engine_sha256=cycle.digest(engine_path), minutes=args.minutes,
+                **({'maps': list(args.maps)} if tuple(args.maps) != DEFAULT_MAPS else {}),
                 **({'factions': dict(a=args.a_faction, b=args.b_faction)}
                    if (args.a_faction, args.b_faction) != ('FactionChina', 'FactionChina') else {}),
                 ratings=dict(a=args.a_rating, b=args.b_rating, view=args.rating_view,
                              **({'a_input': True} if args.a_rating_input else {}),
                              **({'b_input': True} if args.b_rating_input else {})),
                 **({'openers': dict(a=args.a_opener, b=args.b_opener)}
-                   if (args.a_opener, args.b_opener) != ('none', 'none') else {}))
+                   if (args.a_opener, args.b_opener) != ('none', 'none') else {}),
+                **({'apm': dict(a=args.a_apm, b=args.b_apm)} if (args.a_apm, args.b_apm) != (None, None) else {}),
+                **({'look_ms': args.look_ms} if args.look_ms is not None else {}),
+                **({'constant_pace': dict(a=args.a_constant_pace, b=args.b_constant_pace)}
+                   if args.a_constant_pace or args.b_constant_pace else {}))
     previous = cycle.load(output/'meta.json')
-    if previous and (any(previous.get(k) != meta.get(k) for k in ('a_sha256', 'b_sha256', 'engine_sha256', 'minutes', 'openers'))
+    if previous and (any(previous.get(k) != meta.get(k) for k in ('a_sha256', 'b_sha256', 'engine_sha256', 'minutes', 'maps', 'openers', 'apm', 'look_ms', 'constant_pace'))
                      or previous.get('ratings', dict(a=None, b=None, view='true')) != meta['ratings']):
         raise SystemExit('Output directory holds a different matchup; use a new --output')
     cycle.save(output/'meta.json', meta)
@@ -164,15 +180,15 @@ def main():
     for slot in range(args.parallel):
         profile = output/f'profile-{slot}'
         if not (profile/'Maps').is_dir():
-            isolation_profile(ROOT/'replay-runtime/gameplay-profile', profile, maps=list(MAPS))
-        for name, sha in MAPS.items():
+            isolation_profile(ROOT/'replay-runtime/gameplay-profile', profile, maps=list(args.maps))
+        for name, sha in ((n, MAPS[n]) for n in args.maps):
             assert cycle.digest(profile/'Maps'/name/(name+'.map')) == sha
         preflight(engine, profile, output/'logs'/f'preflight-{slot}.log', 120)
         profiles.append(profile)
 
     results_path = output/'results.json'
     results = {r['game']['name']: r for r in (cycle.load(results_path) or [])}
-    todo = [g for g in games(args.seeds) if g['name'] not in results]
+    todo = [g for g in games(args.seeds, args.maps) if g['name'] not in results]
     failures = {}  # game name -> failed attempts; a failed game is retried later, not fatal for the others
     running = {}  # slot -> (game, process, family, log, start)
     frames = str(round(args.minutes*60*FPS))
@@ -210,6 +226,16 @@ def main():
                     command += ['--rating', str(args.a_rating)]
                 if args.b_rating is not None:
                     command += ['--opponent-rating', str(args.b_rating)]
+                if args.a_apm is not None:
+                    command += ['--apm', str(args.a_apm)]
+                if args.b_apm is not None:
+                    command += ['--opponent-apm', str(args.b_apm)]
+                if args.look_ms is not None:
+                    command += ['--look-ms', str(args.look_ms)]
+                if args.a_constant_pace:
+                    command += ['--constant-pace']
+                if args.b_constant_pace:
+                    command += ['--opponent-constant-pace']
                 if args.record_replays:
                     command += ['--record-replay']
                 if args.device:

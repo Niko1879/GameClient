@@ -13,7 +13,7 @@ from event_store import feature_identity, write_shard
 from generals_policy import NeuralPolicy
 from prepared_io import _write_json
 from tensor_replay_store import Column, decode_columns, encode_columns
-from test_fixtures import fixture, raw_row
+from test_fixtures import RECORDING, fixture, raw_row
 
 
 class Float32FeatureTests(unittest.TestCase):
@@ -24,7 +24,7 @@ class Float32FeatureTests(unittest.TestCase):
         columns = dict(features=Column.build(values, float_dtype='float32'),
                        ids=Column.build([np.array([2**53+1], dtype=np.int64)]*4, float_dtype='float32'),
                        masks=Column.build([np.array([True, False, True])]*4, float_dtype='float32'))
-        encoded = encode_columns(columns, [{'target': {'kind': 'wait', 'delay': i}} for i in range(4)],
+        encoded = encode_columns(columns, [{'target': {'kind': 'move', 'x': i}} for i in range(4)],
                                  float_dtype='float32')
         restored, metadata = decode_columns(encoded)
         self.assertEqual(restored['features'].data.dtype, np.float32)
@@ -32,7 +32,7 @@ class Float32FeatureTests(unittest.TestCase):
         self.assertEqual(restored['masks'].data.dtype, np.bool_)
         self.assertEqual(restored['ids'].at(0)[0], 2**53+1)
         self.assertEqual(len(restored['features'].shapes), 2)
-        self.assertEqual(metadata[3]['target']['delay'], 3)
+        self.assertEqual(metadata[3]['target']['x'], 3)
         for i, value in enumerate(values):
             if value is None:
                 self.assertIsNone(restored['features'].at(i))
@@ -54,7 +54,7 @@ class Float32FeatureTests(unittest.TestCase):
         config, obs, terrain = fixture()
         policy = NeuralPolicy(config)
         rows = [raw_row(0, obs), raw_row(30, obs, [{'kind': 'stop', 'units': [10]}]), raw_row(60, obs, terminal=True)]
-        game = dict(player=2, map=terrain, rows=rows, source_ticks_per_second=60)
+        game = dict(player=2, map=terrain, rows=rows, source_ticks_per_second=60, replay_sha256=RECORDING)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root/'shard.zip'
@@ -72,8 +72,7 @@ class Float32FeatureTests(unittest.TestCase):
                                                   config=config, entries=[entry]))
             dataset = EventDataset(root/'dataset.json')
             decoded = [row for ref in dataset.chunks('train') for row in dataset.read(ref)]
-            self.assertEqual([(row['frame'], row['target']['kind'], row['target'].get('delay')) for row in decoded],
-                             [(0, 'wait', 29), (30, 'stop', None)])
+            self.assertEqual([(row['frame'], row['target']['kind']) for row in decoded], [(0, 'wait'), (30, 'stop')])
 
 
 if __name__ == '__main__':

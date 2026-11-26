@@ -284,6 +284,7 @@ def check_shard(job):
     dataset = object.__new__(EventDataset)
     dataset.path = DATA/'.shard-validation.json'
     dataset.entries, dataset.key, dataset.verified, dataset.shared = [entry], _KEY, {}, {}
+    dataset.noop_share = 1.0
     try:
         factions = match_factions(index['source']['original_replay'])
         entry['faction_identities'] = ([list(_SPEC.reference.encoder.identity.player_identity(f)) for f in factions]

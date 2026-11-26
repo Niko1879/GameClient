@@ -17,7 +17,7 @@ from event_store import feature_identity, write_shard
 from generals_policy import OPENER_BUILDINGS, OPENER_WINDOW_SECONDS, NeuralPolicy, opener_inputs, scalar_input_slices
 from nn_numpy import Tensor, no_grad
 from prepared_io import _write_json
-from test_fixtures import fixture, raw_row
+from test_fixtures import RECORDING, fixture, raw_row
 from train_events import EventLearner
 from training_legality import build_legality
 
@@ -41,9 +41,9 @@ class OpenerExtractionTests(unittest.TestCase):
         self.assertEqual([t for t, _ in orders], [12, 15, 15, 1, 28, 28])  # 660 is a re-click of 600
         self.assertEqual(orders[-1][1], 40.0)
 
-    def test_retail_rows_count_seconds_at_their_own_rate(self):
-        # 30 ticks/s: 60 ticks apart is 2 s, a re-click; 120 apart is 4 s, a second building.
-        orders = openers.build_orders([build(15, 0, 30), build(15, 60, 30), build(15, 180, 30)])
+    def test_retail_rows_count_seconds_in_stored_canonical_frames(self):
+        # A 30 Hz recording is stored at 60 ticks/s too: 120 ticks apart is 2 s, a re-click; 240 apart is 4 s.
+        orders = openers.build_orders([build(15, 0, 30), build(15, 120, 30), build(15, 360, 30)])
         self.assertEqual([round(s) for _, s in orders], [0, 6])
 
     def test_shard_headers_across_chunks_and_short_games(self):
@@ -93,7 +93,7 @@ class OpenerModelTests(unittest.TestCase):
 
     def test_dataset_rows_carry_z_only_in_the_window_and_when_not_blanked(self):
         rows = [raw_row(f, self.obs, [{'kind': 'stop', 'units': [10]}]) for f in range(30, 331, 30)]
-        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2}
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result = write_shard(root/'a.zip', [game], self.policy, {'match_key': 'test:1', 'path': 'absent'})
@@ -123,9 +123,9 @@ class OpenerModelTests(unittest.TestCase):
         given = {**encoded, 'opener': opener_inputs(self.config, self.plan)}
         rows, targets = [], []
         for item in (given, encoded):
-            target = {**self.policy.target(item, [{'kind': 'stop', 'units': [10]}]), 'delay': 30}
+            target = self.policy.target(item, [{'kind': 'stop', 'units': [10]}])
             item['_training_legality'] = build_legality(self.policy, item, target, key)
-            rows.append({'encoded': item, 'target': target, 'hold_ticks': 6, 'scope': 'event'})
+            rows.append({'encoded': item, 'target': target, 'scope': 'event'})
             targets.append(target)
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key
@@ -141,7 +141,7 @@ class OpenerModelTests(unittest.TestCase):
 
     def test_actor_shows_its_opener_only_in_the_window_and_keeps_it_across_games(self):
         actor = EventActor(self.policy)
-        trace = ([], {'kind': 'wait', 'delay': 7}, None, Tensor(0), Tensor(0), Tensor(0))
+        trace = ([], {'kind': 'wait'}, None, Tensor(0), Tensor(0), Tensor(0))
         with patch.object(self.policy, 'decide', return_value=trace) as decide:
             actor.act(self.obs, self.terrain, 0)
         self.assertFalse(decide.call_args[0][0]['opener'].any(), 'no opener unless one is configured')

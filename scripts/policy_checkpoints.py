@@ -35,6 +35,15 @@ def load_policy(path):
     return policy_modules(path)[0].load(path)
 
 
+def actor_class(policy):
+    """The deployed actor for a loaded or live policy: the memory-free policies schedule by their delay head."""
+    if type(policy).__module__ in ('generals_policy_old', 'torch_live_policy_old'):
+        from event_policy_old import DelayActor
+        return DelayActor
+    from event_policy import EventActor
+    return EventActor
+
+
 def live_policy(reference, **options):
     """The PyTorch live policy for a loaded reference policy, from the reference's own generation."""
     if type(reference).__module__ == 'generals_policy_old':

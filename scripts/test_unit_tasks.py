@@ -14,7 +14,7 @@ from nn_numpy import no_grad
 from replay_events import encoded_events
 from replay_sequences import normalize_demonstration
 from tensor_replay_store import project, encode_columns, decode_columns, TensorRows
-from test_fixtures import fixture, grid, raw_row, task, trunk_arrays
+from test_fixtures import RECORDING, fixture, grid, raw_row, task, trunk_arrays
 from train_events import EventLearner
 from training_legality import build_legality
 from unit_tasks import TASKS, RELATIONS
@@ -132,7 +132,7 @@ class UnitTaskTests(unittest.TestCase):
             rows = [raw_row(0, self.obs), raw_row(60, self.obs,
                 [{'kind': kind, 'units': [10], **({'target': 99} if kind == 'attack' else {})}])]
             return list(encoded_events(self.policy, {'rows': rows, 'map': self.terrain,
-                'player': 2, 'source_ticks_per_second': 60}, Counter()))[0]
+                'player': 2, 'source_ticks_per_second': 60, 'replay_sha256': RECORDING}, Counter()))[0]
         left, right = convert('stop'), convert('attack')
         for name in ('task_numeric', 'task_relations', 'task_commands'):
             np.testing.assert_array_equal(left['encoded'][name], right['encoded'][name])
@@ -146,7 +146,7 @@ class UnitTaskTests(unittest.TestCase):
     def test_replay_pretraining_keeps_unseen_receipt_inputs_neutral(self):
         before = self.encode()
         learner = EventLearner(self.policy)
-        rows = [{'encoded': before, 'target': {**self.policy.target(before, [{'kind': 'stop', 'units': [10]}]), 'delay': 5}}]
+        rows = [{'encoded': before, 'target': self.policy.target(before, [{'kind': 'stop', 'units': [10]}])}]
         learner.batch(rows, train=True)
         obs = copy.deepcopy(self.obs)
         obs['last_validation'] = {'available': True, 'kind': 'move', 'actors': [10],
@@ -200,8 +200,8 @@ class UnitTaskTests(unittest.TestCase):
         rows = []
         for action in actions:
             encoded = self.encode(obs)
-            target = {**self.policy.target(encoded, action), 'delay': 5}
-            rows.append({'encoded': encoded, 'target': target, 'hold_ticks': 6, 'scope': 'event'})
+            target = self.policy.target(encoded, action)
+            rows.append({'encoded': encoded, 'target': target, 'scope': 'event'})
         key = feature_identity(self.policy)
         for row in rows:
             row['encoded']['_training_legality'] = build_legality(self.policy, row['encoded'], row['target'], key)
@@ -245,9 +245,9 @@ class UnitTaskTests(unittest.TestCase):
         rows = []
         for obs in (dead, self.obs):
             encoded = self.encode(obs)
-            target = {**self.policy.target(encoded, []), 'delay': 5}
+            target = self.policy.target(encoded, [])
             encoded['_training_legality'] = build_legality(self.policy, encoded, target, key)
-            rows.append({'encoded': encoded, 'target': target, 'hold_ticks': 6, 'scope': 'event'})
+            rows.append({'encoded': encoded, 'target': target, 'scope': 'event'})
         self.assertFalse(rows[0]['encoded']['own'].any())
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key

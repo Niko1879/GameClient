@@ -134,7 +134,7 @@ class IdentityHierarchyTests(unittest.TestCase):
         target = self.policy.target(self.encoded, [{'kind': 'build', 'builder': 10,
                       'template': 'ChinaPowerPlant', 'position': [230, 350, 0]}])
         def loss():
-            result = self.policy.decide(self.encoded, teacher={**target, 'delay': 3})
+            result = self.policy.decide(self.encoded, teacher=target)
             return -result[4]+result[3]*result[3]*.1
         loss().backward()
         obj = self.identity.objects['ChinaVehicleDozer']
@@ -164,7 +164,7 @@ class IdentityHierarchyTests(unittest.TestCase):
         learner = EventLearner(policy)
         regularization = float(learner.model.regularization_loss())
         self.assertGreater(regularization, 0)
-        learner.batch([{'encoded': self.encoded, 'target': {'kind': 'wait', 'delay': 5}}], train=True)
+        learner.batch([{'encoded': self.encoded, 'target': {'kind': 'wait'}}], train=True)
         updated = learner.model.weights['variant_embedding'].detach().numpy()[obj]
         self.assertTrue((updated < .25).all())
 

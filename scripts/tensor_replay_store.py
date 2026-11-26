@@ -223,7 +223,7 @@ def project(rows, common, policy, key, *, float_dtype=None):
         encoded, legality = row['encoded'], row['encoded']['_training_legality']
         if legality['key'] != key or legality['teacher'] != row['target']:
             raise ValueError('Column projection legality differs from teacher')
-        meta = {'row': {name: row[name] for name in ('target', 'hold_ticks', 'scope') if name in row},
+        meta = {'row': {name: row[name] for name in ('target', 'scope') if name in row},
                 'encoded': {'entity_count': len(encoded['entities']), 'rotated': bool(encoded['rotated'])}}
         for name in ARRAY_FIELDS:
             value = encoded.get(name)

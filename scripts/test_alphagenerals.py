@@ -18,7 +18,7 @@ from prepared_io import _write_json
 from tensor_replay_store import TensorRows, decode_columns, encode_columns, project
 from test_command_actions import ACTIONS as COMMAND_ACTIONS, fixture_commands
 from test_current_perception import perceived
-from test_fixtures import entity, fixture, raw_row
+from test_fixtures import RECORDING, entity, fixture, raw_row
 from test_policy import ACTIONS as BASIC_ACTIONS
 from torch_policy_v3 import TorchPolicyV3
 from torch_training_inputs import teacher_heads
@@ -50,7 +50,7 @@ def rows_for(policy, observation, terrain):
             target = policy.target(encoded, actions)
         except ValueError:  # e.g. a basic group order naming units this fixture does not hold
             continue
-        rows.append({'encoded': encoded, 'target': {**target, 'delay': 5}})
+        rows.append({'encoded': encoded, 'target': target})
     return rows
 
 
@@ -78,7 +78,7 @@ class HeadAgreementTests(unittest.TestCase):
                 self.assertEqual(len(encoded[0]['effect_numeric']), 0)
             else:
                 self.assertGreater(len(encoded[0]['effect_numeric']), 0)
-        self.assertEqual(heads, {'decision', 'delay', 'unit', 'target', 'slot', 'angle', 'cell', 'offset'})
+        self.assertEqual(heads, {'decision', 'unit', 'target', 'slot', 'angle', 'cell', 'offset'})
 
     def test_full_mask_build_scores_position_with_its_placement_features(self):
         from test_build_placement import PlacementTests
@@ -213,7 +213,7 @@ class LaneSamplerTests(unittest.TestCase):
                                                   (4, 'validation'), (7, 'validation'))):
             rows = [raw_row(0, fixture_case.obs)]+[raw_row(30*(i+1), fixture_case.obs, [{'kind': 'stop', 'units': [10]}])
                                                    for i in range(length)]
-            game = {'rows': rows, 'map': fixture_case.terrain, 'source_ticks_per_second': 60, 'player': 2}
+            game = {'rows': rows, 'map': fixture_case.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
             result = write_shard(root/f'shards/{number}.zip', [game], fixture_case.policy, {'match_key': f'test:{number}'})
             entries.append({**result, 'path': f'shards/{number}.zip', 'match_key': f'test:{number}', 'split': split})
         _write_json(root/'dataset.json', {'kind': 'generals_event_dataset', 'schema': 1, 'config': fixture_case.config,
@@ -224,12 +224,12 @@ class LaneSamplerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_every_training_decision_once_per_epoch_in_episode_order(self):
+    def test_every_decision_once_per_pass_in_episode_order(self):
         dataset = self.dataset
         episodes = dataset.episodes('train')
         for epoch in (0, 1):
             seen = {number: [] for number in range(len(episodes))}
-            for schedule in dataset.lane_schedule('train', seed=1, epoch=epoch, lanes=3, steps=4):
+            for schedule in dataset.lane_schedule('train', seed=1, epoch=epoch, lanes=3, steps=4, shuffle=False):
                 episode, row, reset = schedule
                 np.testing.assert_array_equal(reset, (episode >= 0) & (row == 0))
                 for lane in range(3):
@@ -244,12 +244,23 @@ class LaneSamplerTests(unittest.TestCase):
                 self.assertEqual(seen[number], list(range(count)))
         # Rows reach a lane in game order.
         frames = {}
-        for schedule in dataset.lane_schedule('train', seed=1, epoch=0, lanes=2, steps=3):
+        for schedule in dataset.lane_schedule('train', seed=1, epoch=0, lanes=2, steps=3, shuffle=False):
             for value in dataset.lane_rows('train', schedule, range(2)):
                 frames.setdefault((value['match_key'], value['player']), []).append(value['frame'])
         for values in frames.values():
             self.assertEqual(values, sorted(values))
         self.assertEqual(sum(map(len, frames.values())), sum(count for _, count in episodes))
+
+    def test_a_training_epoch_ends_at_its_last_full_update(self):
+        rows = sum(count for _, count in self.dataset.episodes('train'))
+        updates = [episode for episode, _, _ in self.dataset.lane_schedule('train', seed=1, epoch=0, lanes=2, steps=3)]
+        self.assertGreater(len(updates), 1)
+        self.assertTrue(all((episode >= 0).all() for episode in updates))
+        full = [episode for episode, _, _ in self.dataset.lane_schedule('train', seed=1, epoch=0, lanes=2, steps=3, shuffle=False)]
+        self.assertEqual(sum(int((episode >= 0).sum()) for episode in full), rows)
+        # Too few rows for one full update: one partial update, not none.
+        (episode, _, _), = self.dataset.lane_schedule('train', seed=1, epoch=0, lanes=1000, steps=3)
+        self.assertLess(int((episode >= 0).sum()), 3000)
 
     def test_validation_matches_never_appear_in_training(self):
         dataset = self.dataset
@@ -306,8 +317,7 @@ class GradientAndCheckpointTests(unittest.TestCase):
 @unittest.skipUnless(all(path.exists() for path in OLD_CHECKPOINTS), 'old checkpoints are local only')
 class OldCheckpointTests(unittest.TestCase):
     def test_v11_1500_and_70m_load_through_the_old_modules_and_decide(self):
-        from event_policy import EventActor
-        from policy_checkpoints import is_old, load_policy, policy_modules
+        from policy_checkpoints import actor_class, is_old, load_policy, policy_modules
         for path in OLD_CHECKPOINTS:
             with self.subTest(path.parent.name):
                 self.assertTrue(is_old(path))
@@ -320,7 +330,8 @@ class OldCheckpointTests(unittest.TestCase):
                 terrain = {'grid_size': side, 'extent_low': [0, 0, 0], 'extent_high': [1000, 1000, 100],
                            'height': [0]*side*side, 'cliff': [0]*side*side}
                 observation['visibility_grid'] = [2]*side*side
-                actor = EventActor(live, 3)
+                actor = actor_class(live)(live, 3)
+                self.assertEqual(type(actor).__name__, 'DelayActor')
                 for frame in (0, 300, 600):
                     actor.next_decision_frame = 0
                     actor.act(copy.deepcopy(observation), terrain, frame)

@@ -406,7 +406,7 @@ def export(args):
     require(logic in ('current', '081326', '062026'), 'Unknown replay logic')
     # 062026 loads particle templates at engine start, so a reused engine session can't switch to it.
     require(logic != '062026' or getattr(args, 'engine_session', None) is None, '062026 logic needs a fresh engine')
-    # scheduled: quiet observations only where the event schedule can use them
+    # scheduled: quiet observations only at the player's no-op snapshot frames
     # (scheduled_capture.py); preparation output is unchanged.
     quiet_capture = getattr(args, 'quiet_capture', 'all')
     require(quiet_capture in ('all', 'scheduled'), 'Quiet capture must be all or scheduled')
@@ -432,7 +432,7 @@ def export(args):
 
     def play():
         """One native run of this replay: (status, validation, exit code, earlier games in its process)."""
-        controller = (CaptureController(args.capture_policy, replay, trajectory)
+        controller = (CaptureController(args.capture_policy, replay, replay_digest, trajectory)
                       if quiet_capture == 'scheduled' else None)
         earlier = 0
         try:
@@ -458,10 +458,6 @@ def export(args):
         if status in ('passed', 'crc_diverged') and getattr(args, 'ticks_per_second', None) is not None:
             if native['ticks_per_second'] != args.ticks_per_second:
                 status = 'rate_mismatch'
-        # A failed capture schedule matters only for a playback that would be exported.
-        failure = controller.failure() if controller is not None else None
-        if failure is not None and status in ('passed', 'crc_diverged'):
-            raise RuntimeError('Capture schedule failed') from failure
         return status, native, returncode, earlier
 
     status, native, returncode, earlier = play()

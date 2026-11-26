@@ -1403,8 +1403,10 @@ class NeuralPolicy:
     def _template_embeddings(self):
         return self.object_embedding(self.encoder.identity.template_objects)
 
-    def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False):
-        """One decision: action type, delay, then a command's arguments; DEFER has only the first two."""
+    def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False, allow_wait=True):
+        """One decision: action type, delay, then a command's arguments; DEFER has only the first two.
+
+        allow_wait=False masks wait whenever any command is legal (EventActor.configure_pace)."""
         from event_schedule import delay_mask
         hidden, entity, spatial, value, gate = self._trunk(encoded)
         p, config, trace = self.parameters, self.config, {}
@@ -1424,7 +1426,10 @@ class NeuralPolicy:
         delays = delay_mask(config, encoded.get('event_rate', 60))
         first_delay = int(np.flatnonzero(delays)[0])
         logits, core = self._action_type(hidden, gate)
-        verb = draw('decision', logits, self.verb_mask(encoded),
+        verbs = self.verb_mask(encoded)
+        if not allow_wait and verbs[1:].any():
+            verbs = np.concatenate([[False], verbs[1:]])
+        verb = draw('decision', logits, verbs,
                     KINDS.index(teacher['kind']) if teacher is not None else None)
         one_hot = np.zeros(len(KINDS))
         one_hot[verb] = 1

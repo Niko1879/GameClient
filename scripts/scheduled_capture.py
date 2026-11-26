@@ -3,32 +3,24 @@
 With `-trainingQuietCapture scheduled` the engine writes every sample's metadata,
 but a quiet cadence sample carries its observation only when this controller
 names its frame; command samples and each player's first sample always carry
-one. The controller follows the export file as it is written and runs the same
-event schedule as preparation (replay_events.decisions with EventValidator,
-which encodes command rows to learn whether they are accepted). The engine flushes
-every row with an observation and says so ("rows"), so validation runs alongside
-the game. At a quiet cadence frame it may ask which quiet frames will need one:
+one. Preparation keeps the quiet frames event_schedule.is_snapshot draws from the
+recording, the player and the frame, so the answer to "which quiet frames will need
+one?" is the player's next snapshot frame, known in advance:
 
-  no decision yet         -> this frame
-  last decision at L      -> the last quiet frame before L+cap and the first at
-                             or after L+cap: the only quiet rows decisions() can
-                             select before another observed row changes L
-  episode finished        -> none
+  episode running  -> the next snapshot frame at or after this one that is quiet
+  episode finished -> none (never asked again)
 
-decisions() changes its last decision only while consuming an observed row, and
-the rows an answer names cannot change it before its last frame, so an answer
-stays valid until then or until a command row. Commands only move the schedule
-later, so a quiet frame before the first frame of the latest answer cannot be
-selected and the engine does not ask there. Future quiet frames come from the
-original replay's command stream (audit_replay_commands.binary_commands, which
-every export is reconciled against); each arriving row is checked against it.
-Preparation still reads the finished export; a quiet row it needs but cannot
-find fails loudly rather than producing different data.
+An answer stays valid until its frame has passed; the engine also asks again after a
+command row, but never before the latest answer's frame. Quiet frames come from the
+original replay's command stream (audit_replay_commands.binary_commands, which every
+export is reconciled against); each arriving row is checked against it. The controller
+follows the export file as it is written (the engine flushes earlier rows before it
+asks) only to see an episode end early: production outside the scope, as in decisions().
+Preparation still reads the finished export; a snapshot it needs but cannot find fails
+loudly rather than producing different data.
 """
 from __future__ import annotations
 
-from collections import deque
-from itertools import chain
 import json
 import os
 from pathlib import Path
@@ -39,10 +31,9 @@ import time
 from audit_replay_commands import binary_commands, message_names
 from binary_replay import stream_records
 from engine_runtime import disable_power_throttling
-from generals_policy import NeuralPolicy
+from event_schedule import is_snapshot
 from replay_actions import ReplayActionAdapter
-from replay_events import EventValidator, decisions
-from replay_sequences import normalize_demonstration
+from replay_events import outside_production_scope
 
 IGNORED = {'MSG_BEGIN_NETWORK_MESSAGES', 'MSG_LOGIC_CRC', 'MSG_SET_REPLAY_CAMERA'}
 ROWS_READY = 'GAIX {"event":"rows"}\n'
@@ -57,40 +48,15 @@ def command_frames(replay):
     return frames
 
 
-def wanted_frames(frame, last_decision, finished, cap, cadence, quiet):
-    """Quiet frames from `frame` on that decisions() can select from this state.
+def next_snapshot(config, replay_sha256, player, frame, rate, cadence, quiet):
+    """The first quiet snapshot frame at or after `frame`, in the engine's own frames.
 
-    From last decision L, a quiet row is selected either as the last quiet row
-    before L+cap (promoted when the next row passes L+cap) or as the first
-    quiet row at or after L+cap. With no decision yet, the next quiet row is.
-    """
-    if finished:
-        return []
-    if last_decision is None:
-        return [frame]
-    end, wanted = last_decision+cap, []
-    last = (end-1)//cadence*cadence
-    while last >= frame and not quiet(last):
-        last -= cadence
-    if last >= frame:
-        wanted.append(last)
-    first = max(frame, -(-end//cadence)*cadence)
-    while not quiet(first):
-        first += cadence
-    wanted.append(first)
-    return wanted
-
-
-def wanted_native(frame, rate, last_decision, finished, cap, cadence, quiet):
-    """wanted_frames for an engine running at `rate` Hz, in its own frames.
-
-    The schedule runs in canonical 60 Hz frames, as preparation feeds decisions()
-    (replay_sequences.normalize_demonstration); `frame`, `cadence`, `quiet` and the
-    answer are native.
-    """
+    Snapshots are drawn in canonical 60 Hz frames, as preparation sees them."""
     scale = 60//rate
-    return [f//scale for f in wanted_frames(frame*scale, last_decision, finished, cap, cadence*scale,
-                                            lambda f: f % scale == 0 and quiet(f//scale))]
+    frame = -(-frame//cadence)*cadence
+    while not (quiet(frame) and is_snapshot(config, replay_sha256, player, frame*scale)):
+        frame += cadence
+    return frame
 
 
 class GrowingFile:
@@ -99,7 +65,7 @@ class GrowingFile:
     Opened with delete sharing, so the engine can rename its .part file when it
     finishes. A short read happens only after `finished` is set. Records are small
     and many, so reads ahead keep most of them from needing a system call, and
-    from giving up the GIL to a schedule thread every record.
+    from giving up the GIL every record.
     """
     READ_AHEAD = 256*1024
 
@@ -169,87 +135,18 @@ def open_shared(path):
     return os.fdopen(msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY), 'rb', buffering=0)
 
 
-class PlayerSchedule(threading.Thread):
-    """One player's decisions() run over rows as they arrive."""
-    def __init__(self, player, policy, game):
-        super().__init__(name=f'capture-schedule-{player}', daemon=True)
-        self.player, self.policy, self.game = player, policy, game
-        self.rows, self.condition = deque(), threading.Condition()
-        self.waiting = self.closed = self.done = False
-        self.last_decision, self.finished, self.error = None, False, None
-        self.counts = {}
-
-    def put(self, row):
-        with self.condition:
-            self.rows.append(row)
-            if self.waiting:
-                self.condition.notify_all()
-
-    def close(self):
-        with self.condition:
-            self.closed = True
-            self.condition.notify_all()
-
-    def _source(self):
-        while True:
-            with self.condition:
-                while not self.rows and not self.closed:
-                    self.waiting = True
-                    self.condition.notify_all()
-                    self.condition.wait()
-                self.waiting = False
-                if not self.rows:
-                    return
-                row = self.rows.popleft()
-            yield row
-
-    def observe(self, last_decision, finished):
-        self.last_decision, self.finished = last_decision, finished
-
-    def run(self):
-        from collections import Counter
-        self.counts = Counter()
-        try:
-            rows = self._source()
-            first = next(rows, None)
-            if first is None:
-                return
-            validate = EventValidator(self.policy, self.game, self.counts, first['observation'], schedule_only=True)
-            for _ in decisions(chain([first], rows), self.policy.config, self.counts,
-                               validate=validate, observe=self.observe):
-                pass
-        except BaseException as error:
-            self.error = error
-        finally:
-            with self.condition:
-                self.done = True
-                self.condition.notify_all()
-
-    def settled(self, timeout):
-        """Wait until every queued row is consumed; the schedule state is then current."""
-        deadline = time.monotonic()+timeout
-        with self.condition:
-            while not self.done and not (self.waiting and not self.rows):
-                remaining = deadline-time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError('Capture schedule did not settle')
-                self.condition.wait(remaining)
-        if self.error is not None:
-            raise RuntimeError(f'Capture schedule for player {self.player} failed') from self.error
-
-
 class CaptureController:
-    def __init__(self, policy_path, replay, trajectory):
-        config = json.loads(Path(policy_path).read_text(encoding='utf-8'))
-        self.policy = NeuralPolicy(config, parameters=False)
-        self.cap = config['event_max_delay']
+    def __init__(self, policy_path, replay, replay_sha256, trajectory):
+        self.config = json.loads(Path(policy_path).read_text(encoding='utf-8'))
+        self.replay_sha256 = replay_sha256
         self.commands = command_frames(replay)
         self.finished = threading.Event()
         self.file = GrowingFile(Path(str(trajectory)+'.part'), self.finished)
-        self.header = self.terrain = None
-        self.players, self.adapters, self.last_frame = {}, {}, {}
+        self.header = None
+        self.adapters, self.last_frame = {}, {}
+        self.ended = set()  # Players whose training episode ended early (production scope).
         self.cadence, self.error = None, None
-        self.dispatched = 0  # bytes whose records have reached their player schedules
+        self.dispatched = 0  # bytes whose records have been read
         self.ready, self.asking = threading.Condition(), False
         self.reader = threading.Thread(target=self._read, name='capture-reader', daemon=True)
         self.reader.start()
@@ -263,8 +160,6 @@ class CaptureController:
                         raise ValueError('Scheduled capture needs a 30 or 60 Hz scheduled-capture export')
                     self.header = record
                     self.cadence = max(1, (record['interval_ms']*record['ticks_per_second']+999)//1000)
-                elif kind == 'map':
-                    self.terrain = record
                 elif kind == 'sample':
                     self._sample(record)
                 elif kind == 'footer':
@@ -276,8 +171,6 @@ class CaptureController:
         except BaseException as error:
             self.error = error
         finally:
-            for schedule in self.players.values():
-                schedule.close()
             with self.ready:
                 self.ready.notify_all()
 
@@ -288,25 +181,22 @@ class CaptureController:
             raise ValueError(f'Replay command stream disagrees with export at frame {frame}')
         if record.get('light') and (commanded or frame % self.cadence):
             raise ValueError('Light sample outside a quiet cadence frame')
-        if player not in self.players:
-            self.adapters[player] = ReplayActionAdapter(self.header['template_catalog'])
-            game = {'map': self.terrain, 'source_ticks_per_second': self.header['ticks_per_second'], 'player': player}
-            self.players[player] = PlayerSchedule(player, self.policy, game)
-            self.players[player].start()
-        # The same demonstration fields iter_demonstrations gives decisions().
-        row = {'record': 'demonstration', 'source': 'replay', 'player_index': player, 'frame': frame,
-               **self.adapters[player].decode(record), 'reward': None}
-        if 'observation' in record:
-            row['observation'] = record['observation']
         self.last_frame[player] = frame
-        # decisions() runs in canonical 60 Hz time, as preparation's ReplayRows feeds it.
-        self.players[player].put(normalize_demonstration({**row, 'hold_ticks': None}, self.header['ticks_per_second']))
+        if player in self.ended:
+            return
+        if player not in self.adapters:
+            self.adapters[player] = ReplayActionAdapter(self.header['template_catalog'])
+        row = self.adapters[player].decode(record)
+        if row['actions']:
+            row['observation'] = record['observation']
+            if any(outside_production_scope(self.config, row, action) for action in row['actions']):
+                self.ended.add(player)
 
     def quiet(self, player, frame):
         return frame % self.cadence == 0 and frame not in self.commands.get(player, ())
 
     def directive(self, player, frame, timeout=600):
-        """Quiet frames from `frame` on whose observations decisions() may select."""
+        """Quiet frames from `frame` on whose observations decisions() will select (one, or none once the episode ended)."""
         # The engine flushed every earlier row before asking: consume them all.
         size = self.file.path.stat().st_size if self.file.path.exists() else 0
         deadline = time.monotonic()+timeout
@@ -323,32 +213,17 @@ class CaptureController:
                 self.asking = False
         if self.error is not None:
             raise RuntimeError('Scheduled capture reader failed') from self.error
-        schedule = self.players.get(player)
-        if schedule is None or not self.quiet(player, frame) or self.last_frame[player] >= frame:
+        if not self.quiet(player, frame) or self.last_frame.get(player, frame) >= frame:
             raise ValueError(f'Unexpected capture request for player {player} at frame {frame}')
-        try:
-            schedule.settled(timeout)
-        except RuntimeError:
-            if schedule.error is None:
-                raise
-            # A schedule fails on rows preparation cannot use either (e.g. a game that never
-            # loaded its map). Observe every quiet row so the engine plays on: its playback
-            # verdict decides first, and failure() is raised only for a playback that passed.
-            return [frame]
-        return wanted_native(frame, self.header['ticks_per_second'], schedule.last_decision,
-                             schedule.done or schedule.finished, self.cap, self.cadence, lambda f: self.quiet(player, f))
-
-    def failure(self):
-        """The first player schedule's error, once close() has run."""
-        return next((s.error for s in self.players.values() if s.error is not None), None)
+        if player in self.ended:
+            return []
+        return [next_snapshot(self.config, self.replay_sha256, player, frame, self.header['ticks_per_second'],
+                              self.cadence, lambda f: self.quiet(player, f))]
 
     def close(self):
         self.finished.set()
         self.file.more.set()
         self.reader.join(60)
-        for schedule in self.players.values():
-            schedule.close()
-            schedule.join(60)
         self.file.close()
         if self.error is not None:
             raise RuntimeError('Scheduled capture reader failed') from self.error

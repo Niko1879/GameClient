@@ -22,7 +22,8 @@ VOCABULARY = {'types': ['<unknown>', 'ChinaVehicleDozer', 'ChinaCommandCenter', 
               'promotions': {'FactionChina': ['SCIENCE_ArtilleryBarrage1', 'SCIENCE_Frenzy1']},
               'upgrades': ['Upgrade_ChinaRadar', 'Upgrade_InfantryCaptureBuilding'],
               'powers': ['SuperweaponArtilleryBarrage', 'SuperweaponCarpetBomb']}
-SMALL = dict(embedding=4, map_hidden=6, map_side=4, position_bins=16,
+# Every quiet grid frame is a no-op row in the fixtures (one snapshot per 100 ms, probability 1).
+SMALL = dict(embedding=4, map_hidden=6, map_side=4, position_bins=16, snapshot_rate=10,
              widths={'entity': 8, 'ffn': 16, 'heads': 2, 'head_width': 2, 'key': 4, 'pool_queries': 2, 'scatter': 2,
                      'map_out': 3, 'map_embedding': 8, 'scalar': 8, 'scalar_out': 6, 'core': 16,
                      'action_embedding': 8, 'unit_query': 4})
@@ -88,6 +89,10 @@ def fixture(placement_mode='fast'):
     config = default_config(vocabulary, placement_mode)
     config.update(SMALL)
     return config, observation, terrain
+
+
+# The original recording's SHA-256, which draws a game's no-op snapshots.
+RECORDING = '0123456789abcdef'*4
 
 
 def raw_row(frame, observation, actions=(), *, ui=False, unsupported=False, terminal=False):

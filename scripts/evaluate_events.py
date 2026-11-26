@@ -8,9 +8,9 @@ from pathlib import Path
 from shutil import copy2
 
 from engine_runtime import PROFILE_ENV, isolation_profile
-from event_policy import EventActor, science_buyer
+from event_policy import LOOK_TICKS, science_buyer
 from generals_env import GeneralsEnv, run_episode
-from generals_policy import PLAY_RATING
+from generals_policy import PLAY_APM, PLAY_RATING
 from openers import NAMED, named_templates
 from prepared_io import _digest, _write_json
 from replay_bootstrap import check_live_provenance, check_live_rules
@@ -20,6 +20,15 @@ def rating_view(own, other, view):
     """(own, opponent) rating inputs for one actor: 'true' sees the other side's rating,
     'mirror' assumes an evenly matched game at its own rating (isolates own-rating effects)."""
     return (own, other) if view == 'true' else (own, own)
+
+
+def configure_timing(actor, apm, look_ms):
+    """A new policy's APM input and look interval. A memory-free checkpoint has neither: --apm fixes its pace."""
+    if hasattr(actor, 'configure_pace'):
+        actor.configure_pace(apm)
+    else:
+        actor.configure_apm(PLAY_APM if apm is None else apm)
+        actor.configure_look(look_ms)
 
 
 def evaluate(args, *, profile_source=None, write_trajectory=True):
@@ -38,16 +47,16 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
             args.map = str(destination/source_map.name)
         os.environ[PROFILE_ENV] = str(profile.resolve())
     # AlphaGenerals or, until its adoption, a memory-free checkpoint through the _old modules.
-    from policy_checkpoints import live_policy, load_policy
+    from policy_checkpoints import actor_class, live_policy, load_policy
     policy, _, checkpoint = load_policy(args.checkpoint)
     policy.rating_input = args.rating_input
     device = getattr(args, 'device', None) or ('cuda' if args.headed else None)
 
     def live(reference):
-        # Without a device, headless games use the NumPy reference policy.
-        if device is None:
+        # Without a device, headless games use the NumPy reference policy (the comparison network has none).
+        if device is None and not reference.config.get('network'):
             return reference
-        return live_policy(reference, device=device)
+        return live_policy(reference, device=device or 'cpu')
 
     policy = live(policy)
     with GeneralsEnv(args.exe, log_path=output/'engine.log', headed=args.headed) as env:
@@ -59,17 +68,21 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
         else:
             check_live_provenance(env.metadata, engine_sha256, deployment)
         science = science_buyer
-        actors = [EventActor(policy, args.seed, deterministic=args.deterministic, science=science(args.faction))]
+        policy.constant_pace = args.constant_pace
+        actors = [actor_class(policy)(policy, args.seed, deterministic=args.deterministic, science=science(args.faction))]
         actors[0].configure_ratings(*rating_view(args.rating, args.opponent_rating, args.rating_view))
         actors[0].configure_opener(named_templates(policy.config, args.opener))
+        configure_timing(actors[0], args.apm, args.look_ms)
         if args.opponent_kind == 'policy':
             other, _, _ = load_policy(args.opponent or args.checkpoint)
             other.rating_input = args.opponent_rating_input if args.opponent else args.rating_input
             other = live(other)
-            actors.append(EventActor(other, args.seed+1, deterministic=args.deterministic,
-                                     science=science(args.opponent_policy_faction)))
+            other.constant_pace = args.opponent_constant_pace
+            actors.append(actor_class(other)(other, args.seed+1, deterministic=args.deterministic,
+                                             science=science(args.opponent_policy_faction)))
             actors[1].configure_ratings(*rating_view(args.opponent_rating, args.rating, args.rating_view))
             actors[1].configure_opener(named_templates(other.config, args.opponent_opener))
+            configure_timing(actors[1], args.opponent_apm, args.look_ms)
             if args.learning_side == 1:
                 actors.reverse()
         policy_factions = None
@@ -97,7 +110,9 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
                    factions=dict(checkpoint=args.faction, opponent=args.opponent_policy_faction),
                    ratings=dict(checkpoint=args.rating, opponent=args.opponent_rating, view=args.rating_view,
                                 checkpoint_input=args.rating_input, opponent_input=args.opponent_rating_input),
-                   openers=dict(checkpoint=args.opener, opponent=args.opponent_opener))
+                   openers=dict(checkpoint=args.opener, opponent=args.opponent_opener),
+                   apm=dict(checkpoint=args.apm, opponent=args.opponent_apm), look_ms=args.look_ms,
+                   constant_pace=dict(checkpoint=args.constant_pace, opponent=args.opponent_constant_pace))
     _write_json(output/'summary.json', summary)
     print(json.dumps(summary), flush=True)
     return summary
@@ -139,6 +154,13 @@ def make_parser():
                         help='Strategy input z of the --checkpoint side (scripts/openers.py NAMED)')
     parser.add_argument('--opponent-opener', choices=('none', *sorted(NAMED)), default='none',
                         help='Strategy input z of the --opponent side')
+    parser.add_argument('--apm', type=float, help='APM input of the --checkpoint side (default %d). A memory-free checkpoint '
+                        'has no such input: there it fixes the commands per game minute, waits masked' % PLAY_APM)
+    parser.add_argument('--opponent-apm', type=float, help='The same for the --opponent side')
+    parser.add_argument('--constant-pace', action='store_true', help='The --checkpoint side acts at its APM input rate '
+                        'in every state, never choosing no-op (pace off; a forced rate for other policies)')
+    parser.add_argument('--opponent-constant-pace', action='store_true', help='The same for the --opponent side')
+    parser.add_argument('--look-ms', type=float, default=1000*LOOK_TICKS/60, help='Game time between looks of both sides')
     parser.add_argument('--rating-input', action='store_true',
                         help='The --checkpoint model was trained with the rating input (GENERALS_RATING_INPUT=1)')
     parser.add_argument('--opponent-rating-input', action='store_true',

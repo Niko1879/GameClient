@@ -55,7 +55,7 @@ def top_fraction_rating(document, fraction):
     return ratings[max(1, round(fraction*len(ratings)))-1]
 
 
-def subset(document, *, min_rating=None, top_fraction=None, include=(), widths=None):
+def subset(document, *, min_rating=None, top_fraction=None, include=(), widths=None, snapshot_rate=None):
     """A new dataset document: every validation entry, the training entries that pass."""
     include = set(include)
     if widths and not set(widths) <= MODEL_ONLY:
@@ -75,6 +75,8 @@ def subset(document, *, min_rating=None, top_fraction=None, include=(), widths=N
         elif entry['match_key'] in include:
             kept.append(entry); counts['included'] += 1
     result = {**document, 'entries': kept, 'config': {**document['config'], **(widths or {})}}
+    if snapshot_rate is not None:  # No-op rows kept per second (event_dataset thins at load).
+        result['snapshot_rate'] = snapshot_rate
     result['selection'] = {**document.get('selection', {}),
                            'subset': dict(min_rating=min_rating, top_fraction=top_fraction, include_sha256=hashlib.sha256(
                                json.dumps(sorted(include)).encode()).hexdigest(), widths=widths or {}, counts=counts)}
@@ -109,6 +111,7 @@ def main():
                       help='Instead: the top share of training matches by that rating, e.g. 0.1 (nested cuts)')
     make.add_argument('--include', help='JSON list of match keys kept in training regardless of rating')
     make.add_argument('--widths', help='JSON object of model-only widths')
+    make.add_argument('--snapshot-rate', type=float, help='Thin the no-op rows to this many per second of game time')
     args = parser.parse_args()
     if args.command == 'curated-keys':
         found = curated_keys(args.catalog)
@@ -121,7 +124,7 @@ def main():
     document = json.loads(source.read_text())
     result = subset(document, min_rating=args.min_rating, top_fraction=args.top_fraction,
                     include=json.loads(Path(args.include).read_text()) if args.include else (),
-                    widths=json.loads(args.widths) if args.widths else None)
+                    widths=json.loads(args.widths) if args.widths else None, snapshot_rate=args.snapshot_rate)
     output.write_text(json.dumps(result))
     print(json.dumps(result['selection']['subset']))
 

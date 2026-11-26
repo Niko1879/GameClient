@@ -32,7 +32,6 @@ class PlacementTests(unittest.TestCase):
             home_position=[900, 900] if rotate else [100, 100])
         target = self.policy.target(encoded, [{'kind': 'build', 'builder': 10,
             'template': 'ChinaPowerPlant', 'position': list(position), 'angle': angle*np.pi/8}])
-        target['delay'] = 5
         return {'encoded': encoded, 'target': target}
 
     def test_grid_rejects_stale_wrong_prefix_and_corruption(self):
@@ -127,7 +126,6 @@ class PlacementTests(unittest.TestCase):
     def test_numpy_torch_and_portable_columns_agree_on_every_head(self):
         rows = [self.example(), self.example(rotate=True)]
         for row in rows:
-            row['hold_ticks'] = 6
             row['scope'] = 'event'
         from training_legality import build_legality
         from event_store import feature_identity

@@ -23,7 +23,7 @@ from pathlib import Path
 from generals_policy import OPENER_BUILDINGS
 
 ROOT = Path(__file__).resolve().parents[1]
-CACHE = ROOT/'training-data'/'openers.json'
+CACHE = ROOT/'training-data'/'openers-60hz.json'  # openers.json read 30 Hz recordings at half their rate.
 # The same building ordered again within this many seconds is a re-click after a refused placement; it counts once.
 REPEAT_SECONDS = 3
 OPENER_BLANK = 0.5
@@ -38,7 +38,7 @@ def build_orders(rows, limit=OPENER_BUILDINGS):
         if target.get('kind') != 'build':
             continue
         template = int(target['template'])
-        seconds = row['seconds'] if 'seconds' in row else row['frame']/row.get('source_ticks_per_second', 60)
+        seconds = row['seconds'] if 'seconds' in row else row['frame']/60  # Stored frames are canonical 60 Hz.
         if template in last and seconds-last[template] < REPEAT_SECONDS:
             last[template] = seconds
             continue

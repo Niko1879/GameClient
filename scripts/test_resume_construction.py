@@ -66,13 +66,13 @@ class ResumeConstructionTests(unittest.TestCase):
         with self.assertRaises(Unrepresentable):
             self.policy.target(encoded, [{'kind': 'resume_construction', 'builder': 10, 'target': 30}])
         with no_grad():
-            actions, *_ = self.policy.decide(self.encode(), None, teacher={'kind': 'wait', 'delay': 0})
+            actions, *_ = self.policy.decide(self.encode(), None, teacher={'kind': 'wait'})
         self.assertEqual(actions, [])
 
     def test_teacher_round_trip_chooses_one_builder_and_exact_existing_foundation(self):
         encoded = self.encode()
         action = {'kind': 'resume_construction', 'builder': 10, 'target': 30}
-        teacher = {**self.policy.target(encoded, [action]), 'delay': 0}
+        teacher = self.policy.target(encoded, [action])
         with no_grad():
             decoded, trace, *_ = self.policy.decide(encoded, None, teacher=teacher)
         self.assertEqual(decoded, [action])
@@ -124,8 +124,8 @@ class ResumeConstructionTests(unittest.TestCase):
         for action in ([], [{'kind': 'resume_construction', 'builder': 10, 'target': 30}],
                        [{'kind': 'attack', 'units': [10], 'target': 99}]):
             encoded = self.encode()
-            target = {**self.policy.target(encoded, action), 'delay': 5}
-            rows.append({'encoded': encoded, 'target': target, 'hold_ticks': 6, 'scope': 'event'})
+            target = self.policy.target(encoded, action)
+            rows.append({'encoded': encoded, 'target': target, 'scope': 'event'})
         key = feature_identity(self.policy)
         for row in rows:
             row['encoded']['_training_legality'] = build_legality(self.policy, row['encoded'], row['target'], key)

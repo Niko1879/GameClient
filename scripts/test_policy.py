@@ -58,8 +58,6 @@ def examples(policy, observation, terrain):
         source = empty if i == len(ACTIONS) else (extra if i in (2, 3) else observation)
         encoded = policy.encoder.encode(source, terrain, 6)
         target = policy.target(encoded, action)
-        if i % 2:
-            target['delay'] = 2
         rows.append({'encoded': encoded, 'target': target})
     return rows
 
@@ -263,7 +261,7 @@ class AgreementTests(unittest.TestCase):
         config, obs, terrain = fixture(placement_mode)
         policy = NeuralPolicy(config, 5)
         if head_scale:  # Extreme head logits, so LOGIT_CAP is what bounds them.
-            for name in ('action_w', 'delay_w', 'angle_w', 'slot_w', 'target_action_embedding',
+            for name in ('action_w', 'angle_w', 'slot_w', 'target_action_embedding',
                          'unit_action_embedding'):
                 policy.parameters[name].data *= head_scale
         # Ready and charging buttons, and a seen supply count, reach both implementations.

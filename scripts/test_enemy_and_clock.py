@@ -22,7 +22,7 @@ class EnemyAndClockTests(unittest.TestCase):
         self.config, self.obs, self.terrain = fixture()
         self.policy = NeuralPolicy(self.config, 5)
         self.encoded = self.policy.encoder.encode(self.obs, self.terrain, 300, previous_frame=240)
-        self.target = {**self.policy.target(self.encoded, [{'kind': 'stop', 'units': [10]}]), 'delay': 30}
+        self.target = self.policy.target(self.encoded, [{'kind': 'stop', 'units': [10]}])
 
     def logp(self, encoded):
         with no_grad():
@@ -59,7 +59,7 @@ class EnemyAndClockTests(unittest.TestCase):
         identity = self.policy.encoder.identity
         self.encoded['enemy_identity'] = identity.player_identity('FactionGLAToxinGeneral')
         self.encoded['_training_legality'] = build_legality(self.policy, self.encoded, self.target, key)
-        row = {'encoded': self.encoded, 'target': self.target, 'hold_ticks': 6, 'scope': 'event'}
+        row = {'encoded': self.encoded, 'target': self.target, 'scope': 'event'}
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key
         output = learner.model.teacher_heads([self.encoded], [self.target], *learner.model.events([self.encoded]))

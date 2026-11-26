@@ -38,7 +38,7 @@ FEATURE_CONSTANTS = ('OBSERVATION_VERSION', 'KINDS', 'TARGET_KINDS', 'BUILDER_KI
                      'ENTITY_COMMAND_SLOTS', 'SUPPLY_BOX_SCALE',
                      'SCALAR_FEATURES', 'MAP_CHANNELS')
 MODEL_ONLY = {'hidden', 'entity_hidden', 'embedding', 'attention_heads', 'map_hidden', 'scalar_hidden',
-              'variant_l2', 'argument_loss_weights', 'delay_loss_weight', 'target_smoothing'}
+              'variant_l2', 'argument_loss_weights', 'target_smoothing'}
 
 
 _FEATURE_CODE = []
@@ -87,10 +87,13 @@ def write_shard(destination, games, policy, source):
                         meta['row'].update({name: row[name] for name in ('frame', 'player', 'source_ticks_per_second')})
                         meta['encoded']['event_rate'] = row['source_ticks_per_second']
                     raw = encode_columns(packed.columns, packed.metadata, float_dtype=float_dtype)
+                    noops = np.packbits([row['target']['kind'] == 'wait' for row in buffer]).tobytes().hex()
                     member = f'chunks/{number:04d}/{len(chunks):06d}.bin'
                     archive.writestr(member, raw)
                     chunks.append({'member': member, 'rows': len(buffer), 'bytes': len(raw),
-                                   'sha256': hashlib.sha256(raw).hexdigest(), 'start': start})
+                                   'sha256': hashlib.sha256(raw).hexdigest(), 'start': start,
+                                   # One bit per row: thinning (event_dataset) counts rows without reading chunks.
+                                   'noops': noops})
                     start += len(buffer)
                     buffer, size = [], 0
 
@@ -114,7 +117,9 @@ def write_shard(destination, games, policy, source):
                 index['shared'][str(number)] = {'member': member, 'bytes': len(raw),
                                               'sha256': hashlib.sha256(raw).hexdigest()}
                 episode = {'player': game['player'], 'length': start,
-                           'shared': str(number), 'chunks': chunks}
+                           'shared': str(number), 'chunks': chunks,
+                           # The player's own pace over the episode, for reporting (event_dataset).
+                           'commands': episode_counts['commands'], 'ticks': episode_counts['observed_canonical_ticks']}
                 if cutoff is not None:
                     episode['censored'] = {'reason': 'production_scope', 'frame': cutoff}
                 index['episodes'].append(episode)

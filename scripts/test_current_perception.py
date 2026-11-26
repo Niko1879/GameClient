@@ -40,7 +40,7 @@ class CurrentPerceptionTests(unittest.TestCase):
         self.policy = NeuralPolicy(self.config, 7)
         self.plain = self.policy.encoder.encode(self.obs, self.terrain, 300)
         self.encoded = self.policy.encoder.encode(perceived(self.obs), self.terrain, 300)
-        self.target = {**self.policy.target(self.encoded, [{'kind': 'stop', 'units': [10]}]), 'delay': 30}
+        self.target = self.policy.target(self.encoded, [{'kind': 'stop', 'units': [10]}])
 
     def logp(self, encoded):
         with no_grad():
@@ -81,9 +81,9 @@ class CurrentPerceptionTests(unittest.TestCase):
         key = feature_identity(self.policy)
         rows, targets = [], []
         for encoded in (self.encoded, self.plain):
-            target = {**self.policy.target(encoded, [{'kind': 'stop', 'units': [10]}]), 'delay': 30}
+            target = self.policy.target(encoded, [{'kind': 'stop', 'units': [10]}])
             encoded['_training_legality'] = build_legality(self.policy, encoded, target, key)
-            rows.append({'encoded': encoded, 'target': target, 'hold_ticks': 6, 'scope': 'event'})
+            rows.append({'encoded': encoded, 'target': target, 'scope': 'event'})
             targets.append(target)
         learner = EventLearner(self.policy, device=os.environ.get('TEST_TORCH_DEVICE', 'cpu'))
         learner.model.legality_key = key

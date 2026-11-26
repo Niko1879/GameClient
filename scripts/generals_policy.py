@@ -20,6 +20,7 @@ import threading
 
 import numpy as np
 
+from event_schedule import grid_ticks, snapshot_probability
 from generals_identity import IdentityHierarchy, in_production_scope, production_twin, validate_production_scope
 from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum, tensor
 
@@ -70,6 +71,10 @@ SUPPLY_BOX_SCALE = 8
 # percentile (1730).
 RATING_CENTER, RATING_SCALE, PLAY_RATING = 1100, 300, 1730
 RATING_FEATURES = 6
+# The player's own pace: ln(retained commands per minute over the whole game / APM_CENTER) and a known flag. In
+# training it contains the episode's future, as a coarse style input; live it is set freely (wait_snapshots.md).
+# Rating explains only ~9% of its variance (23 Nov 2026), so it is its own input. 50 is the median at 1800-2000.
+APM_CENTER, PLAY_APM, APM_FEATURES = 50, 50, 2
 # v11 appends the public superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
 SCALAR_FEATURES = 22
 SUPERWEAPON_SECONDS = 600
@@ -82,9 +87,13 @@ CUE_SECONDS = 5
 EFFECT_RADIUS_SCALE = 50
 # Width of the map summary (map_fc), AlphaStar's 256 whatever the entity width (15 Nov 2026).
 MAP_EMBEDDING = 256
-# since_decision and since_command stay in stored scalars but never reach the model:
-# quiet rows are kept at most 120 ticks apart, so these clocks give away wait vs command.
-HIDDEN_SCALARS = (9, 14)
+# since_decision and since_command stay in stored scalars but never reach the model. since_decision: thinning no-op
+# rows changes a row's predecessor. since_command (user, 23 Nov 2026, after the live pace check): in play the model's
+# own orders reset it, and it read them as a human burst: after acting it acted again at 94% of 200 ms looks (198
+# orders/min); held at 1 s, 50/min (human ~52). No-op rows lie on the quiet grid, commands on any tick, and the exporter
+# refreshes sightings on it, so the game clock and a remembered sighting's last-seen clock are floored to it (Encoder).
+SINCE_DECISION, SINCE_COMMAND = 9, 14
+HIDDEN_SCALARS = (SINCE_DECISION, SINCE_COMMAND)
 # Height, cliff, supply, x, y; three visibility states; own, seen enemy, remembered enemy and neutral counts; alert.
 STATIC_MAP_CHANNELS = 5
 MAP_CHANNELS = 13
@@ -121,7 +130,7 @@ LOGIT_CAP = 50.0
 # Each selected unit's key enters the unit query divided by this constant, as AlphaStar's
 # mean over its fixed 512 entity slots does (12 Nov 2026: 16 is about the smallest entity count).
 SELECTED_UNIT_DIVISOR = 16
-# Live sampling temperature for every argument except the delay.
+# Live sampling temperature of the selected action and its arguments; acting or not is drawn at 1.
 SAMPLING_TEMPERATURE = .8
 # AlphaGenerals (notes/plan.md Â§1): SCC's policy network. Unit groups as SCC's own, enemy and
 # neutral, plus the v11 effect and sound-cue tokens; the transformer and pooling run per group.
@@ -129,7 +138,7 @@ GROUPS = ('own', 'enemy', 'neutral', 'effects')
 UNIT_GROUPS = 3
 LSTM_LAYERS = 3
 # The heads that read an action embedding of the selected action, each its own (SCC Fig. 4).
-ARGUMENT_HEADS = ('delay', 'unit', 'target', 'position', 'slot', 'angle')
+ARGUMENT_HEADS = ('unit', 'target', 'position', 'slot', 'angle')
 # Widths SCC does not give: AlphaStar's where a counterpart exists, otherwise ours (plan.md Â§6).
 # 'core' is the pre-LSTM FC and every LSTM layer, chosen so the model has 45-49M parameters.
 # Fixed constants. A config 'widths' entry shrinks them for tests; it is part of the feature key
@@ -141,12 +150,21 @@ WIDTHS = {'entity': 256, 'ffn': 1024, 'heads': 2, 'head_width': 32, 'key': 32, '
 
 def widths(config):
     """The network widths: WIDTHS, overridden only by a test model's config 'widths'."""
+    if config.get('network'):  # Temporary comparison networks (network_alphastar.py).
+        from network_alphastar import WIDTHS as variant
+        return {**WIDTHS, **variant, **config.get('widths', {})}
     return {**WIDTHS, **config.get('widths', {})}
 
 
-def group_sources(group):
+def token_groups(config):
+    """The transformer's token groups: GROUPS, or only the unit groups when effects are painted on the map
+    (config effects='map', network_alphastar.EFFECTS_MAP: no effect tokens; units read the map at their cell)."""
+    return GROUPS[:UNIT_GROUPS] if config.get('effects') == 'map' else GROUPS
+
+
+def group_sources(group, count=len(GROUPS)):
     """Source groups of one query group's attention blocks, in concat order: itself, then the others."""
-    return [group]+[other for other in range(len(GROUPS)) if other != group]
+    return [group]+[other for other in range(count) if other != group]
 
 
 def unit_groups(own, owners, real):
@@ -183,6 +201,7 @@ def scalar_input_slices(config):
     from unit_tasks import COMMAND_FEATURES
     e = config['embedding']
     widths = [('scalars', SCALAR_FEATURES), ('player_identity', e), ('enemy_identity', e), ('ratings', RATING_FEATURES),
+              ('apm', APM_FEATURES),
               ('opener', len(config['templates'])+1), ('player_flags', len(config['upgrades'])+2*len(config['sciences'])),
               ('unit_counts', len(config['types'])), ('available_actions', len(KINDS)),
               ('task_command', COMMAND_FEATURES), ('task_command_template', e),
@@ -234,7 +253,7 @@ def visible_scalars(scalars):
 
 
 def visible_task_commands(commands):
-    """Stored command receipts as the model sees them: their age is the same clock as since_command."""
+    """Stored command receipts as the model sees them, without their age (since_command, unfloored)."""
     from unit_tasks import COMMANDS
     # unit_tasks.encode writes [present, *command one-hot, log age, ...]; that file is a hashed feature source.
     visible = np.array(commands)
@@ -270,6 +289,19 @@ def rating_inputs(own, opponent):
 
 
 UNRATED = rating_inputs(None, None)
+
+
+def apm_inputs(apm):
+    """Model APM input from a player's commands per minute, or None (unknown)."""
+    if apm is None:
+        return np.zeros(APM_FEATURES)
+    if not 0 < apm <= 600:
+        raise ValueError('APM must be in (0, 600]')
+    return np.asarray([math.log(apm/APM_CENTER), 1.])
+
+
+UNKNOWN_APM = apm_inputs(None)
+
 
 # Strategy input z (scripts/openers.py, 17 Nov 2026): the counts of each production template among a player's
 # first OPENER_BUILDINGS build orders, /OPENER_BUILDINGS, then a given flag; all zero = no opener. Shown only during
@@ -445,6 +477,18 @@ def cap_logits(logits, mask):
     return ((logits-top)/LOGIT_CAP).tanh()*LOGIT_CAP
 
 
+def order_rate(encoded):
+    """The acting player's own orders per second, from the APM input (the play default when unknown)."""
+    apm = np.asarray(encoded.get('apm', UNKNOWN_APM), dtype=float)
+    return (APM_CENTER*math.exp(apm[0]) if apm[1] else PLAY_APM)/60
+
+
+def complement(logp):
+    """ln(1-p) of a Tensor of log-probabilities below 0."""
+    share = np.exp(logp.data)/np.expm1(logp.data)
+    return Tensor(np.log(-np.expm1(logp.data)), (logp,), lambda g: logp.add_grad(g*share))
+
+
 def location_stages(config):
     """Output channels of each 2x upsampling from map_side to position_bins."""
     fine, channels = config['position_bins']//config['map_side'], config['map_hidden']
@@ -463,7 +507,7 @@ MASK_CACHE_ROWS = 160
 
 class Encoder:
     def __init__(self, config):
-        self.config = config
+        self.config, self.grid = config, grid_ticks(config)
         self.types = {name: i for i, name in enumerate(config['types'])}
         self.identity = IdentityHierarchy(config)
         self.upgrade_ids = {name: i+1 for i, name in enumerate(config['upgrades'])}
@@ -538,21 +582,9 @@ class Encoder:
             flags = self._menus[name] = (bool(menus.get(name+'|build')), bool(menus.get(name+'|train')))
         return flags
 
-    def schedule_inputs(self, observation, terrain):
-        """What policy.target() reads to accept or reject a command.
-
-        Acceptance does not depend on entity order or map orientation, so the
-        capture schedule skips them and every feature column (test_scheduled_capture).
-        """
-        low, _, span = self._bounds(terrain)
-        entities = observation['own_entities'] + observation['known_nonowned_entities']
-        real_count = len(entities)
-        return {'entities': entities, 'ids': {e['id']: i for i, e in enumerate(entities)},
-                'own': np.asarray([e['own'] for e in entities] if real_count else [False]),
-                'visible_target': np.asarray([not e['own'] and e['visible'] and e['health'] > 0 and e['max_health'] > 0
-                                              for e in entities] if real_count else [False]),
-                'low': low, 'span': span, 'rotated': False,
-                'purchasable_sciences': self._player_flags(observation['player'])[1]}
+    def floor(self, ticks):
+        """Canonical ticks floored to the quiet grid (see HIDDEN_SCALARS)."""
+        return ticks//self.grid*self.grid
 
     @staticmethod
     def _superweapons(observation):
@@ -644,7 +676,7 @@ class Encoder:
                 np.log1p(np.maximum(maximum, 0)) / 10,
                 np.asarray(owns, dtype=float), np.asarray(visibles, dtype=float),
                 np.asarray([e['owner'] >= 2 and not e['own'] for e in entities], dtype=float),
-                np.log1p(np.maximum(0, frame - column('last_seen_frame')) / 60) / 10,
+                np.log1p(np.maximum(0, self.floor(frame) - self.floor(column('last_seen_frame'))) / 60) / 10,
                 (construction == -1).astype(float),
                 np.maximum(0, construction) / 100,
                 np.asarray([min(len(q), 20) / 20 for q in queues], dtype=float),
@@ -673,7 +705,7 @@ class Encoder:
         scalars = np.concatenate([np.minimum(np.maximum(np.asarray([
             np.log1p(p['cash']) / 10, p['power_production'] / 100, p['power_consumption'] / 100,
             float(p['radar']), p['rank'] / 5, p['skill_points'] / 10, p['science_points'] / 10,
-            float(p['dead']), np.log1p(frame / 60) / 10, np.log1p(since_decision / 60),
+            float(p['dead']), np.log1p(self.floor(frame) / 60) / 10, np.log1p(since_decision / 60),
             len(observation['own_entities']) / 100, len(observation['known_nonowned_entities']) / 100,
             span[0] / 4000, span[1] / 4000]), -10), 10),
             [np.log1p(since_command)/5, source_ticks_per_second/60],
@@ -789,8 +821,10 @@ class Encoder:
 class NeuralPolicy:
     def __init__(self, config, seed=1, *, parameters=True):
         """parameters=False builds the encoder, masks and targets only (preparation and identities)."""
-        if config.get('architecture') != ARCHITECTURE:
+        if config.get('architecture') != ARCHITECTURE or config.get('network') not in (None, 'alphastar', 'memoryfree', 'paced', 'movement'):
             raise ValueError('Unsupported policy architecture')
+        if config.get('network'):  # Temporary comparison networks: the import keeps 'network' out of feature keys.
+            import network_alphastar  # noqa: F401
         validate_production_scope(config)
         self.config, self.encoder = config, Encoder(config)
         self.kinds = KINDS
@@ -812,8 +846,10 @@ class NeuralPolicy:
         n, bins = config['map_side'], config['position_bins']
         if n <= 0 or 32 % n or bins % n or bins <= n or (bins//n) & (bins//n-1):
             raise ValueError('Invalid map/attention dimensions')
-        if config['delay_ticks'] != list(range(1, config['event_max_delay']+1)):
-            raise ValueError('Unsupported delay vocabulary')
+        # No-op snapshots per second of game time in this policy's training rows. Checkpoints trained on thinned
+        # rows (event_dataset) carry their own rate; live play needs it for the action rate and the memory.
+        snapshot_probability(config)  # validates
+        self.snapshot_rate = config['snapshot_rate']
         if not np.isfinite(config.get('variant_l2', 0)) or config.get('variant_l2', 0) < 0:
             raise ValueError('Variant regularization must be finite and nonnegative')
         if config['placement_mode'] == 'full_mask' and config['angle_bins'] != 16:
@@ -872,20 +908,24 @@ class NeuralPolicy:
         self.parameters['task_validation_target_features_w'].data[:] = 0
         # Group transformer (plan Â§1b): per layer and query group, one self- and three cross-attention
         # blocks with their own weights, concatenated into the group's FC; pre-norm, per-group FFN.
+        groups = token_groups(config)
         for layer in range(ATTENTION_LAYERS):
-            for g, group in enumerate(GROUPS):
+            for g, group in enumerate(groups):
                 name = f'attn{layer}_{group}'
                 norm(name+'_ln', d)
-                for s in group_sources(g):
+                for s in group_sources(g, len(groups)):
                     for projection in ('q', 'k', 'v'):
-                        w(f'{name}_{GROUPS[s]}_{projection}', (d, inner))
-                w(name+'_out_w', (len(GROUPS)*inner, d), .5); b(name+'_out_b', d)
+                        w(f'{name}_{groups[s]}_{projection}', (d, inner))
+                w(name+'_out_w', (len(groups)*inner, d), .5); b(name+'_out_b', d)
                 norm(f'ffn{layer}_{group}_ln', d)
                 w(f'ffn{layer}_{group}_in_w', (d, W['ffn']), math.sqrt(2)); b(f'ffn{layer}_{group}_in_b', W['ffn'])
                 w(f'ffn{layer}_{group}_out_w', (W['ffn'], d), .5); b(f'ffn{layer}_{group}_out_b', d)
         # Group outputs (plan Â§1c): final norm, attention pooling, attention keys and the unit maps.
         for g, group in enumerate(GROUPS):
-            norm(f'final_{group}_ln', d)
+            # Every group is pooled; effects painted on the map (token_groups) skip the transformer and its norm,
+            # and their pool reads the effect tokens directly (heard launches without a position reach the core).
+            if group in groups:
+                norm(f'final_{group}_ln', d)
             self.parameters[f'pool_{group}_query'] = Tensor(rng.normal(0, 1, (W['pool_queries'], inner)), requires_grad=True)
             w(f'pool_{group}_k', (d, inner)); w(f'pool_{group}_v', (d, inner))
             if g < UNIT_GROUPS:
@@ -910,7 +950,11 @@ class NeuralPolicy:
         # Core: FC-ReLU, then a residual LSTM of LSTM_LAYERS layer-normed layers (AlphaStar's internals).
         pooled = len(GROUPS)*W['pool_queries']*inner
         w('core_in_w', (W['scalar_out']+pooled+W['map_embedding'], core), math.sqrt(2)); b('core_in_b', core)
-        for layer in range(LSTM_LAYERS):
+        actions = len(self.actions)
+        if config.get('network'):  # Temporary comparison networks (network_alphastar.py).
+            from network_alphastar import add_parameters
+            add_parameters(w, b, c, W, config, actions)
+        for layer in range(0 if config.get('network') else LSTM_LAYERS):
             w(f'core_lstm{layer}_x_w', (core, 4*core)); w(f'core_lstm{layer}_h_w', (core, 4*core))
             # Gate order (input, forget, cell, output); each gate normalised on its own; forget bias 1.
             self.parameters[f'core_lstm{layer}_gate_g'] = Tensor(np.ones((4, core)), requires_grad=True)
@@ -920,12 +964,10 @@ class NeuralPolicy:
             norm(f'core_lstm{layer}_cell', core)
         # Heads (plan Â§1f): every head reads the core output; the selected action is one flat softmax,
         # and each argument head has its own embedding of that action.
-        actions = len(self.actions)
-        w('action_w', (core, actions), .1); b('action_b', actions)
+        if config.get('network') != 'alphastar':  # It has its own (network_alphastar).
+            w('action_w', (core, actions), .1); b('action_b', actions)
         for head in ARGUMENT_HEADS:
             w(head+'_action_embedding', (actions, a), 1)
-        delays = len(config['delay_ticks'])
-        w('delay_w', (core+a, delays), .1); b('delay_b', delays)
         # Selected units: a pointer network; the query LSTM steps once per chosen unit (end token last).
         uq = W['unit_query']
         w('unit_in_w', (core+a, a)); b('unit_in_b', a)
@@ -1517,7 +1559,8 @@ class NeuralPolicy:
         opener = encoded['opener'] if 'opener' in encoded else np.zeros(len(self.config['templates'])+1)
         parts = [Tensor(visible_scalars(encoded['scalars'])), identity, enemy,
                  # Set per game by the dataset or the live actor; absent means both unrated.
-                 Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)), Tensor(np.asarray(opener, dtype=float)),
+                 Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)),
+                 Tensor(np.asarray(encoded.get('apm', UNKNOWN_APM), dtype=float)), Tensor(np.asarray(opener, dtype=float)),
                  Tensor(encoded['player_flags']), Tensor(np.sqrt(counts)),
                  Tensor(np.asarray(self.verb_mask(encoded), dtype=float))]
         commands = visible_task_commands(encoded['task_commands'])
@@ -1534,6 +1577,8 @@ class NeuralPolicy:
 
     def _core(self, core_input, state):
         """(core output, next state): FC-ReLU u, then u + a residual LSTM step (plan Â§1e)."""
+        if self.config.get('network'):
+            raise ValueError('The comparison networks play only through TorchLivePolicy')
         p, size = self.parameters, widths(self.config)['core']
         u = (core_input @ p['core_in_w']+p['core_in_b']).relu()
         x, following = u, []
@@ -1570,6 +1615,8 @@ class NeuralPolicy:
                 'core_input': concatenate([self._scalars(encoded), *pools, map_embedding])}
 
     def _trunk(self, encoded, state=None):
+        if self.config.get('network'):  # Before encoding: effects='map' has no NumPy encoder either.
+            raise ValueError('The comparison networks play only through TorchLivePolicy')
         trunk = self.encode_observation(encoded)
         trunk['core'], trunk['state'] = self._core(trunk['core_input'], state)
         p = self.parameters
@@ -1581,13 +1628,13 @@ class NeuralPolicy:
         parts = [trunk['core'], self.parameters[head+'_action_embedding'][action]]
         return concatenate(parts+([summary] if summary is not None else []))
 
+    def _pace(self, trunk):
+        """log(order rate / own mean) for networks with a pace head (network='paced'), else None."""
+        return None
+
     def _action_logits(self, trunk):
         p = self.parameters
         return trunk['core'] @ p['action_w']+p['action_b']
-
-    def _delay_logits(self, trunk, action):
-        p = self.parameters
-        return self._with_action(trunk, 'delay', action) @ p['delay_w']+p['delay_b']
 
     def _lstm_step(self, query, state):
         """One step of torch's LSTM equations; state is (hidden, cell)."""
@@ -1664,12 +1711,30 @@ class NeuralPolicy:
     def _sampling_logits(self, logits):
         return logits
 
-    def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False):
-        """One decision and the next core state: the selected action, its delay, then the action's arguments.
+    def _top_orders(self, logits, orders, count=5):
+        """[(label, probability)] of the likeliest orders as live play samples them (SAMPLING_TEMPERATURE)."""
+        legal = np.flatnonzero(orders)
+        scaled = logits.data[legal]/SAMPLING_TEMPERATURE
+        p = np.exp(scaled-scaled.max())
+        p /= p.sum()
+        top = []
+        for i in np.argsort(-p)[:count]:
+            k, obj = (int(v) for v in self.actions[legal[i]])
+            kind = KINDS[k]
+            name = '' if obj < 0 else self.config['templates' if kind in ('build', 'train') else 'commands'][obj]
+            top.append((' '.join(filter(None, (kind, name.replace('Command_', '').replace('China', '')))), float(p[i])))
+        return top
 
-        memory is the core LSTM state from this player's previous decision (None at a game's start).
+    def decide(self, encoded, memory=None, *, teacher=None, rng=None, deterministic=False, snapshots=None):
+        """One look and the next core state: whether to act, the selected action, then its arguments.
+
+        memory is the core LSTM state from this player's previous committed row (None at a game's start).
+        snapshots (live): how many no-op rows training would hold in the time since the last look (EventActor).
+        The no-op rows are a constant-rate sample of time, so the odds of acting x snapshots is the number of
+        orders expected in that time, and the look acts with that probability (at most 1): the average pace is
+        kept up to one order per look. None draws the training softmax. Acting or not is sampled at temperature 1 even when deterministic, if an rng is given:
+        a look is far shorter than a human gap, so the likelier answer is nearly always not to act.
         Returns (actions, trace, next memory, value, log-probability, entropy)."""
-        from event_schedule import delay_mask
         trunk = self._trunk(encoded, memory)
         config, trace = self.config, {}
         logp, entropy = Tensor(0), Tensor(0)
@@ -1678,7 +1743,7 @@ class NeuralPolicy:
             logits = self._sampling_logits(logits)
             if name not in ('cell', 'offset'):  # Position: capped in _location.
                 logits = cap_logits(logits, mask)
-            if teacher is None and name != 'delay' and not deterministic:
+            if teacher is None and not deterministic:
                 logits = logits/SAMPLING_TEMPERATURE
             choice, lp, ent = categorical(logits, mask, choice=override, rng=rng, deterministic=deterministic)
             logp, entropy = logp+lp, entropy+ent
@@ -1688,14 +1753,38 @@ class NeuralPolicy:
         if teacher is None:  # Live play: only objects some unit can use now.
             exact = mask & self.exact_action_mask(encoded)
             mask = exact if exact.any() else mask
-        action = draw('decision', self._action_logits(trunk), mask, self.action_choice(teacher) if teacher else None)
+        noop, acting = self.action_index[(0, -1)], None
+        if teacher is not None:
+            action = draw('decision', self._action_logits(trunk), mask, self.action_choice(teacher))
+        else:
+            # Act or not at temperature 1 (the training calibration), then what at SAMPLING_TEMPERATURE.
+            logits = cap_logits(self._sampling_logits(self._action_logits(trunk)), mask)
+            orders, action = mask.copy(), noop
+            orders[noop] = False
+            pace = self._pace(trunk)
+            if orders.any() and getattr(self, 'explain', False):  # play_headed --decisions: the top orders
+                trace['top'] = self._top_orders(logits, orders)
+            if orders.any():
+                stay, act = logits[noop:noop+1], logits[np.flatnonzero(orders)].reshape((1, -1)).logsumexp(1)
+                if pace is not None:  # network='paced': no trained no-op; orders/s = own pace x exp(pace).
+                    stay, act = Tensor(np.asarray([math.log(self.snapshot_rate)])), Tensor(np.asarray([pace+math.log(order_rate(encoded))]))
+                if snapshots is not None:
+                    act = act-stay+math.log(snapshots)
+                    stay = complement(act) if act.data[0] < 0 else None
+                acts, acting = 1, 1.
+                if stay is not None:
+                    pair = concatenate([stay, act])
+                    acts, lp, ent = categorical(pair, [True, True], rng=rng, deterministic=deterministic and rng is None)
+                    logp, entropy = logp+lp, entropy+ent
+                    acting = round(float(1/(1+np.exp(pair.data[0]-pair.data[1]))), 6)
+                if acts:
+                    action, lp, ent = categorical(logits if deterministic else logits/SAMPLING_TEMPERATURE, orders,
+                                                  rng=rng, deterministic=deterministic)
+                    logp, entropy = logp+lp, entropy+ent
         k, obj = (int(value) for value in self.actions[action])
         kind = KINDS[k]
-        delays = delay_mask(config, encoded.get('event_rate', 60))
-        first_delay = int(np.flatnonzero(delays)[0])
-        delay = draw('delay', self._delay_logits(trunk, action), delays, teacher.get('delay', first_delay) if teacher else None)
         if kind == 'wait':
-            return [], {'kind': 'wait', 'delay': delay}, trunk['state'], trunk['value'], logp, entropy
+            return [], {'kind': 'wait', 'act_probability': acting, **({'top': trace['top']} if 'top' in trace else {})}, trunk['state'], trunk['value'], logp, entropy
         actors = self.actor_mask(encoded, kind)
         if teacher is None and obj >= 0:
             actors &= self.object_actors(encoded, kind, obj)
@@ -1716,7 +1805,7 @@ class NeuralPolicy:
             available = self.selection_mask(encoded, kind, selected, actors)
             if not any(available[i] for i in range(len(actors)) if i not in selected):
                 break
-        trace = {'kind': kind, 'selection': selected, 'delay': delay}
+        trace = {'kind': kind, 'selection': selected, 'act_probability': acting, **({'top': trace['top']} if 'top' in trace else {})}
         ids = [encoded['entities'][i]['id'] for i in selected]
         result = {'kind': kind}
         if kind in GROUP_KINDS:
@@ -1730,6 +1819,7 @@ class NeuralPolicy:
             trace['template'] = obj
             result['template'] = self.production_native(encoded['entities'][selected[0]], kind, config['templates'][obj])
         summary = self._selection_summary(trunk, selected)
+        trunk['selected'] = selected  # The movement network's location head marks them on its map.
         if kind == 'cancel_production':
             result['slot'] = draw('slot', self._slot_logits(trunk, action, summary), self.slot_mask(encoded, selected),
                                   teacher.get('slot') if teacher else None)
@@ -1825,4 +1915,5 @@ class NeuralPolicy:
             if policy.weight_hash() != document['weight_hash'] or policy.identity_hash() != document['policy_identity_hash']:
                 raise ValueError('Checkpoint weight/configuration hash mismatch')
             optimizer.parameter_steps = document['metadata'].get('event_optimizer_steps', {})
+            policy.snapshot_rate = document['metadata'].get('event_snapshot_rate', policy.snapshot_rate)
         return policy, optimizer, document

@@ -13,7 +13,7 @@ import zipfile
 import event_ingest
 import event_store
 from prepared_io import _digest, _write_json
-from test_fixtures import fixture, raw_row
+from test_fixtures import RECORDING, fixture, raw_row
 
 
 class PreparationTests(unittest.TestCase):
@@ -32,7 +32,8 @@ class PreparationTests(unittest.TestCase):
                 audit=dict(observation_policy_version=11, placement_mode='fast')))
             rows = [raw_row(0, self.obs), raw_row(30, self.obs, [{'kind': 'stop', 'units': [10]}]),
                     raw_row(60, self.obs, terminal=True)]
-            self.games.append(dict(path=str(path), player=2, map=self.terrain, rows=rows, source_ticks_per_second=60))
+            self.games.append(dict(path=str(path), player=2, map=self.terrain, rows=rows, source_ticks_per_second=60,
+                                   replay_sha256=RECORDING))
             entries.append(dict(trajectory=str(path), sha256=_digest(path), match_key=match, split='train'))
         self.input = self.root/'input.json'
         _write_json(self.input, dict(entries=entries))
