@@ -63,9 +63,9 @@ def in_archive(path):
             or (path.parent.parent.parent == SPECIAL.resolve() and path.parent.parent.name != '_screened'))
 RETAIL = rc.ROOT/'replay-runtime/retail-104'
 RETAIL_ENGINE = RETAIL/'game/generalszh.exe'
-# VC6 build of TheSuperHackers 85135752c with the uncommitted GeneralsAI exporter port
-# (C:/repos/GeneralsAI/TheSuperHackers); in CRC sync on retail 1.04 replays.
-RETAIL_ENGINE_SHA = '06911584c5b02aa18f882ff0be0297bbce58978a24362be23772973257d4f139'
+# VC6 build of TheSuperHackers branch ai at befd9846f (pushed as Niko1879/GameClient retail-104), the GeneralsAI
+# exporter port after the 26 Nov 2026 feature review; in CRC sync on retail 1.04 replays.
+RETAIL_ENGINE_SHA = '2fc6ef5aa04535cead17be9cdc30c431624131c43ea904b191d6c7050475fcf1'
 MAPS = RETAIL/'maps'
 # Generals Online's handshake: retail shards train a policy deployed on that engine.
 DEPLOYMENT_CATALOG = rc.ROOT/'replay-runtime/action-catalog.json'
