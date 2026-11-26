@@ -18,7 +18,7 @@ from event_policy import SCIENCE_ORDERS, EventActor
 from event_schedule import native_deadline, step_ticks
 from event_dataset import EventDataset
 from event_store import feature_identity, write_shard
-from generals_policy import NeuralPolicy
+from generals_policy import NeuralPolicy, Unrepresentable
 from nn_numpy import Tensor
 from prepared_io import _write_json
 from replay_events import decisions, encoded_events
@@ -79,6 +79,16 @@ class EventTests(unittest.TestCase):
         if encoded['rotated']:
             x, y = bins-1-x, bins-1-y
         self.assertEqual((x, y), (bins-1, 0))
+
+    def test_stop_is_for_mobile_units_only(self):
+        encoded = self.policy.encoder.encode(self.obs, self.terrain, 30)
+        mask = self.policy.actor_mask(encoded, 'stop')
+        mobile = self.policy.mobile_types
+        self.assertTrue(all(mask[i] == (e['type'] in mobile) for i, e in enumerate(encoded['entities']) if e['own']))
+        self.policy.target(encoded, [{'kind': 'stop', 'units': [10]}])
+        building = next(e['id'] for e in self.obs['own_entities'] if e['type'] not in mobile)
+        with self.assertRaises(Unrepresentable):
+            self.policy.target(encoded, [{'kind': 'stop', 'units': [building]}])
 
     def test_unsupported_events_are_neither_commands_nor_no_ops(self):
         stop = [{'kind': 'stop', 'units': [10]}]

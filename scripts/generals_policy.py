@@ -1016,7 +1016,9 @@ class NeuralPolicy:
                 if kind != 'rally' and passes:
                     passes = not menu.isdisjoint(self.production_available(e, kind))
                 mask[i] = passes
-        elif kind in ('move', 'attack_move', 'add_waypoint'):
+        elif kind in ('move', 'attack_move', 'add_waypoint', 'stop'):
+            # Stop too (user, 26 Nov): a Stop on buildings is the engine sending Stop alongside a train hotkey (the
+            # War Factory's Listening Outpost key: the train follows ~0.1 s later), a duplicate, never a decision.
             mobile = self.mobile_types
             mask[[i for i, e in rows if e['type'] not in mobile]] = False
         elif kind == 'sell':
