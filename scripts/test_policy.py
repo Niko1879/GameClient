@@ -117,13 +117,46 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(encoded['cells'][encoded['ids'][100+i]], cell)
         self.assertEqual(observation, unchanged)
 
+    def test_economy_tech_buildings_and_capture(self):
+        """Static map knowledge (user review, 26 Nov): derricks on the map and supply sources in my half, where a
+        source is the supply objects one supply center serves (chains within SUPPLY_SOURCE_RADIUS)."""
+        from generals_policy import (CAPTURABLE_COLUMN, STATIC_MAP_CHANNELS, SUPPLY_SOURCE_RADIUS, economy_map,
+                                     supply_sources)
+        labels = supply_sources([[0, 0], [150, 0], [300, 0], [900, 900]])
+        self.assertEqual(len(set(labels[:3])), 1, 'Piles chained within the radius are one source')
+        self.assertNotEqual(labels[3], labels[0])
+        self.assertEqual(SUPPLY_SOURCE_RADIUS, 200)
+        obs, terrain = copy.deepcopy(self.obs), copy.deepcopy(self.terrain)
+        low = np.asarray(terrain['extent_low'][:2], dtype=float); high = np.asarray(terrain['extent_high'][:2], dtype=float)
+        near, far = (low+.1*(high-low)).tolist(), (low+.9*(high-low)).tolist()
+        terrain['supply_sources'] = [{'id': i, 'type': 'SupplyPileSmall', 'position': [*p, 0]}
+                                     for i, p in enumerate([near, [near[0]+100, near[1]], far])]
+        terrain['tech_buildings'] = [{'id': 50, 'type': 'TechOilDerrick', 'position': [*far, 0], 'income': True},
+                                     {'id': 51, 'type': 'TechOilDerrick', 'position': [*near, 0], 'income': True},
+                                     {'id': 52, 'type': 'TechArtilleryPlatform', 'position': [*near, 0], 'income': False}]
+        self.assertEqual(economy_map(terrain, near, low, high), (2, 1))
+        for e in obs['own_entities']:
+            e['task'] = {**e['task'], 'kind': 'collect'}
+        obs['known_nonowned_entities'][0]['capturable'] = True
+        obs['known_nonowned_entities'][1]['capturable'] = True  # The fixture's second sighting is a fog ghost.
+        encoded = self.policy.encoder.encode(obs, terrain, 600, home_position=near)
+        derricks, mine, collecting = encoded['scalars'][10:13]
+        self.assertAlmostEqual(derricks, .2); self.assertAlmostEqual(mine, .1)
+        self.assertAlmostEqual(collecting, len(obs['own_entities'])/20)
+        planes = map_planes(encoded)
+        self.assertEqual(planes[5].sum() > 0, True); self.assertEqual(planes[6].sum() > 0, True)
+        seen, ghost = (encoded['ids'][e['id']] for e in obs['known_nonowned_entities'])
+        self.assertEqual(encoded['numeric'][seen, CAPTURABLE_COLUMN], 1)
+        self.assertEqual(encoded['numeric'][ghost, CAPTURABLE_COLUMN], 0, 'Nothing in the fog can be captured')
+
     def test_empty_entity_grid_preserves_zero_sentinel(self):
         observation = copy.deepcopy(self.obs)
         observation['own_entities'] = observation['known_nonowned_entities'] = []
         encoded = self.policy.encoder.encode(observation, self.terrain, 6)
         np.testing.assert_array_equal(encoded['numeric'], np.zeros((1, ENTITY_FEATURES)))
         np.testing.assert_array_equal(encoded['cells'], [0])
-        self.assertFalse(map_planes(encoded)[8:13].any())
+        from generals_policy import STATIC_MAP_CHANNELS
+        self.assertFalse(map_planes(encoded)[STATIC_MAP_CHANNELS+3:STATIC_MAP_CHANNELS+8].any())
         self.assertEqual(self.policy.decide(encoded, teacher={'kind': 'wait'})[1]['kind'], 'wait')
 
     def test_entity_ids_and_order_do_not_enter_network(self):
@@ -180,8 +213,9 @@ class PolicyTests(unittest.TestCase):
         terrain['supply_sources'] = [{'id': 123, 'type': 'SupplyDock', 'position': [500, 500, 0]}]
         encoded = self.policy.encoder.encode(obs, terrain, 600)
         planes = map_planes(encoded)
-        self.assertTrue((planes[5] == 1).all())
-        self.assertTrue((planes[6:8] == 0).all())
+        from generals_policy import STATIC_MAP_CHANNELS
+        self.assertTrue((planes[STATIC_MAP_CHANNELS] == 1).all())
+        self.assertTrue((planes[STATIC_MAP_CHANNELS+1:STATIC_MAP_CHANNELS+3] == 0).all())
         self.assertGreater(planes[2].sum(), 0)
         self.assertFalse(encoded['visible_target'][encoded['ids'][100]])
         self.assertGreater(encoded['numeric'][encoded['ids'][100], 8], 0)

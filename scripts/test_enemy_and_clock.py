@@ -103,7 +103,8 @@ class EnemyAndClockTests(unittest.TestCase):
         self.assertEqual(int(bins[first].argmax()), 10)
         self.assertEqual(int(bins[second].argmax()), 31)
         side = self.terrain['grid_size']
-        alert = map_planes(encoded)[12]
+        from generals_policy import STATIC_MAP_CHANNELS
+        alert = map_planes(encoded)[STATIC_MAP_CHANNELS+7]
         self.assertEqual(alert.reshape(-1)[encoded['cells'][first]], 1)
         self.assertEqual(alert.sum(), 1)
         self.assertEqual(alert.shape, (side, side))

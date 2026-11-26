@@ -143,7 +143,7 @@ struct DirectSighting : training_sightings::Flags {
     int supplyBoxes = 0;
     std::array<int, WEAPONSLOT_COUNT> weapons{};
     int armor = -1;
-    bool firing = false, poisoned = false, burning = false;
+    bool firing = false, poisoned = false, burning = false, capturable = false;
     const ThingTemplate *typeTemplate = nullptr;
 };
 std::array<std::vector<DirectSighting>, MAX_PLAYER_COUNT> directSightings;
@@ -156,7 +156,7 @@ struct DirectScratch {
     std::vector<std::pair<const Object *, int>> effects;
 } directScratch;
 
-void refreshDirectSighting(DirectSighting &result, Object *object, unsigned frame)
+void refreshDirectSighting(DirectSighting &result, Object *object, unsigned frame, const Player *viewer)
 {
     result.id = static_cast<unsigned>(object->getID());
     result.lastSeen = frame;
@@ -184,6 +184,7 @@ void refreshDirectSighting(DirectSighting &result, Object *object, unsigned fram
     result.firing = firingVisibly(object, frame);
     result.poisoned = poisonedVisibly(object);
     result.burning = burningVisibly(object);
+    result.capturable = capturableBy(object, viewer);
     result.visible = true;
 }
 
@@ -191,7 +192,7 @@ void writeDirectSighting(DirectOutput &out, DirectCursor &parent, const DirectSi
 {
     auto fields = out.object(parent, {"id", "type", "owner", "position", "health", "max_health",
                                       "last_seen_frame", "visible", "own", "velocity_x", "velocity_y", "facing", "veterancy",
-                                      "supply_boxes", "weapons", "armor", "firing", "poisoned", "burning"});
+                                      "supply_boxes", "weapons", "armor", "firing", "poisoned", "burning", "capturable"});
     out.put(fields, entity.id); out.put(fields, entity.type); out.put(fields, entity.owner);
     out.point(fields, &entity.position); out.put(fields, entity.health); out.put(fields, entity.maximumHealth);
     out.put(fields, entity.lastSeen); out.put(fields, entity.visible); out.put(fields, false);
@@ -204,6 +205,7 @@ void writeDirectSighting(DirectOutput &out, DirectCursor &parent, const DirectSi
     // A fog ghost shows no current activity.
     out.put(fields, entity.visible && entity.firing); out.put(fields, entity.visible && entity.poisoned);
     out.put(fields, entity.visible && entity.burning);
+    out.put(fields, entity.visible && entity.capturable);
     fields.finish();
 }
 
@@ -218,13 +220,13 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
     const bool hasBuilder = builder && builder->getControllingPlayer() == owner;
     const char *names[] = {"id", "type", "owner", "position", "health", "max_health", "last_seen_frame", "visible", "own",
         "velocity_x", "velocity_y", "facing", "veterancy", "supply_boxes", "weapons", "armor",
-        "firing", "poisoned", "burning", "weapon_bonus",
+        "firing", "poisoned", "burning", "capturable", "weapon_bonus",
         "task", "radius", "has_weapon", "weapon_cooldown_ticks", "ticks_since_damage",
         "can_attack", "has_atk_move_cmd", "can_attack_move", "dock_targets", "resume_targets",
         "construction_percent", "ai_state", "production_queue", "buildable_templates", "trainable_templates",
         "commands", "command_cooldowns", "command_targets", "enter_targets", "container_id", "occupants", "capacity",
         "upgrades", "can_guard", "repair_targets", "repair_depots", hasProducer ? "producer_id" : "builder_id", "builder_id"};
-    const size_t count = 46+hasProducer+hasBuilder;
+    const size_t count = 47+hasProducer+hasBuilder;
     auto fields = out.writer.literalObject(out.buffer, parent.next(), names, count);
     out.put(fields, static_cast<unsigned>(object->getID())); out.put(fields, object->getTemplate()->getName().str());
     out.put(fields, owner ? static_cast<int>(owner->getPlayerIndex()) : -1);
@@ -241,6 +243,7 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
     out.put(fields, arms.armor);
     out.put(fields, firingVisibly(object, frame)); out.put(fields, poisonedVisibly(object));
     out.put(fields, burningVisibly(object));
+    out.put(fields, capturableBy(object, owner));
     auto bonus = out.array(fields, 3);
     out.put(bonus, arms.damage); out.put(bonus, arms.range); out.put(bonus, arms.rate);
     const CommandSet *set = commandSetFor(object, lookups);
@@ -392,7 +395,7 @@ template<class Own> void observeObjects(Player *player, unsigned frame, Own own)
             auto found = std::lower_bound(memory.begin(), memory.end(), id,
                 [](const DirectSighting &item, unsigned key) { return item.id < key; });
             if (found == memory.end() || found->id != id) found = memory.emplace(found);
-            refreshDirectSighting(*found, object, frame);
+            refreshDirectSighting(*found, object, frame, player);
         }
     }
     temporarySightingsForgotten[index] += static_cast<unsigned>(training_sightings::forgetHiddenTemporary(memory));

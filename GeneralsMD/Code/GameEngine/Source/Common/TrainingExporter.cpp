@@ -512,7 +512,8 @@ bool retainedNeutralTemplate(const ThingTemplate *t)
     if (t->isKindOf(KINDOF_CAN_ATTACK) && t->getDefaultOwningSide() != "Civilian") return true;
     const ModuleInfo &modules = t->getBehaviorModuleInfo();
     for (int i = 0; i < modules.getCount(); ++i)
-        if (std::strstr(modules.getNthName(i).str(), "Contain")) return true;
+        if (std::strstr(modules.getNthName(i).str(), "Contain") || std::strstr(modules.getNthName(i).str(), "CrateCollide"))
+            return true;
     return false;
 }
 
@@ -979,6 +980,23 @@ Json templateStats(int player)
     return result;
 }
 
+// Whether this structure can be captured: by the viewer, for anything not the viewer's; by an enemy, for the viewer's
+// own. The target-side half of ActionManager::canCaptureBuilding (the capturer's power and readiness are its own
+// inputs): a live, finished structure that is not immune, not garrisoned by visible units, and either an enemy's or
+// marked CAPTURABLE (tech buildings) and not allied. Feature review, 26 Nov 2026.
+bool capturableBy(const Object *object, const Player *viewer)
+{
+    if (!object->isKindOf(KINDOF_STRUCTURE) || object->isKindOf(KINDOF_IMMUNE_TO_CAPTURE) || object->isEffectivelyDead())
+        return false;
+    if (object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || object->testStatus(OBJECT_STATUS_SOLD)) return false;
+    if (const ContainModuleInterface *contain = object->getContain())
+        if (contain->isGarrisonable() && contain->getContainCount() > contain->getStealthUnitsContained()) return false;
+    const Player *owner = object->getControllingPlayer();
+    if (owner == viewer) return true;
+    const Relationship relation = viewer->getRelationship(object->getTeam());
+    return relation == ENEMIES || (object->isKindOf(KINDOF_CAPTURABLE) && relation != ALLIES);
+}
+
 Json entity(Object *object, bool own, unsigned frame, ObservationLookups &lookups, Json j = Json())
 {
     ExportTimer timer(EXPORT_ENTITY);
@@ -1209,10 +1227,20 @@ Json mapFeatures()
             || o->getControllingPlayer()->getPlayerIndex() < 2))
             sources.push_back({{"id", static_cast<unsigned>(o->getID())}, {"type", o->getTemplate()->getName().str()},
                                {"position", position(o->getPosition())}});
-    Json result = reservedObject(7);
+    // Tech buildings (derricks, refineries, artillery platforms, hospitals...): where they stand and whether they pay
+    // out (an oil derrick's AutoDepositUpdate). Static map knowledge, as the supply locations; owners are not exported.
+    Json tech = Json::array();
+    static const NameKeyType autoDeposit = NAMEKEY("AutoDepositUpdate");
+    for (Object *o = TheGameLogic->getFirstObject(); o; o = o->getNextObject())
+        if (o->isKindOf(KINDOF_TECH_BUILDING))
+            tech.push_back({{"id", static_cast<unsigned>(o->getID())}, {"type", o->getTemplate()->getName().str()},
+                            {"position", position(o->getPosition())},
+                            {"income", o->findUpdateModule(autoDeposit) != nullptr}});
+    Json result = reservedObject(8);
     result["record"] = "map";
     result["grid_size"] = gridSize;
     result["supply_sources"] = std::move(sources);
+    result["tech_buildings"] = std::move(tech);
     result["extent_low"] = position(&region.lo);
     result["extent_high"] = position(&region.hi);
     result["height"] = std::move(heights);
@@ -1314,6 +1342,7 @@ Json observation(Player *player, unsigned frame, Json result = Json())
         if (isOwned) {
             Json &slot = arraySlot(own, owned++);
             slot = entity(o, true, frame, lookups, std::move(slot));
+            slot["capturable"] = capturableBy(o, player);
             const unsigned id = static_cast<unsigned>(o->getID());
             const auto found = training_sightings::find(memory, id);
             if (found != memory.end() && found->id == id) memory.erase(found);
@@ -1328,6 +1357,7 @@ Json observation(Player *player, unsigned frame, Json result = Json())
                 found->persistent = persistentSightingTemplate(found->type);
             }
             found->value = entity(o, false, frame, lookups, std::move(found->value));
+            found->value["capturable"] = capturableBy(o, player);
         }
     }
     world.stop();

@@ -51,14 +51,15 @@ PAIR_FIELDS = {'dock': 'dock_targets', 'enter': 'enter_targets', 'repair': 'repa
                'get_repaired': 'repair_depots'}
 COMMAND_KINDS = ('upgrade', 'ability')
 # Position, health, ownership, construction, the production queue (current item's progress), cooldown, under attack,
-# motion, facing, veterancy, supply boxes and firing now. No ghost age, poisoned or burning (user review, 26 Nov).
-ENTITY_FEATURES = 22
+# motion, facing, veterancy, supply boxes, firing now and capturable (by me; for my own buildings, by an enemy: the
+# engine's capture rules, seen units only). No ghost age, poisoned or burning (user review, 26 Nov).
+ENTITY_FEATURES = 23
 # Divides world units per second, so a fast ground unit is near 1.
 VELOCITY_SCALE = 100
 # Numeric columns read back when building model inputs.
 HEALTH_COLUMN, CONSTRUCTED_COLUMN = 3, 8
 OWN_COLUMN, VISIBLE_COLUMN, ENEMY_COLUMN, COOLDOWN_COLUMN, UNDER_ATTACK_COLUMN = 5, 6, 7, 13, 14
-SUPPLY_COLUMN, FIRING_COLUMN = 20, 21
+SUPPLY_COLUMN, FIRING_COLUMN, CAPTURABLE_COLUMN = 20, 21, 22
 # Own (and garrisonable) entities: inside a container, and a container's fill. Menus, buttons and charging are the
 # type embedding's and the button inputs' (user review, 26 Nov).
 EXTRA_ENTITY_FEATURES = 2
@@ -80,9 +81,14 @@ RATING_FEATURES = 6
 # Rating explains only ~9% of its variance (23 Nov 2026), so it is its own input. 50 is the median at 1800-2000.
 APM_CENTER, PLAY_APM, APM_FEATURES = 50, 50, 2
 # Cash, net power (made - used, negative when short), radar, rank, progress to the next rank [0, 1) (the engine's
-# level-down/level-up skill points; 0 at max rank), science points, game clock, own unit count, map extent, source rate;
-# then the public superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
-SCALAR_FEATURES = 17
+# level-down/level-up skill points; 0 at max rank), science points, game clock, own unit count, map extent; economy
+# (user review, 26 Nov): oil derricks on the map, supply sources in my half of it (static map knowledge), own units
+# collecting supplies now; the source rate; then the public superweapon timers, own then enemy: present, soonest ready
+# (/SUPERWEAPON_SECONDS), ready now.
+SCALAR_FEATURES = 20
+# One supply source: the supply objects one supply center serves, the AI's rule (AIPlayer::findSupplyCenter:
+# SUPPLY_CENTER_CLOSE_DIST = 20 pathfinding cells of 10 world units), chained.
+SUPPLY_SOURCE_RADIUS = 200
 SUPERWEAPON_SECONDS = 600
 # Current perception (TrainingExporter: effects, audio_cues): projectiles and hazards visible now, and special-power
 # launch sounds heard in the last CUE_SECONDS (10 s, user review 26 Nov; the cue age tells fresh from old). Painted
@@ -97,8 +103,9 @@ MAP_EMBEDDING = 256
 # bursts in play (its own orders reset it: 198 orders/min at 200 ms looks, 23 Nov). The exporter refreshes sightings on
 # the quiet grid, so the game clock and a remembered sighting's last-seen clock are floored to it (Encoder.floor).
 # Height, cliff, supply, x, y; three visibility states; own, seen enemy, remembered enemy and neutral counts; alert.
-STATIC_MAP_CHANNELS = 5
-MAP_CHANNELS = 13
+# Height, cliff, supply, x, y, oil derricks, other tech buildings (static map knowledge, like the supply locations).
+STATIC_MAP_CHANNELS = 7
+MAP_CHANNELS = 15
 POSITION_BITS = 16
 # Attack cooldown as AlphaStar encodes it: one-hot in 45 ms game steps, capped at 31.
 COOLDOWN_BINS = 32
@@ -396,6 +403,38 @@ def location_stages(config):
     return [max(1, channels >> (i+1)) for i in range(stages-1)]+[1]
 
 
+def supply_sources(positions, radius=SUPPLY_SOURCE_RADIUS):
+    """Supply objects grouped into sources: chains of objects within `radius` of one another. (n, 2) -> labels."""
+    positions = np.asarray(positions, dtype=float).reshape(-1, 2)
+    labels = np.arange(len(positions))
+    def root(i):
+        while labels[i] != i:
+            labels[i] = labels[labels[i]]
+            i = labels[i]
+        return i
+    for i in range(len(positions)):
+        near = np.flatnonzero(((positions[i+1:]-positions[i])**2).sum(axis=1) <= radius*radius)+i+1
+        for j in near:
+            labels[root(j)] = root(i)
+    return np.asarray([root(i) for i in range(len(positions))])
+
+
+def economy_map(terrain, home, low, high):
+    """(oil derricks on the map, supply sources in my half): a source is mine when its centre is nearer my start than
+    the point opposite it through the map centre (the enemy's start on symmetric 1v1 maps). Native coordinates."""
+    derricks = sum(bool(t.get('income')) for t in terrain.get('tech_buildings', ()))
+    positions = [s['position'][:2] for s in terrain.get('supply_sources', ())]
+    if home is None or not positions:
+        return derricks, 0
+    labels = supply_sources(positions)
+    home, opposite = np.asarray(home[:2], dtype=float), np.asarray(low+high, dtype=float)-np.asarray(home[:2], dtype=float)
+    mine = 0
+    for label in np.unique(labels):
+        centre = np.asarray(positions, dtype=float)[labels == label].mean(axis=0)
+        mine += ((centre-home)**2).sum() < ((centre-opposite)**2).sum()
+    return derricks, mine
+
+
 def initial_home(observation):
     entities = observation['own_entities']
     return np.mean([e['position'][:2] for e in entities], axis=0).tolist() if entities else None
@@ -438,11 +477,15 @@ class Encoder:
         side = terrain['grid_size']
         height, cliff = np.asarray(terrain['height'], dtype=float), np.asarray(terrain['cliff'], dtype=float)
         sources = terrain.get('supply_sources', [])
+        derricks = [t for t in terrain.get('tech_buildings', ()) if t.get('income')]
+        others = [t for t in terrain.get('tech_buildings', ()) if not t.get('income')]
+        def place(items):
+            if rotated:
+                return [[*(low+high-np.asarray(s['position'][:2])).tolist(), *s['position'][2:]] for s in items]
+            return [s['position'] for s in items]
         if rotated:
             height, cliff = (grid.reshape(side, side)[::-1, ::-1].reshape(-1) for grid in (height, cliff))
-            sources = [[*(low+high-np.asarray(s['position'][:2])).tolist(), *s['position'][2:]] for s in sources]
-        else:
-            sources = [s['position'] for s in sources]
+        sources, derricks, others = place(sources), place(derricks), place(others)
         base = np.zeros((side*side, STATIC_MAP_CHANNELS))
         base[:, 0] = height / 512
         base[:, 1] = cliff
@@ -454,8 +497,22 @@ class Encoder:
             base[y*side+x, 2] += 1
         base[:, 2] = np.log1p(base[:, 2]) / 4
         base[:, 3:5] = (np.stack(np.meshgrid(np.arange(side), np.arange(side)), axis=-1).reshape(-1, 2) + .5) / side
+        # Tech buildings where they stand, whoever owns them now (ownership is the entity's).
+        for channel, items in ((5, derricks), (6, others)):
+            for item in items:
+                pos = (np.asarray(item[:2])-low)/span
+                x, y = np.clip((pos*side).astype(int), 0, side-1)
+                base[y*side+x, channel] = 1
         self._static[rotated] = (terrain, base)
         return base
+
+    def _economy(self, terrain, home, low, high):
+        """economy_map, once per game (its terrain record) and start."""
+        key = (id(terrain), None if home is None else tuple(np.round(home[:2], 3)))
+        cached = self._static.get(('economy', key))
+        if cached is None or cached[0] is not terrain:
+            cached = self._static[('economy', key)] = (terrain, economy_map(terrain, home, low, high))
+        return cached[1]
 
     def _player_flags(self, player):
         """Completed player upgrades, owned promotions and currently purchasable promotions."""
@@ -585,7 +642,8 @@ class Encoder:
                 # Public: a seen pile's depletion; a fogged sighting keeps its last count.
                 np.log1p(column('supply_boxes')) / SUPPLY_BOX_SCALE,
                 # Visible now (the exporter clears it on fog ghosts).
-                column('firing')])
+                column('firing'),
+                np.asarray([bool(e.get('capturable')) and e['visible'] for e in entities], dtype=float)])
         else:
             # A zero row keeps pooling and pointer shapes defined after defeat.
             numeric = np.asarray([[0] * ENTITY_FEATURES])
@@ -595,6 +653,9 @@ class Encoder:
             float(p['radar']), p['rank'] / 5, min(max(p['rank_progress'], 0.), 1.), p['science_points'] / 10,
             np.log1p(self.floor(frame) / 60) / 10, len(observation['own_entities']) / 100,
             span[0] / 4000, span[1] / 4000]), -10), 10),
+            np.asarray([*self._economy(terrain, home_position, low, high),
+                        sum(e.get('task', {}).get('kind') in ('collect', 'return_supplies')
+                            for e in observation['own_entities'])]) / np.asarray([10, 10, 20]),
             [source_ticks_per_second/60],
             self._superweapons(observation)])
         visible_target = np.asarray([not e['own'] and e['visible'] and e['health'] > 0 and e['max_health'] > 0
