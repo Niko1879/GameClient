@@ -260,7 +260,7 @@ bool retainedNeutralTemplate(const ThingTemplate *t)
 	if (t->isKindOf(KINDOF_CAN_ATTACK) && t->getDefaultOwningSide() != "Civilian") return true;
 	const ModuleInfo &modules = t->getBehaviorModuleInfo();
 	for (int i = 0; i < modules.getCount(); ++i)
-		if (strstr(modules.getNthName(i).str(), "Contain")) return true;
+		if (strstr(modules.getNthName(i).str(), "Contain") || strstr(modules.getNthName(i).str(), "CrateCollide")) return true;
 	return false;
 }
 
@@ -705,6 +705,20 @@ Json mapFeatures()
 	result.set("record", S("map"));
 	result.set("grid_size", I(gridSize));
 	result.set("supply_sources", sources);
+	// Tech buildings: where they stand and whether they pay out (an oil derrick's AutoDepositUpdate). Static map
+	// knowledge, as the supply locations (feature review, 26 Nov 2026).
+	Json tech = Json::array();
+	static const NameKeyType autoDeposit = NAMEKEY("AutoDepositUpdate");
+	for (Object *o = TheGameLogic->getFirstObject(); o; o = o->getNextObject())
+		if (o->isKindOf(KINDOF_TECH_BUILDING)) {
+			Json building = Json::object();
+			building.set("id", U(static_cast<unsigned>(o->getID())));
+			building.set("type", S(o->getTemplate()->getName().str()));
+			building.set("position", position(o->getPosition()));
+			building.set("income", B(o->findUpdateModule(autoDeposit) != nullptr));
+			tech.push(building);
+		}
+	result.set("tech_buildings", tech);
 	result.set("extent_low", position(&region.lo));
 	result.set("extent_high", position(&region.hi));
 	result.set("height", heights);
@@ -977,11 +991,11 @@ struct DirectSighting {
 	int veterancy;
 	int supplyBoxes;
 	EntityArms arms;
-	bool firing, poisoned, burning;
+	bool firing, poisoned, burning, capturable;
 	const ThingTemplate *typeTemplate;
 	DirectSighting() : id(0), visible(false), persistent(true), lastSeen(0), owner(-1), health(0), maximumHealth(0),
 		velocityX(0), velocityY(0), facing(0), veterancy(0), supplyBoxes(0), firing(false), poisoned(false), burning(false),
-		typeTemplate(nullptr) {
+		capturable(false), typeTemplate(nullptr) {
 		position.x = position.y = position.z = 0;
 	}
 };
@@ -1008,7 +1022,21 @@ struct DirectScratch {
 	std::vector<std::pair<Int, const SuperweaponInfo *> > superweapons;
 } directScratch;
 
-void refreshDirectSighting(DirectSighting &result, Object *object, unsigned frame)
+// Whether this structure can be captured: by the viewer, for anything not the viewer's; by an enemy, for the viewer's
+// own. The target-side half of ActionManager::canCaptureBuilding (feature review, 26 Nov 2026).
+static bool capturableBy(const Object *object, const Player *viewer)
+{
+	if (!object->isKindOf(KINDOF_STRUCTURE) || object->isKindOf(KINDOF_IMMUNE_TO_CAPTURE) || object->isEffectivelyDead())
+		return false;
+	if (object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || object->testStatus(OBJECT_STATUS_SOLD)) return false;
+	const ContainModuleInterface *contain = object->getContain();
+	if (contain && contain->isGarrisonable() && contain->getContainCount() > contain->getStealthUnitsContained()) return false;
+	if (object->getControllingPlayer() == viewer) return true;
+	const Relationship relation = viewer->getRelationship(object->getTeam());
+	return relation == ENEMIES || (object->isKindOf(KINDOF_CAPTURABLE) && relation != ALLIES);
+}
+
+void refreshDirectSighting(DirectSighting &result, Object *object, unsigned frame, const Player *viewer)
 {
 	result.id = static_cast<unsigned>(object->getID());
 	result.lastSeen = frame;
@@ -1034,6 +1062,7 @@ void refreshDirectSighting(DirectSighting &result, Object *object, unsigned fram
 	result.firing = firingVisibly(object, frame, true);
 	result.poisoned = poisonedVisibly(object);
 	result.burning = burningVisibly(object);
+	result.capturable = capturableBy(object, viewer);
 	result.visible = true;
 }
 
@@ -1041,7 +1070,7 @@ void writeDirectSighting(DirectOutput &out, DirectCursor &parent, const DirectSi
 {
 	static const char *const sightingFields[] = {"id", "type", "owner", "position", "health", "max_health",
 		"last_seen_frame", "visible", "own", "velocity_x", "velocity_y", "facing", "veterancy", "supply_boxes",
-		"weapons", "armor", "firing", "poisoned", "burning"};
+		"weapons", "armor", "firing", "poisoned", "burning", "capturable"};
 	DirectCursor fields = out.object(parent, FIELDS(sightingFields));
 	out.put(fields, entity.id); out.put(fields, entity.type); out.put(fields, entity.owner);
 	out.point(fields, &entity.position); out.put(fields, entity.health); out.put(fields, entity.maximumHealth);
@@ -1055,6 +1084,7 @@ void writeDirectSighting(DirectOutput &out, DirectCursor &parent, const DirectSi
 	// A fog ghost shows no current activity.
 	out.put(fields, entity.visible && entity.firing); out.put(fields, entity.visible && entity.poisoned);
 	out.put(fields, entity.visible && entity.burning);
+	out.put(fields, entity.visible && entity.capturable);
 	fields.finish();
 }
 
@@ -1087,14 +1117,14 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
 	const bool hasBuilder = builder && builder->getControllingPlayer() == owner;
 	const char *names[] = {"id", "type", "owner", "position", "health", "max_health", "last_seen_frame", "visible", "own",
 		"velocity_x", "velocity_y", "facing", "veterancy", "supply_boxes", "weapons", "armor",
-		"firing", "poisoned", "burning", "weapon_bonus",
+		"firing", "poisoned", "burning", "capturable", "weapon_bonus",
 		"task", "radius", "has_weapon", "weapon_cooldown_ticks", "ticks_since_damage",
 		"can_attack", "has_atk_move_cmd", "can_attack_move", "dock_targets", "resume_targets",
 		"construction_percent", "ai_state", "production_queue", "buildable_templates", "trainable_templates",
 		"commands", "command_cooldowns", "command_targets", "enter_targets", "container_id", "occupants", "capacity",
 		"upgrades", "can_guard", "repair_targets", "repair_depots", "builder_id", "builder_id"};
-	names[46] = hasProducer ? "producer_id" : "builder_id";
-	const size_t count = 46 + (hasProducer ? 1 : 0) + (hasBuilder ? 1 : 0);
+	names[47] = hasProducer ? "producer_id" : "builder_id";
+	const size_t count = 47 + (hasProducer ? 1 : 0) + (hasBuilder ? 1 : 0);
 	DirectCursor fields = out.writer.object(out.buffer, parent.next(), names, count);
 	out.put(fields, static_cast<unsigned>(object->getID())); out.put(fields, object->getTemplate()->getName().str());
 	out.put(fields, owner ? static_cast<int>(owner->getPlayerIndex()) : -1);
@@ -1111,6 +1141,7 @@ void directEntity(DirectOutput &out, DirectCursor &parent, Object *object, unsig
 	out.put(fields, arms.armor);
 	out.put(fields, firingVisibly(object, frame, true)); out.put(fields, poisonedVisibly(object));
 	out.put(fields, burningVisibly(object));
+	out.put(fields, capturableBy(object, owner));
 	DirectCursor bonus = out.array(fields, 3);
 	out.put(bonus, arms.damage); out.put(bonus, arms.range); out.put(bonus, arms.rate);
 	const CommandSet *set = commandSetFor(object, lookups);
@@ -1244,7 +1275,7 @@ void observeObjects(Player *player, unsigned frame, DirectOutput *out, DirectCur
 			if (found < memory.size() && memory[found].id == id) memory.erase(memory.begin() + found);
 		} else if (TrainingObjectVisibleTo(object, index)) {
 			if (found == memory.size() || memory[found].id != id) memory.insert(memory.begin() + found, DirectSighting());
-			refreshDirectSighting(memory[found], object, frame);
+			refreshDirectSighting(memory[found], object, frame, player);
 		}
 	}
 	const size_t before = memory.size();
