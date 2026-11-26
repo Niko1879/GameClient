@@ -45,6 +45,8 @@
 #include "GameLogic/Module/PoisonedBehavior.h"
 #include "GameLogic/Module/DumbProjectileBehavior.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
+#include "GameLogic/Module/SpecialPowerUpdateModule.h"
+#include "GameLogic/Module/HackInternetAIUpdate.h"
 #include "Common/SpecialPower.h"
 #include "Common/SpecialPowerType.h"
 #include "Common/GameAudio.h"
@@ -410,7 +412,7 @@ struct PowerCue {
 	}
 };
 std::vector<PowerCue> powerCues;
-const unsigned CUE_SECONDS = 5;
+const unsigned CUE_SECONDS = 10;  // User review, 26 Nov 2026 (was 5).
 unsigned soundAudience(const AudioEventRTS *sound)
 {
 	if (!sound || sound->getEventName().isEmpty() || !TheAudio) return 0;
@@ -870,6 +872,18 @@ void writeReference(DirectOutput &out, DirectCursor &parent, const DirectReferen
 	fields.finish();
 }
 
+// Using a special ability now (Red Guard capture, Dragon firewall, Black Lotus, a hacker at work): unit task 'ability'
+// (feature review, 26 Nov 2026).
+static bool usingAbility(Object *object, AIUpdateInterface *ai)
+{
+	for (BehaviorModule **module = object->getBehaviorModules(); *module; ++module) {
+		SpecialPowerUpdateInterface *power = (*module)->getSpecialPowerUpdateInterface();
+		if (power && power->isSpecialAbility() && power->isActive()) return true;
+	}
+	HackInternetAIInterface *hack = ai ? ai->getHackInternetAIInterface() : nullptr;
+	return hack && (hack->isHacking() || hack->isHackingPackingOrUnpacking());
+}
+
 void directTask(DirectOutput &out, DirectCursor &parent, Object *object)
 {
 	AIUpdateInterface *ai = object->getAIUpdateInterface();
@@ -902,6 +916,7 @@ void directTask(DirectOutput &out, DirectCursor &parent, Object *object)
 		case AI_GUARD: case AI_GUARD_TUNNEL_NETWORK: case AI_GUARD_RETALIATE: kind = "guard"; break;
 		default: kind = "other"; break;
 		}
+		if (usingAbility(object, ai)) kind = "ability";
 		ObjectID goal = targetTask ? ai->getGoalObjectID() : INVALID_ID;
 		DozerAIInterface *dozer = ai->getDozerAIInterface();
 		if (dozer && dozer->getCurrentTask() != DOZER_TASK_INVALID) {
