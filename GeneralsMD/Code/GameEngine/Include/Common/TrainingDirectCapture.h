@@ -419,11 +419,12 @@ void directObservation(Player *player, unsigned frame, const Json &actions, Dire
     auto root = out.writer.literalObject(buffer, 0, names, fullPlacementMask ? 12 : 11);
     const int index = static_cast<int>(player->getPlayerIndex());
     auto state = out.object(root, {"index", "faction", "cash", "power_production", "power_consumption", "radar", "rank",
-                                   "skill_points", "science_points", "dead", "sciences", "purchasable_sciences", "upgrades"});
+                                   "skill_points", "rank_progress", "science_points", "dead", "sciences",
+                                   "purchasable_sciences", "upgrades"});
     out.put(state, index); out.put(state, player->getPlayerTemplate()->getName().str());
     out.put(state, player->getMoney()->countMoney()); out.put(state, player->getEnergy()->getProduction());
     out.put(state, player->getEnergy()->getConsumption()); out.put(state, static_cast<bool>(player->hasRadar()));
-    out.put(state, player->getRankLevel()); out.put(state, player->getSkillPoints());
+    out.put(state, player->getRankLevel()); out.put(state, player->getSkillPoints()); out.put(state, rankProgress(player));
     out.put(state, player->getSciencePurchasePoints()); out.put(state, static_cast<bool>(player->isPlayerDead()));
     ObservationLookups &lookups = observationLookups;
     training_commands::playerCommands(player, lookups.player);

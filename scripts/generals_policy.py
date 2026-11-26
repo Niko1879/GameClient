@@ -20,7 +20,7 @@ import threading
 
 import numpy as np
 
-from event_schedule import grid_ticks, snapshot_probability
+from event_schedule import grid_ticks
 from generals_identity import IdentityHierarchy, in_production_scope, production_twin, validate_production_scope
 from nn_numpy import Adam, Tensor, categorical, concatenate, conv2d, conv_transpose2d, scatter_sum, tensor
 
@@ -75,8 +75,10 @@ RATING_FEATURES = 6
 # training it contains the episode's future, as a coarse style input; live it is set freely (wait_snapshots.md).
 # Rating explains only ~9% of its variance (23 Nov 2026), so it is its own input. 50 is the median at 1800-2000.
 APM_CENTER, PLAY_APM, APM_FEATURES = 50, 50, 2
-# v11 appends the public superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
-SCALAR_FEATURES = 22
+# Cash, power made and used, radar, rank, progress to the next rank [0, 1) (the engine's level-down/level-up skill
+# points; 0 at max rank), science points, game clock, own and seen counts, map extent, source rate; then the public
+# superweapon timers, own then enemy: present, soonest ready (/SUPERWEAPON_SECONDS), ready now.
+SCALAR_FEATURES = 19
 SUPERWEAPON_SECONDS = 600
 # v11 current perception (TrainingExporter: effects, audio_cues), one token group sharing the entity
 # attention but never an actor or target: projectiles and hazards visible now, and special-power
@@ -87,13 +89,9 @@ CUE_SECONDS = 5
 EFFECT_RADIUS_SCALE = 50
 # Width of the map summary (map_fc), AlphaStar's 256 whatever the entity width (15 Nov 2026).
 MAP_EMBEDDING = 256
-# since_decision and since_command stay in stored scalars but never reach the model. since_decision: thinning no-op
-# rows changes a row's predecessor. since_command (user, 23 Nov 2026, after the live pace check): in play the model's
-# own orders reset it, and it read them as a human burst: after acting it acted again at 94% of 200 ms looks (198
-# orders/min); held at 1 s, 50/min (human ~52). No-op rows lie on the quiet grid, commands on any tick, and the exporter
-# refreshes sightings on it, so the game clock and a remembered sighting's last-seen clock are floored to it (Encoder).
-SINCE_DECISION, SINCE_COMMAND = 9, 14
-HIDDEN_SCALARS = (SINCE_DECISION, SINCE_COMMAND)
+# No time-since-decision or time-since-command input (feature review, 26 Nov): since_command made the model act in
+# bursts in play (its own orders reset it: 198 orders/min at 200 ms looks, 23 Nov). The exporter refreshes sightings on
+# the quiet grid, so the game clock and a remembered sighting's last-seen clock are floored to it (Encoder.floor).
 # Height, cliff, supply, x, y; three visibility states; own, seen enemy, remembered enemy and neutral counts; alert.
 STATIC_MAP_CHANNELS = 5
 MAP_CHANNELS = 13
@@ -103,10 +101,6 @@ COOLDOWN_BINS = 32
 COOLDOWN_BIN_SECONDS = .045
 MAX_COOLDOWN_SECONDS = 10
 DERIVED_ENTITY_FEATURES = POSITION_BITS+COOLDOWN_BINS
-# Weapon and armour inputs (re-export fix 4): the engine's three weapon slots and its damage types
-# (DAMAGE_NUM_TYPES, both engine trees); the anti mask's low bits. See arms_inputs.
-WEAPON_SLOTS, DAMAGE_TYPES, ANTI_BITS = 3, 38, 8
-ARMS_FEATURES = WEAPON_SLOTS*(1+7+ANTI_BITS+DAMAGE_TYPES)+1+DAMAGE_TYPES
 # A unit counts as under attack on the alert map for this long after taking damage.
 UNDER_ATTACK_TICKS = 120
 ATTENTION_LAYERS = 3
@@ -142,7 +136,7 @@ ARGUMENT_HEADS = ('unit', 'target', 'position', 'slot', 'angle')
 # Widths SCC does not give: AlphaStar's where a counterpart exists, otherwise ours (plan.md Â§6).
 # 'core' is the pre-LSTM FC and every LSTM layer, chosen so the model has 45-49M parameters.
 # Fixed constants. A config 'widths' entry shrinks them for tests; it is part of the feature key
-# (not in event_store.MODEL_ONLY), so it never rides on a real dataset.
+# (event_store.DATA_CONFIG), so it never rides on a real dataset.
 WIDTHS = {'entity': 256, 'ffn': 1024, 'heads': 2, 'head_width': 32, 'key': 32, 'pool_queries': 2,
           'scatter': 32, 'map_out': 32, 'map_embedding': 256, 'scalar': 512, 'scalar_out': 256,
           'core': 1024, 'action_embedding': 256, 'unit_query': 32}
@@ -245,13 +239,6 @@ def entity_key(entity):
             tuple(entity['position']), entity['last_seen_frame'])
 
 
-def visible_scalars(scalars):
-    """Stored scalars as the model sees them, for one row or a batch."""
-    visible = np.array(scalars)
-    visible[..., HIDDEN_SCALARS] = 0
-    return visible
-
-
 def visible_task_commands(commands):
     """Stored command receipts as the model sees them, without their age (since_command, unfloored)."""
     from unit_tasks import COMMANDS
@@ -338,77 +325,6 @@ def derived_inputs(numeric):
 # The factions the policy plays and learns from (13 Nov 2026: vanilla China plus the Tank and Nuke
 # generals, which share its buildings and economy; "my general" is the player_identity input).
 CHINA_FACTIONS = ('FactionChina', 'FactionChinaTankGeneral', 'FactionChinaNukeGeneral')
-
-
-class TemplateTable:
-    """One game's weapon and armour stats by per-game id (re-export fix 4).
-
-    The exporter sends each template's stats once per player stream, in the observation where
-    it first appears (`template_stats`). Every captured observation must pass through add(),
-    selected for training or not. Times become seconds: the engines run at 30 or 60 logic frames.
-    """
-    def __init__(self, source_ticks_per_second):
-        self.rate, self.weapons, self.armors = float(source_ticks_per_second), {}, {}
-
-    def add(self, stats):
-        for w in (stats or {}).get('weapons', ()):
-            self.weapons[int(w['id'])] = [w['range'], w['min_range'], w['damage'], w['radius'],
-                                          (w['min_delay_frames']+w['max_delay_frames'])/2/self.rate,
-                                          w['clip_size'], w['clip_reload_frames']/self.rate,
-                                          w['anti_mask'], w['damage_type']]
-        for a in (stats or {}).get('armors', ()):
-            if len(a['damage_multipliers']) != DAMAGE_TYPES:
-                raise ValueError('Armour stats do not cover every damage type')
-            self.armors[int(a['id'])] = list(a['damage_multipliers'])
-
-    def arrays(self):
-        """`weapon_stats` (W, 9) and `armor_stats` (A, DAMAGE_TYPES), rows by id; ids never sent stay zero."""
-        weapons = np.zeros((max(self.weapons, default=-1)+1, 9))
-        for i, row in self.weapons.items():
-            weapons[i] = row
-        armors = np.zeros((max(self.armors, default=-1)+1, DAMAGE_TYPES))
-        for i, row in self.armors.items():
-            armors[i] = row
-        return {'weapon_stats': weapons, 'armor_stats': armors}
-
-
-def arms_inputs(encoded):
-    """Per-entity weapon and armour inputs (ARMS_FEATURES) from stored ids, bonuses and the game's table.
-
-    Per weapon slot: present; log-scaled range x range bonus, minimum range, damage x damage bonus,
-    radius, mean delay (s) / rate bonus, clip size, clip reload (s) / rate bonus; ANTI_BITS anti-mask
-    bits; damage-type one-hot. Then armour present and its damage multiplier per damage type.
-    """
-    weapon_ids, armor_ids = np.asarray(encoded['weapon_ids']), np.asarray(encoded['armor_ids'])
-    bonus = np.asarray(encoded['weapon_bonus'], dtype=np.float64)
-    # No table attached (e.g. a fixture row): no stats; any used id then fails the check below.
-    table = np.asarray(encoded.get('weapon_stats', np.zeros((0, 9))))
-    armors = np.asarray(encoded.get('armor_stats', np.zeros((0, DAMAGE_TYPES))))
-    # The exporter sends a template's stats before any entity uses its id.
-    if weapon_ids.max(initial=-1) >= len(table) or armor_ids.max(initial=-1) >= len(armors):
-        raise ValueError('Weapon/armour template id without stats in the game table')
-    # A game without any template keeps the columns: one zero row stands in.
-    table = table if len(table) else np.zeros((1, 9))
-    armors = armors if len(armors) else np.zeros((1, DAMAGE_TYPES))
-    count = len(armor_ids)
-    blocks = []
-    for slot in range(WEAPON_SLOTS):
-        ids = weapon_ids[:, slot]
-        present = ids >= 0
-        stats = np.where(present[:, None], table[np.maximum(ids, 0)], 0)
-        damage, reach, rate = bonus[:, 0], bonus[:, 1], np.maximum(bonus[:, 2], 1e-6)
-        numbers = np.stack([np.log1p(stats[:, 0]*reach)/7, np.log1p(stats[:, 1])/7, np.log1p(stats[:, 2]*damage)/7,
-                            np.log1p(stats[:, 3])/5, np.log1p(stats[:, 4]/rate)/3, np.log1p(stats[:, 5])/5,
-                            np.log1p(stats[:, 6]/rate)/3], axis=1)*present[:, None]
-        anti = ((stats[:, 7].astype(np.int64)[:, None] >> np.arange(ANTI_BITS)) & 1)*present[:, None]
-        kind = np.eye(DAMAGE_TYPES)[stats[:, 8].astype(np.int64)]*present[:, None]
-        blocks += [present[:, None].astype(float), numbers, anti, kind]
-    worn = armor_ids >= 0
-    multipliers = np.where(worn[:, None], np.clip(armors[np.maximum(armor_ids, 0)], 0, 4), 0)
-    blocks += [worn[:, None].astype(float), multipliers]
-    result = np.concatenate(blocks, axis=1)
-    assert result.shape == (count, ARMS_FEATURES)
-    return result
 
 
 def count_channels(numeric, count):
@@ -583,7 +499,7 @@ class Encoder:
         return flags
 
     def floor(self, ticks):
-        """Canonical ticks floored to the quiet grid (see HIDDEN_SCALARS)."""
+        """Canonical ticks floored to the quiet grid, on which the exporter refreshes sightings."""
         return ticks//self.grid*self.grid
 
     @staticmethod
@@ -626,8 +542,7 @@ class Encoder:
         return (np.asarray(rows, dtype=float).reshape(-1, EFFECT_FEATURES), np.asarray(types, dtype=int),
                 np.asarray(powers, dtype=int))
 
-    def encode(self, observation, terrain, frame, *, previous_frame=None, home_position=None,
-               source_ticks_per_second=60):
+    def encode(self, observation, terrain, frame, *, home_position=None, source_ticks_per_second=60):
         if observation.get('observation_policy_version') != OBSERVATION_VERSION:
             raise ValueError('Policy requires observation version %d' % OBSERVATION_VERSION)
         if observation['player']['faction'] not in CHINA_FACTIONS:
@@ -699,16 +614,13 @@ class Encoder:
             # A zero row keeps pooling and pointer shapes defined after defeat.
             numeric = np.asarray([[0] * ENTITY_FEATURES])
         p = observation['player']
-        since_decision = max(0, frame - (frame if previous_frame is None else previous_frame))
-        submission = observation.get('last_submission', {})
-        since_command = submission.get('age_seconds', 0) if submission.get('available', False) else 0
         scalars = np.concatenate([np.minimum(np.maximum(np.asarray([
             np.log1p(p['cash']) / 10, p['power_production'] / 100, p['power_consumption'] / 100,
-            float(p['radar']), p['rank'] / 5, p['skill_points'] / 10, p['science_points'] / 10,
-            float(p['dead']), np.log1p(self.floor(frame) / 60) / 10, np.log1p(since_decision / 60),
+            float(p['radar']), p['rank'] / 5, min(max(p['rank_progress'], 0.), 1.), p['science_points'] / 10,
+            np.log1p(self.floor(frame) / 60) / 10,
             len(observation['own_entities']) / 100, len(observation['known_nonowned_entities']) / 100,
             span[0] / 4000, span[1] / 4000]), -10), 10),
-            [np.log1p(since_command)/5, source_ticks_per_second/60],
+            [source_ticks_per_second/60],
             self._superweapons(observation)])
         visible_target = np.asarray([not e['own'] and e['visible'] and e['health'] > 0 and e['max_health'] > 0
                                      for e in entities] if real_count else [False])
@@ -786,21 +698,7 @@ class Encoder:
                 extra[extra_index] = extra_rows
         else:
             extra = np.asarray([[0]*EXTRA_ENTITY_FEATURES])
-        # Weapon/armour template ids into the game's TemplateTable, and an owned unit's fire bonus.
-        weapon_ids = np.full((max(real_count, 1), WEAPON_SLOTS), -1, dtype=int)
-        armor_ids = np.full(max(real_count, 1), -1, dtype=int)
-        weapon_bonus = np.ones((max(real_count, 1), 3))
-        for index, e in enumerate(entities):
-            weapons = e.get('weapons')
-            if weapons:
-                weapon_ids[index] = weapons[:WEAPON_SLOTS]
-            armor_ids[index] = e.get('armor', -1)
-            if e['own'] and e.get('weapon_bonus'):
-                weapon_bonus[index] = e['weapon_bonus']
         player_flags, purchasable_sciences = self._player_flags(p)
-        encoded.update(weapon_ids=weapon_ids, armor_ids=armor_ids, weapon_bonus=weapon_bonus,
-                       # Empty until the game's table is attached (shards: episode shared data; live: the actor).
-                       **TemplateTable(1).arrays())
         effect_numeric, effect_types, effect_powers = self._effects(observation, low, high, span, rotated,
                                                                     source_ticks_per_second)
         encoded.update(effect_numeric=effect_numeric, effect_types=effect_types, effect_powers=effect_powers)
@@ -846,9 +744,10 @@ class NeuralPolicy:
         n, bins = config['map_side'], config['position_bins']
         if n <= 0 or 32 % n or bins % n or bins <= n or (bins//n) & (bins//n-1):
             raise ValueError('Invalid map/attention dimensions')
-        # No-op snapshots per second of game time in this policy's training rows. Checkpoints trained on thinned
-        # rows (event_dataset) carry their own rate; live play needs it for the action rate and the memory.
-        snapshot_probability(config)  # validates
+        # The no-op rate per second of game time that p(no-op) is set against in live play (decide). No longer a data
+        # setting: exports hold no no-op rows (26 Nov). Checkpoints carry their own rate.
+        if not 0 < config['snapshot_rate']*grid_ticks(config)/60 <= 1:
+            raise ValueError('The snapshot rate must be positive and at most one per grid frame')
         self.snapshot_rate = config['snapshot_rate']
         if not np.isfinite(config.get('variant_l2', 0)) or config.get('variant_l2', 0) < 0:
             raise ValueError('Variant regularization must be finite and nonnegative')
@@ -885,7 +784,7 @@ class NeuralPolicy:
         self.parameters['base_faction_embedding'].data[0] = 0
         b('general_embedding', (len(vocab['generals']), e))
         b('variant_embedding', (len(vocab['objects']), e))
-        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+ARMS_FEATURES+5*e, d)); b('entity_b', d)
+        w('entity_w', (ENTITY_FEATURES+EXTRA_ENTITY_FEATURES+DERIVED_ENTITY_FEATURES+5*e, d)); b('entity_b', d)
         # Row 0 is the empty upgrade slot; it is masked out of every sum.
         w('upgrade_embedding', (len(config['upgrades'])+1, e), .5)
         # v11 effect and sound-cue tokens (Encoder._effects); power 0 is none or unknown.
@@ -1339,9 +1238,8 @@ class NeuralPolicy:
             if command_target(config, target) == 'position':
                 bins = config['position_bins']
                 normalized = (np.asarray(a['position'][:2]) - encoded['low']) / encoded['span']
-                if np.any(normalized < 0) or np.any(normalized > 1):
-                    raise Unrepresentable('Position outside map')
-                x, y = np.clip((normalized * bins).astype(int), 0, bins - 1).tolist()
+                # A click off the map's edge (0.4% of orders, 23 Nov) is clamped to the edge cell, not dropped.
+                x, y = np.clip(np.floor(normalized * bins), 0, bins - 1).astype(int).tolist()
                 # Quantize once in world coordinates; then mirror the grid index.
                 if encoded['rotated']:
                     x, y = bins-1-x, bins-1-y
@@ -1449,8 +1347,7 @@ class NeuralPolicy:
     def _entity_inputs(self, encoded):
         """(units (count, d), effect tokens (k, d) or None): each unit's embedded input (plan Â§1a)."""
         p, e = self.parameters, self.config['embedding']
-        features = np.concatenate([encoded['numeric'], encoded['extra_numeric'],
-                                   derived_inputs(encoded['numeric']), arms_inputs(encoded)], axis=1)
+        features = np.concatenate([encoded['numeric'], encoded['extra_numeric'], derived_inputs(encoded['numeric'])], axis=1)
         offset = features.shape[1]
         slots = encoded['entity_upgrades']
         filled = Tensor((slots.reshape(-1) > 0).astype(float)[:, None])
@@ -1557,7 +1454,7 @@ class NeuralPolicy:
         enemy = p['base_faction_embedding'][faction]+p['general_embedding'][general]
         counts = np.bincount(np.asarray(encoded['types'])[:len(encoded['entities'])], minlength=len(self.config['types']))
         opener = encoded['opener'] if 'opener' in encoded else np.zeros(len(self.config['templates'])+1)
-        parts = [Tensor(visible_scalars(encoded['scalars'])), identity, enemy,
+        parts = [Tensor(np.asarray(encoded['scalars'], dtype=float)), identity, enemy,
                  # Set per game by the dataset or the live actor; absent means both unrated.
                  Tensor(np.asarray(encoded.get('ratings', UNRATED), dtype=float)),
                  Tensor(np.asarray(encoded.get('apm', UNKNOWN_APM), dtype=float)), Tensor(np.asarray(opener, dtype=float)),

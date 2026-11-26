@@ -1241,6 +1241,16 @@ void mapRecord()
     mapWritten = true;
 }
 
+// Progress from the current rank's skill-point threshold to the next one, in [0, 1); 0 at the top rank or the
+// game's rank cap (the cap holds the points at the cap level's threshold). Feature review, 26 Nov 2026.
+float rankProgress(const Player *player)
+{
+    const Int down = player->getSkillPointsLevelDown(), up = player->getSkillPointsLevelUp();
+    if (up == INT_MAX || up <= down) return 0.0f;
+    const float progress = static_cast<float>(player->getSkillPoints()-down)/static_cast<float>(up-down);
+    return progress < 0.0f ? 0.0f : progress < 1.0f ? progress : 0.999999f;
+}
+
 Json observation(Player *player, unsigned frame, Json result = Json())
 {
     ExportTimer timer(EXPORT_OBSERVATION);
@@ -1341,6 +1351,7 @@ Json observation(Player *player, unsigned frame, Json result = Json())
     playerState["radar"] = static_cast<bool>(player->hasRadar());
     playerState["rank"] = player->getRankLevel();
     playerState["skill_points"] = player->getSkillPoints();
+    playerState["rank_progress"] = rankProgress(player);
     playerState["science_points"] = player->getSciencePurchasePoints();
     playerState["dead"] = static_cast<bool>(player->isPlayerDead());
     auto &commands = lookups.player;

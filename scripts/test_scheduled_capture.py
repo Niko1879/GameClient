@@ -1,4 +1,4 @@
-"""Scheduled quiet capture keeps every observation the event schedule selects."""
+"""Scheduled quiet capture: no quiet observations are kept, and preparation needs none (orders only, 26 Nov)."""
 from collections import Counter
 import copy
 from pathlib import Path
@@ -10,11 +10,10 @@ import unittest
 
 import numpy as np
 
-from event_schedule import is_snapshot
 from generals_policy import NeuralPolicy
 from replay_events import encoded_events
 from replay_sequences import normalize_demonstration
-from scheduled_capture import CaptureController, GrowingFile, next_snapshot
+from scheduled_capture import CaptureController, GrowingFile
 from test_fixtures import RECORDING, fixture, raw_row
 
 CADENCE = 6
@@ -50,29 +49,16 @@ def commanded(row):
 
 
 def simulated_export(policy, rows, rate=60):
-    """The engine's capture loop (TrainingExporter quietObservationWanted): quiet rows keep their
-    observation only on request. Returns the rows and the number of questions asked."""
-    cadence = CADENCE*rate//60
-    occupied = {r['frame'] for r in rows if commanded(r)}
-    sparse, current, wanted, earliest, asked = [], False, [], 0, 0
+    """The engine's capture loop (TrainingExporter quietObservationWanted) with the controller answering none:
+    only the first row and command rows keep their observation."""
+    sparse = []
     for index, row in enumerate(rows):
         observed = index == 0 or commanded(row)
-        if commanded(row):
-            current = False
-        if not observed:
-            if current and wanted and row['frame'] > wanted[-1]:
-                current = False
-            if not current and row['frame'] >= earliest:
-                wanted = [next_snapshot(policy.config, RECORDING, 2, row['frame'], rate, cadence,
-                                        lambda f: f not in occupied)]
-                assert min(wanted) >= row['frame']
-                earliest, current, asked = wanted[0], True, asked+1
-            observed = current and row['frame'] in wanted
         kept = dict(row)
         if not observed:
             del kept['observation']
         sparse.append(kept)
-    return sparse, asked
+    return sparse
 
 
 class ScheduledCaptureTests(unittest.TestCase):
@@ -98,9 +84,8 @@ class ScheduledCaptureTests(unittest.TestCase):
         for seed in range(6):
             with self.subTest(seed=seed):
                 rows = scenario(self.obs, seed)
-                sparse, asked = simulated_export(self.policy, rows)
-                self.assertLess(asked, len(rows)//3)
-                self.assertTrue(any(e['target']['kind'] == 'wait' for e in self.events(rows)))
+                sparse = simulated_export(self.policy, rows)
+                self.assertFalse(any(e['target']['kind'] == 'wait' for e in self.events(rows)))
                 omitted = sum('observation' not in row for row in sparse)
                 self.assertGreater(omitted, len(rows)//3)
                 self.assert_same_events(self.events(rows), self.events(sparse))
@@ -110,28 +95,13 @@ class ScheduledCaptureTests(unittest.TestCase):
         for seed in range(4):
             with self.subTest(seed=seed):
                 rows = scenario(self.obs, seed, length=1200, cadence=CADENCE//2)
-                sparse, _ = simulated_export(self.policy, rows, rate=30)
+                sparse = simulated_export(self.policy, rows, rate=30)
                 omitted = sum('observation' not in row for row in sparse)
                 self.assertGreater(omitted, len(rows)//3)
                 self.assert_same_events(self.events([normalize_demonstration(r, 30) for r in rows]),
                                         self.events([normalize_demonstration(r, 30) for r in sparse]))
 
-    def test_the_next_snapshot_is_quiet_never_past_and_the_same_at_30_hz(self):
-        quiet = lambda f: f % 5 != 0
-        found = []
-        frame = 0
-        while len(found) < 20:
-            frame = next_snapshot(self.config, RECORDING, 2, frame, 60, 6, lambda f: quiet(f))
-            found.append(frame)
-            frame += 1
-        self.assertEqual(found, sorted(set(found)))
-        self.assertTrue(all(quiet(f) and is_snapshot(self.config, RECORDING, 2, f) for f in found))
-        self.assertEqual(found, [f for f in range(0, found[-1]+1, 6) if quiet(f) and is_snapshot(self.config, RECORDING, 2, f)])
-        # 30 Hz: native frames 3 apart, drawn at the canonical frame preparation uses.
-        native = next_snapshot(self.config, RECORDING, 2, 1, 30, 3, lambda f: True)
-        self.assertEqual(native*2, next_snapshot(self.config, RECORDING, 2, 2, 60, 6, lambda f: True))
-
-    def test_controller_answers_the_next_snapshot_and_nothing_once_the_episode_ended(self):
+    def test_controller_answers_no_quiet_frames_and_still_checks_requests(self):
         controller = object.__new__(CaptureController)
         controller.config, controller.replay_sha256 = self.config, RECORDING
         controller.commands, controller.cadence = {2: {12, 13}}, 6
@@ -140,19 +110,16 @@ class ScheduledCaptureTests(unittest.TestCase):
         controller.ready, controller.asking = threading.Condition(), False
         with tempfile.TemporaryDirectory() as directory:
             controller.file = GrowingFile(Path(directory)/'absent.part', threading.Event())
-            (answer,) = controller.directive(2, 6)
-            self.assertEqual(answer, next_snapshot(self.config, RECORDING, 2, 6, 60, 6, lambda f: f != 12))
+            self.assertEqual(controller.directive(2, 6), [])
             for wrong in (12, 7, 0):  # A command frame, off the grid, already written.
                 with self.assertRaises(ValueError):
                     controller.directive(2, wrong)
-            controller.ended.add(2)
-            self.assertEqual(controller.directive(2, 6), [])
 
-    def test_omitting_a_selected_quiet_row_fails_loudly(self):
+    def test_omitting_a_selected_command_row_fails_loudly(self):
         rows = scenario(self.obs, 1)
-        selected = {e['frame'] for e in self.events(rows) if e['target']['kind'] == 'wait'}
-        broken = [({k: v for k, v in row.items() if k != 'observation'}
-                   if row['frame'] in selected and not commanded(row) and i else row) for i, row in enumerate(rows)]
+        selected = sorted({e['frame'] for e in self.events(rows)})[1]
+        broken = [({k: v for k, v in row.items() if k != 'observation'} if row['frame'] == selected and i else row)
+                  for i, row in enumerate(rows)]
         with self.assertRaisesRegex(ValueError, 'omitted a selected observation'):
             self.events(broken)
 

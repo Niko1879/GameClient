@@ -7,8 +7,8 @@ The AlphaGenerals encoder and argument heads, with three of the 70M's (v11, Alph
 - skip connections from the map ResNet into the location head's FiLM blocks (each projected to SKIP
   channels: full-width skips for every row of a 15,360-row update would not fit the GPU).
 
-Selected by the config entry network='alphastar', which this module adds to event_store.MODEL_ONLY on import
-(event_store.py itself is hashed into the feature key, so editing it would orphan every shard).
+Selected by the config entry network='alphastar' (model-only: not in event_store.DATA_CONFIG, so no feature key
+includes it).
 network='memoryfree' takes only the first change (the memory-free core; AlphaGenerals' flat action layer, no skips),
 to tell how much of any difference is memory. network='paced' is memory-free with no trained no-op (orders only)
 and a pace head on the detached core, trained on the delay to the player's next order, that sets the live order
@@ -31,7 +31,6 @@ from torch.nn import functional as F
 from generals_policy import LOCATION_BLOCKS, LOGIT_CAP, MAP_POOL, MAP_RESIDUAL_BLOCKS, MAP_STAGES, SCATTER_SCALE, \
     SCATTER_VOLUME, UNDER_ATTACK_COLUMN, location_stages
 from torch_policy_v3 import TorchPolicyV3
-import event_store
 
 NETWORK = 'alphastar'
 # Memory-free, pace (from the delay label) instead of a trained no-op.
@@ -41,8 +40,6 @@ MOVEMENT = 'movement'
 NETWORKS = ('alphastar', 'memoryfree', PACED, MOVEMENT)
 # Config effects='map': effects painted on the map, units read their cell; no effect tokens.
 EFFECTS_MAP = 'map'
-# Imported (NeuralPolicy.__init__) before any policy with this network exists, so no feature key includes it.
-event_store.MODEL_ONLY.update(('network', 'effects'))
 # The 70M's core width (its 'hidden'); the heads read it as AlphaGenerals' heads read the LSTM output.
 WIDTHS = {'core': 3840}
 ACTION_BLOCKS, ACTION_WIDTH = 16, 256

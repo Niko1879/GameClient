@@ -4,6 +4,7 @@ Kept with generals_policy_old until AlphaGenerals' adoption (notes/plan.md Phase
 from __future__ import annotations
 
 from event_policy import EventActor
+from generals_policy_old import TemplateTable
 from nn_numpy import no_grad
 
 
@@ -13,6 +14,23 @@ class DelayActor(EventActor):
         # Fixed pace (configure_pace): ticks between decisions and wait masked; None uses the model's own delays and waits.
         self.pace_ticks = None
         super().__init__(*args, **kwargs)
+
+    def reset(self):
+        super().reset()
+        # The game's weapon/armour stats (generals_policy_old.TemplateTable), built from every observation.
+        self.templates = None
+
+    def act(self, observation, terrain, frame):
+        # Before any skip: a template's stats arrive once, in the observation where it first appears.
+        if self.templates is None:
+            self.templates = TemplateTable(self.rate)
+        self.templates.add(observation.get('template_stats'))
+        return super().act(observation, terrain, frame)
+
+    def _encode(self, observation, terrain, frame):
+        encoded = super()._encode(observation, terrain, frame)
+        encoded.update(self.templates.arrays())
+        return encoded
 
     def configure_pace(self, apm=None):
         """Issue one command every 60/apm game seconds, never waiting (None: the model's own waits and delays).

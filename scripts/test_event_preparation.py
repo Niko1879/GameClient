@@ -96,7 +96,8 @@ class PreparationTests(unittest.TestCase):
     def test_spawn_worker_error_stops_pool_and_cleans_partial_shards(self):
         before = {process.pid for process in multiprocessing.active_children()}
         self.games[0] = copy.deepcopy(self.games[0])
-        self.games[0]['rows'][0]['observation']['own_entities'][0].pop('task')
+        # The first order's row (quiet rows are never encoded since 26 Nov).
+        next(row for row in self.games[0]['rows'] if row['actions'])['observation']['own_entities'][0].pop('task')
         with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'Missing owned-unit task snapshot'):
             self.prepare('failure', 4)
         manifest = self.root/'failure/dataset.json'

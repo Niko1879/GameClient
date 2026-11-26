@@ -72,7 +72,7 @@ class Float32FeatureTests(unittest.TestCase):
                                                   config=config, entries=[entry]))
             dataset = EventDataset(root/'dataset.json')
             decoded = [row for ref in dataset.chunks('train') for row in dataset.read(ref)]
-            self.assertEqual([(row['frame'], row['target']['kind']) for row in decoded], [(0, 'wait'), (30, 'stop')])
+            self.assertEqual([(row['frame'], row['target']['kind']) for row in decoded], [(30, 'stop')])  # Orders only (26 Nov).
 
 
 if __name__ == '__main__':

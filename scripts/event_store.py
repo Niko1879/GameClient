@@ -14,7 +14,7 @@ import zipfile
 import numpy as np
 
 import generals_policy
-from generals_policy import ARCHITECTURE, NeuralPolicy, TemplateTable
+from generals_policy import ARCHITECTURE, NeuralPolicy
 from prepared_io import _array_bytes, _common, _digest, _json_bytes, _write_json
 from replay_events import encoded_events
 from tensor_replay_store import Column, TensorRows, decode_columns, encode_columns, project
@@ -23,8 +23,9 @@ from training_legality import build_legality
 SCHEMA = 1
 # Stored inputs, labels and legality depend on these sources and on the policy
 # configuration, never on network widths or optimizer settings.
+# event_store.py itself is not hashed whole (its model-facing parts would orphan shards): write_shard is.
 FEATURE_SOURCES = ('replay_events.py', 'event_schedule.py', 'replay_actions.py', 'replay_sequences.py',
-                   'generals_identity.py', 'tensor_replay_store.py', 'training_legality.py', 'event_store.py',
+                   'generals_identity.py', 'tensor_replay_store.py', 'training_legality.py',
                    'build_placement.py', 'unit_tasks.py')
 FEATURE_CODE = (generals_policy.entity_key, generals_policy.initial_home, generals_policy.Encoder,
                 generals_policy.selection_limit, generals_policy.command_target,
@@ -37,8 +38,20 @@ FEATURE_CONSTANTS = ('OBSERVATION_VERSION', 'KINDS', 'TARGET_KINDS', 'BUILDER_KI
                      'COMMAND_KINDS', 'GUARD_KINDS', 'QUEUE_SLOTS', 'PAIR_FIELDS', 'ENTITY_FEATURES', 'EXTRA_ENTITY_FEATURES', 'ENTITY_UPGRADE_SLOTS',
                      'ENTITY_COMMAND_SLOTS', 'SUPPLY_BOX_SCALE',
                      'SCALAR_FEATURES', 'MAP_CHANNELS')
-MODEL_ONLY = {'hidden', 'entity_hidden', 'embedding', 'attention_heads', 'map_hidden', 'scalar_hidden',
-              'variant_l2', 'argument_loss_weights', 'target_smoothing'}
+# The config entries that shape stored rows: vocabularies, the observation version, clocks, target grids and the
+# legality masks. Every other entry (widths, losses, the network, live settings such as snapshot_rate) is model-only
+# and leaves the key alone (user, 12 and 26 Nov: the key follows the data format, not the model).
+DATA_CONFIG = frozenset({'types', 'templates', 'menus', 'commands', 'command_info', 'command_menus', 'command_shortcuts',
+                         'promotions', 'upgrades', 'powers', 'sciences', 'identity_hierarchy', 'observation_policy_version',
+                         'map_side', 'max_group', 'position_bins', 'angle_bins', 'event_observation_ms',
+                         'production_scope', 'placement_mode',
+                         # A test model's shrunken 'widths' stay in the key, so it never reads real shards.
+                         'widths'})
+
+
+def model_only(keys):
+    """Whether config entries can change without changing the feature key (no data-shaping entry among them)."""
+    return not set(keys) & DATA_CONFIG
 
 
 _FEATURE_CODE = []
@@ -47,9 +60,9 @@ _FEATURE_CODE = []
 def feature_identity(policy):
     # Code is hashed as loaded; source_guard stops the service if its files change.
     if not _FEATURE_CODE:
-        _FEATURE_CODE.extend(inspect.getsource(obj) for obj in FEATURE_CODE)
+        _FEATURE_CODE.extend(inspect.getsource(obj) for obj in (*FEATURE_CODE, write_shard))
     identity = {'schema': SCHEMA,
-                'config': {k: v for k, v in policy.config.items() if k not in MODEL_ONLY},
+                'config': {k: v for k, v in policy.config.items() if k in DATA_CONFIG},
                 'feature_code': _FEATURE_CODE,
                 'constants': {name: getattr(generals_policy, name) for name in FEATURE_CONSTANTS},
                 'dependencies': {name: _digest(Path(__file__).with_name(name)) for name in FEATURE_SOURCES}}
@@ -73,8 +86,6 @@ def write_shard(destination, games, policy, source):
             for number, game in enumerate(games):
                 common, buffer, size, chunks, start = None, [], 0, [], 0
                 episode_counts = Counter()
-                # The game's weapon/armour stats, from every captured observation (episode shared data).
-                table = TemplateTable(game['source_ticks_per_second'])
 
                 def flush():
                     nonlocal buffer, size, start
@@ -97,7 +108,7 @@ def write_shard(destination, games, policy, source):
                     start += len(buffer)
                     buffer, size = [], 0
 
-                for row in encoded_events(policy, game, episode_counts, table):
+                for row in encoded_events(policy, game, episode_counts):
                     if common is None:
                         common = _common(row)
                     estimate = _array_bytes(row['encoded'])
@@ -109,7 +120,6 @@ def write_shard(destination, games, policy, source):
                 counts.update(episode_counts)
                 if common is None:
                     continue
-                common.update(table.arrays())
                 raw = encode_columns({name: Column.build([value], float_dtype=float_dtype) for name, value in common.items()
                                       if isinstance(value, np.ndarray)}, [{}], float_dtype=float_dtype)
                 member = f'shared/{number:04d}.bin'

@@ -25,7 +25,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from event_store import MODEL_ONLY
+from event_store import DATA_CONFIG, model_only
 
 
 def match_rating(entry):
@@ -58,8 +58,8 @@ def top_fraction_rating(document, fraction):
 def subset(document, *, min_rating=None, top_fraction=None, include=(), widths=None, snapshot_rate=None):
     """A new dataset document: every validation entry, the training entries that pass."""
     include = set(include)
-    if widths and not set(widths) <= MODEL_ONLY:
-        raise ValueError('Only model widths may change: '+', '.join(sorted(set(widths)-MODEL_ONLY)))
+    if widths and not model_only(widths):
+        raise ValueError('Only model settings may change, not: '+', '.join(sorted(set(widths) & DATA_CONFIG)))
     if top_fraction is not None:
         if min_rating is not None:
             raise ValueError('Give a minimum rating or a top fraction, not both')

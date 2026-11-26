@@ -10,9 +10,9 @@ import os
 
 import numpy as np
 
-from generals_policy import (ARMS_FEATURES, DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, MAP_POOL, SCATTER_SCALE, UNIT_GROUPS,
-                             UNKNOWN_APM, UNRATED, NeuralPolicy, arms_inputs, coarse_pixels, command_target, count_channels, derived_inputs,
-                             pool_grid, unit_groups, visible_scalars,
+from generals_policy import (DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, MAP_POOL, SCATTER_SCALE, UNIT_GROUPS,
+                             UNKNOWN_APM, UNRATED, NeuralPolicy, coarse_pixels, command_target, count_channels, derived_inputs,
+                             pool_grid, unit_groups,
                              visible_task_commands)
 from training_legality import cached_legality
 
@@ -101,13 +101,12 @@ def encode_values(spec, encoded):
     derived_end = numeric_size+DERIVED_ENTITY_FEATURES
     # Model-only switch, default off (user decision, 12 Nov 2026): without it every row is
     # unrated, so ratings_w adds nothing. Reports still band rows by row['rating'].
-    # GENERALS_RATING_INPUT=1 turns it on without a config key: rating_input is not in event_store.MODEL_ONLY,
-    # so the key would change the feature identity of every shard (12 Nov: with-rating arm on existing shards).
-    # A checkpoint trained this way does not record it; its run directory holds a RATING_INPUT marker instead.
+    # GENERALS_RATING_INPUT=1 turns it on without a config key, for checkpoints trained before rating_input became
+    # model-only (event_store.DATA_CONFIG, 26 Nov); their run directories hold a RATING_INPUT marker.
     rated = bool(spec.config.get('rating_input', False)) or os.environ.get('GENERALS_RATING_INPUT') == '1'
     no_opener = np.zeros(len(spec.config['templates'])+1, dtype=spec.float_dtype)
-    # Columns as generals_policy._encode_modalities: stored numeric, extra, derived, then arms_inputs.
-    numeric = np.zeros((batch, count, derived_end+ARMS_FEATURES), dtype=spec.float_dtype)
+    # Columns as generals_policy._entity_inputs: stored numeric, extra, then derived.
+    numeric = np.zeros((batch, count, derived_end), dtype=spec.float_dtype)
     types = np.zeros((batch, count), dtype=np.int64)
     pixels, owners = types.copy(), np.full_like(types, -1)
     queue_slots = encoded[0]['queue_units'].shape[1]
@@ -130,7 +129,6 @@ def encode_values(spec, encoded):
         numeric[index, :length, :width] = row['numeric']
         numeric[index, :length, width:numeric_size] = row['extra_numeric']
         numeric[index, :length, numeric_size:derived_end] = derived_inputs(row['numeric'])
-        numeric[index, :length, derived_end:] = arms_inputs(row)
         types[index, :length] = row['types']
         queue_units[index, :length], queue_upgrades[index, :length] = row['queue_units'], row['queue_upgrades']
         upgrades[index, :length] = row['entity_upgrades']
@@ -163,7 +161,7 @@ def encode_values(spec, encoded):
         'map_channels': (channels, 'int64'),
         'map_statics': (np.stack(statics), 'float'), 'map_static_index': (static_index, 'int64'),
         'map_visibility': (visibility_shares(np.stack([row['map_visibility'] for row in encoded]), side, spec.float_dtype), 'float'),
-        'scalars': (visible_scalars(np.stack([row['scalars'] for row in encoded])), 'float'),
+        'scalars': (np.stack([row['scalars'] for row in encoded]), 'float'),
         'entity_upgrades': (upgrades, 'int64'),
         'entity_commands': (commands, 'int64'), 'entity_command_states': (command_states, 'float'),
         'player_flags': (np.stack([row['player_flags'] for row in encoded]), 'float'),

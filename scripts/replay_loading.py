@@ -50,7 +50,7 @@ def load_replays(paths, *, use_metadata_cache=True):
             games.append({'path': str(Path(path).resolve()), 'player': player, 'map': terrain,
                           'rows': ReplayRows(path, player, length, rate, validated=True),
                           'source_ticks_per_second': rate,
-                          # The recording's own hash draws its no-op snapshots (event_schedule.is_snapshot).
+                          # The original recording's hash (provenance).
                           'replay_sha256': manifest['replay_sha256'] if manifest is not None else None})
         source = {'path': str(Path(path).resolve()), 'sha256': _digest(path), 'audit': summary,
                   'engine': {k: header[k] for k in ('engine_git_sha', 'engine_git_dirty',

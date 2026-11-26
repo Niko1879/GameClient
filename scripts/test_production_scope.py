@@ -93,7 +93,7 @@ class ProductionScopeTests(unittest.TestCase):
         self.assertEqual(played['template'],'Nuke_ChinaVehicleDozer')
         rows=[self.row(0,[action]),self.row(30,[action])]
         for row in rows: row['observation']=obs
-        counts=Counter(); events=list(decisions(rows,self.config,counts,lambda frame: True))
+        counts=Counter(); events=list(decisions(rows,self.config,counts))
         self.assertEqual([event['source']['frame'] for event in events],[0,30])
         self.assertEqual(counts['truncated:production_scope'],0)
 
@@ -109,7 +109,7 @@ class ProductionScopeTests(unittest.TestCase):
         for foreign in (dict(kind='train',producer=30,template='GLATankScorpion'),
                         dict(kind='build',builder=32,template='AmericaPowerPlant',position=[300,400,0])):
             rows=[self.row(0,stop),self.row(30,train),self.row(60,[foreign]),self.row(90,stop)]
-            counts=Counter(); events=list(decisions(rows,self.config,counts,lambda frame: True))
+            counts=Counter(); events=list(decisions(rows,self.config,counts))
             self.assertEqual([event['source']['frame'] for event in events],[0,30])
             self.assertEqual(counts['excluded:production_scope'],1)
             self.assertEqual(counts['truncated:production_scope'],1)
@@ -123,7 +123,7 @@ class ProductionScopeTests(unittest.TestCase):
                                     ([foreign],[dict(name='unsupported')])):
             row=self.row(10,actions); row['unsupported']=unsupported
             counts=Counter()
-            events=list(decisions([self.row(0,[stop]),row,self.row(60,[stop])],self.config,counts,lambda frame: True))
+            events=list(decisions([self.row(0,[stop]),row,self.row(60,[stop])],self.config,counts))
             self.assertEqual([event['source']['frame'] for event in events],[0])
             self.assertEqual(counts['truncated:production_scope'],1)
 

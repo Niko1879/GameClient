@@ -82,7 +82,16 @@ class TorchPolicyV3(nn.Module):
     def encode_batch(self, encoded):
         """Pad only this chunk's entity dimension; padding never enters attention/pooling."""
         from training_preparation import encode_values
+        from generals_policy_old import ARMS_FEATURES, arms_inputs, visible_scalars
         values, _ = encode_values(self, encoded)
+        # The current pipeline dropped these inputs (26 Nov): this network still reads its weapon/armour columns
+        # after the derived ones, and never sees its hidden clocks.
+        numeric = values['numeric'][0]
+        arms = np.zeros((*numeric.shape[:2], ARMS_FEATURES), dtype=numeric.dtype)
+        for index, row in enumerate(encoded):
+            arms[index, :len(row['numeric'])] = arms_inputs(row)
+        values['numeric'] = np.concatenate([numeric, arms], axis=2), 'float'
+        values['scalars'] = visible_scalars(values['scalars'][0]), 'float'
         # encode_values pools the map for the current network; this one reads the stored 128x128 grids.
         pixels, statics, seen = np.zeros_like(values['scatter_pixels'][0]), [], set()
         for index, row in enumerate(encoded):

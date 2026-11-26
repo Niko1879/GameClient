@@ -1,4 +1,6 @@
-"""No-op snapshots (notes/wait_snapshots.md): constant-rate rows, no clocks, thinning, live looks, the pilot rules."""
+"""No-op rows in existing shards (notes/wait_snapshots.md): thinning, live looks, the pilot rules.
+
+New exports hold no no-op rows (26 Nov feature review); their drawing and the hidden clocks are gone."""
 import copy
 import json
 import math
@@ -12,10 +14,8 @@ import numpy as np
 
 from event_dataset import APM_MIN_COMMANDS, EventDataset, apm_blanked, episode_apm, thinned_rows
 from event_policy import EventActor
-from event_schedule import is_snapshot, snapshot_probability
 from event_store import write_shard
-from generals_policy import (HIDDEN_SCALARS, KINDS, SCALAR_FEATURES, SINCE_COMMAND, NeuralPolicy, apm_inputs,
-                             scalar_input_slices, visible_scalars)
+from generals_policy import KINDS, SCALAR_FEATURES, NeuralPolicy, apm_inputs, scalar_input_slices
 from nn_numpy import Tensor, no_grad
 from prepared_io import _write_json
 from replay_events import decisions, encoded_events
@@ -23,98 +23,6 @@ from subset_manifest import subset
 from test_fixtures import RECORDING, fixture, raw_row
 
 STOP = [{'kind': 'stop', 'units': [10]}]
-
-
-class ScheduleTests(unittest.TestCase):
-    def setUp(self):
-        self.config, self.obs, self.terrain = fixture()
-        self.config['snapshot_rate'] = .5
-
-    def test_the_rate_is_constant_on_the_grid_and_the_draws_are_independent(self):
-        self.assertAlmostEqual(snapshot_probability(self.config), .05)
-        frames = np.array([is_snapshot(self.config, RECORDING, 2, f) for f in range(0, 6*40_000, 6)])
-        self.assertAlmostEqual(frames.mean(), .05, delta=.004)
-        for half in np.split(frames, 2):
-            self.assertAlmostEqual(half.mean(), .05, delta=.006)
-        # No clock: a snapshot says nothing about the next grid frames.
-        for lag in (1, 2, 10, 20):
-            self.assertAlmostEqual(frames[lag:][frames[:-lag]].mean(), .05, delta=.015)
-        self.assertFalse(any(is_snapshot(self.config, RECORDING, 2, f) for f in range(6000) if f % 6))
-
-    def test_recordings_and_players_draw_their_own_frames(self):
-        drawn = [{f for f in range(0, 60_000, 6) if is_snapshot(self.config, recording, player, f)}
-                 for recording, player in ((RECORDING, 2), (RECORDING, 3), ('f'*64, 2))]
-        for i in range(3):
-            for j in range(i):
-                self.assertLess(len(drawn[i] & drawn[j]), len(drawn[i])/4)
-
-    def test_rows_are_every_command_and_only_quiet_snapshot_frames(self):
-        rows = [raw_row(f, self.obs, **({'actions': STOP} if f % 90 == 0 else {'ui': True} if f % 84 == 0 else
-                                        {'unsupported': True} if f % 78 == 0 else {})) for f in range(0, 6000, 6)]
-        rows[-1]['terminal_sample'] = True
-        chosen = {e['source']['frame']: bool(e['actions']) for e in
-                  decisions(rows, self.config, Counter(), lambda f: is_snapshot(self.config, RECORDING, 2, f))}
-        quiet = {r['frame'] for r in rows[:-1] if not r['actions'] and not r['unsupported'] and r['imitation_loss_mask']}
-        self.assertEqual({f for f, command in chosen.items() if command}, {f for f in range(0, 6000, 90)})
-        self.assertEqual({f for f, command in chosen.items() if not command},
-                         {f for f in quiet if is_snapshot(self.config, RECORDING, 2, f)})
-
-    def test_the_players_actions_never_move_a_snapshot(self):
-        def frames(step):
-            rows = [raw_row(f, self.obs, STOP if f % step == 0 else ()) for f in range(0, 12_000, 6)]
-            return {e['source']['frame'] for e in decisions(rows, self.config, Counter(),
-                    lambda f: is_snapshot(self.config, RECORDING, 2, f)) if not e['actions']}
-        few, many = frames(600), frames(30)
-        self.assertEqual({f for f in few if f % 30}, {f for f in many if f % 30})
-
-    def test_a_recording_without_its_hash_is_refused(self):
-        game = {'rows': [raw_row(0, self.obs)], 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2,
-                'replay_sha256': None}
-        with self.assertRaisesRegex(ValueError, 'SHA-256'):
-            list(encoded_events(NeuralPolicy(self.config, parameters=False), game, Counter()))
-
-    def test_no_op_rows_and_commands_on_any_tick_of_the_grid_look_alike(self):
-        policy = NeuralPolicy(self.config, parameters=False)
-        obs = copy.deepcopy(self.obs)
-        obs['known_nonowned_entities'][1]['last_seen_frame'] = 300
-        encode = lambda frame, seen=300: policy.encoder.encode(
-            {**obs, 'known_nonowned_entities': [{**e, 'last_seen_frame': seen} if not e['visible'] else e
-                                                for e in obs['known_nonowned_entities']]}, self.terrain, frame)
-        visible = [i for i in range(len(encode(600)['scalars'])) if i not in HIDDEN_SCALARS]
-        for tick in range(1, 6):
-            # Sightings are refreshed on the grid: their age would otherwise give the tick away.
-            np.testing.assert_array_equal(encode(600)['scalars'][visible], encode(600+tick)['scalars'][visible])
-            np.testing.assert_array_equal(encode(600)['numeric'], encode(600+tick)['numeric'])
-        self.assertTrue((encode(606)['scalars'][visible] != encode(600)['scalars'][visible]).any())
-        self.assertTrue((encode(606)['numeric'] != encode(600)['numeric']).any())
-
-
-    def test_the_time_since_a_command_never_reaches_the_model(self):
-        # Live, the model's own orders reset it and it acted on them as a human burst (23 Nov live pace check).
-        self.assertIn(SINCE_COMMAND, HIDDEN_SCALARS)
-        scalars = np.zeros((3, SCALAR_FEATURES), dtype='float32')
-        scalars[:, SINCE_COMMAND] = np.log1p([0., .2, 30.])/5
-        self.assertFalse(visible_scalars(scalars)[:, SINCE_COMMAND].any())
-        policy = NeuralPolicy(self.config, 5)
-        encoded = policy.encoder.encode(self.obs, self.terrain, 600)
-        def logp(seconds):
-            scalars = encoded['scalars'].copy()
-            scalars[SINCE_COMMAND] = math.log1p(seconds)/5
-            with no_grad():
-                return float(policy.decide({**encoded, 'scalars': scalars}, teacher={'kind': 'wait'})[4].data)
-        self.assertEqual(logp(.2), logp(30.))
-
-    def test_no_op_rows_are_spread_over_the_time_since_a_command_as_time_itself(self):
-        # The leak condition: the shown clock tells an order's likelihood, never which quiet moments were kept.
-        rng = np.random.default_rng(4)
-        commands = np.cumsum(rng.choice((3, 7, 11, 40, 150), 6000))
-        grid = np.arange((commands[0]//6+1)*6, commands[-1], 6)
-        grid = grid[~np.isin(grid, commands)]
-        cell = np.minimum((grid-commands[np.searchsorted(commands, grid)-1])//6, 20)
-        kept = np.array([is_snapshot(self.config, RECORDING, 2, int(f)) for f in grid])
-        for c in range(21):
-            expected = (cell == c).sum()*.05
-            self.assertLess(abs(kept[cell == c].sum()-expected), 4*math.sqrt(expected), c)
 
 
 class DatasetTests(unittest.TestCase):
@@ -136,29 +44,6 @@ class DatasetTests(unittest.TestCase):
 
     def rows(self, count=400):
         return [raw_row(6*i, self.obs, STOP if i % 3 == 1 else ()) for i in range(count)]
-
-    def test_thinning_keeps_every_command_and_a_nested_share_of_no_ops(self):
-        full = self.dataset(self.rows())
-        stored = full.episode_rows('train', 0, 0, 10_000)
-        everything = [(r['frame'], r['target']['kind']) for r in stored]
-        previous = set(everything)
-        for share in (.5, .25):
-            data = self.dataset(self.rows(), snapshot_rate=10*share)
-            (chunks, count), = data.episodes('train')
-            rows = data.episode_rows('train', 0, 0, count)
-            kept = [(r['frame'], r['target']['kind']) for r in rows]
-            self.assertEqual(len(kept), count)
-            self.assertEqual([f for f, kind in kept if kind != 'wait'], [f for f, kind in everything if kind != 'wait'])
-            self.assertLess(set(kept), previous)
-            noops = sum(kind == 'wait' for _, kind in kept)/sum(kind == 'wait' for _, kind in everything)
-            self.assertAlmostEqual(noops, share, delta=.1)
-            previous = set(kept)
-            # Pieces of an episode, as lanes read them, are the same rows.
-            pieces = [r['frame'] for start in range(0, count, 37) for r in data.episode_rows('train', 0, start, min(count, start+37))]
-            self.assertEqual(pieces, [f for f, _ in kept])
-            seen = [int(r) for episode, row, _ in data.lane_schedule('train', seed=1, epoch=0, lanes=1, steps=16, shuffle=False)
-                    for r in row[episode >= 0]]
-            self.assertEqual(seen, list(range(count)))
 
     def test_thinning_is_independent_of_what_the_rows_hold(self):
         descriptor = lambda bits: {'rows': 64, 'start': 128, 'noops': np.packbits(bits).tobytes().hex()}
@@ -357,9 +242,8 @@ class LiveTests(unittest.TestCase):
             ticks = round(look_ms*.06)
             self.run_looks(actor, decide, range(0, ticks*8000, ticks))
             self.assertEqual(len(looks), 8000)
-            # 0.5 commits per second of game time, whatever the look interval; none moves previous_frame otherwise.
+            # 0.5 commits per second of game time, whatever the look interval.
             self.assertAlmostEqual(actor.counters['memory_commits']/(8000*look_ms/1000), .5, delta=.05)
-            self.assertLess(actor.previous_frame, ticks*8000)
 
     def test_the_pace_does_not_depend_on_the_look_interval(self):
         # One action rate h a second, as training would show it: P(act)/P(no-op) = h/r. Through the real decide().

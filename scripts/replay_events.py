@@ -1,15 +1,15 @@
-"""Causal command and no-op row selection before neural feature computation.
+"""Causal command row selection before neural feature computation.
 
-Dense exports remain authoritative. A row is a command the policy can represent, or a
-no-op snapshot: a quiet frame drawn at a constant random rate (event_schedule.is_snapshot).
-UI messages update ReplayActionAdapter but are never rows. Out-of-scope production ends
-only that player's training episode.
+Dense exports remain authoritative. A row is a command the policy can represent; several
+commands on one tick (lag bunching) become one row each, in source order, sharing that
+tick's observation. There are no no-op rows: pace trains on the time to the next order
+(event_dataset.delay_targets). UI messages update ReplayActionAdapter but are never rows.
+Out-of-scope production ends only that player's training episode.
 """
 from __future__ import annotations
 
 from itertools import chain
 
-from event_schedule import is_snapshot
 from generals_policy import KINDS, Unrepresentable, initial_home
 from generals_identity import in_production_scope, production_twin
 
@@ -28,15 +28,17 @@ def outside_production_scope(config, row, action):
     return entity is not None and not in_production_scope(config, production_twin(config, entity['type']))
 
 
-def decisions(rows, config, counts, snapshot, validate=None):
-    """Selected candidates in source order.
-
-    `snapshot(frame)` says whether a quiet frame is a no-op row; it must not depend on the rows."""
-    last_decision = None
+def decisions(rows, config, counts, validate=None):
+    """Selected candidates in source order: one per representable command."""
     previous_source_frame = None
 
     def candidate(row, actions):
-        return {'source': row, 'actions': actions, 'previous_frame': last_decision}
+        return {'source': row, 'actions': actions}
+
+    def exclude(reason, actions):
+        counts['excluded:'+reason] += 1
+        for action in actions:
+            counts['excluded:'+reason+':'+action['kind']] += 1
 
     def checked(event):
         return validate(event) if validate is not None else True
@@ -73,28 +75,19 @@ def decisions(rows, config, counts, snapshot, validate=None):
             counts['production_scope_cutoff_frame'] = frame
             return
         if gameplay:
-            reason = None
             if row['unsupported'] or not eligible:
-                reason = 'unsupported'
-            elif len(actions) != 1 or actions[0]['kind'] not in KINDS[1:]:
-                reason = 'multi_or_unavailable'
+                exclude('unsupported', actions)
             else:
-                proposed = candidate(row, actions)
-                if checked(proposed):
-                    last_decision = frame
-                    yield proposed
-                else:
-                    reason = 'structural'
-            if reason:
-                counts['excluded:'+reason] += 1
+                counts['split_ticks'] += len(actions) > 1
                 for action in actions:
-                    counts['excluded:'+reason+':'+action['kind']] += 1
-        elif not ui_only and not terminal and snapshot(frame):
-            proposed = candidate(row, [])
-            if not checked(proposed):
-                raise ValueError('A no-op must remain representable')
-            last_decision = frame
-            yield proposed
+                    if action['kind'] not in KINDS[1:]:
+                        exclude('unavailable', [action])
+                        continue
+                    proposed = candidate(row, [action])
+                    if checked(proposed):
+                        yield proposed
+                    else:
+                        exclude('structural', [action])
         if terminal:
             return
 
@@ -116,8 +109,7 @@ class EventValidator:
         if self.home is None:
             self.home = initial_home(observation)
         game, policy = self.game, self.policy
-        encoded = policy.encoder.encode(observation, game['map'], source['frame'],
-            previous_frame=event['previous_frame'], home_position=self.home,
+        encoded = policy.encoder.encode(observation, game['map'], source['frame'], home_position=self.home,
             source_ticks_per_second=game['source_ticks_per_second'])
         encoded['event_rate'] = game['source_ticks_per_second']
         try:
@@ -132,30 +124,14 @@ class EventValidator:
         return True
 
 
-def _template_tap(rows, table):
-    """Every captured observation's new template stats into the game's TemplateTable, selected or not."""
-    for row in rows:
-        observation = row.get('observation')
-        if table is not None and observation is not None and 'template_stats' in observation:
-            table.add(observation['template_stats'])
-        yield row
-
-
-def encoded_events(policy, game, counts, table=None):
-    """Encode selected candidates before committing their causal actor history.
-
-    `table` (generals_policy.TemplateTable), when given, collects the game's weapon/armour stats."""
-    iterator = _template_tap(iter(game['rows']), table)
+def encoded_events(policy, game, counts):
+    """Encode selected candidates before committing their causal actor history."""
+    iterator = iter(game['rows'])
     first = next(iterator, None)
     if first is None:
         return
-    # The scheduled-capture controller named the same frames from the same three inputs.
-    recording = game['replay_sha256']
-    if not isinstance(recording, str) or len(recording) != 64:
-        raise ValueError('No-op snapshots need the original recording SHA-256')
-    snapshot = lambda frame: is_snapshot(policy.config, recording, game['player'], frame)
     validate = EventValidator(policy, game, counts, first['observation'])
-    for event in decisions(chain([first], iterator), policy.config, counts, snapshot, validate=validate):
+    for event in decisions(chain([first], iterator), policy.config, counts, validate=validate):
         row = event['prepared']
         target = row['target']
         counts['decisions'] += 1

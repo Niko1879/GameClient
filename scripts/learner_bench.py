@@ -158,15 +158,15 @@ def bundle(args):
 
 
 def model_widths(config, widths=None):
-    """Model-only config overrides (event_store.MODEL_ONLY): a cloud_bundle preset name or JSON
+    """Model-only config overrides (event_store.model_only): a cloud_bundle preset name or JSON
     object. Shards and the feature key are unchanged. AlphaGenerals' network widths
     (generals_policy.WIDTHS) are fixed: changing them would change the feature key."""
-    from event_store import MODEL_ONLY
+    from event_store import model_only
     if widths is None:
         return {}
     from cloud_bundle import WIDTHS
     chosen = WIDTHS[widths] if widths in WIDTHS else json.loads(widths)
-    if not isinstance(chosen, dict) or not set(chosen) <= MODEL_ONLY:
+    if not isinstance(chosen, dict) or not model_only(chosen):
         raise ValueError('Widths must be model-only settings')
     return chosen
 

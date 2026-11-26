@@ -123,7 +123,7 @@ exec .venv/bin/python -B code/train_events.py train --dataset "$DATASET" --outpu
   --max-gpu-mib $(( GPU_MIB * 9 / 10 )) --stop-file run/stop "$@"
 """
 
-# Model-only config overrides (event_store.MODEL_ONLY): the feature key and shards are unchanged.
+# Model-only config overrides (event_store.model_only): the feature key and shards are unchanged.
 # 'default' is AlphaGenerals' fixed widths (generals_policy.WIDTHS, 47.3M parameters; notes/plan.md §6),
 # which cannot change without changing the feature key. Others are JSON, e.g. '{"map_hidden": 64}'.
 WIDTHS = {'default': {}}
@@ -159,10 +159,10 @@ def main():
     args = parser.parse_args()
     from engine_runtime import disable_power_throttling
     disable_power_throttling()
-    from event_store import MODEL_ONLY
+    from event_store import DATA_CONFIG, model_only
     widths = WIDTHS[args.widths] if args.widths in WIDTHS else json.loads(args.widths)
-    if not isinstance(widths, dict) or not set(widths) <= MODEL_ONLY:
-        raise ValueError('Widths must be model-only settings: '+', '.join(sorted(MODEL_ONLY)))
+    if not isinstance(widths, dict) or not model_only(widths):
+        raise ValueError('Widths must be model-only settings, none of: '+', '.join(sorted(DATA_CONFIG)))
     import run_prepared_training as experiment
     from event_dataset import EventDataset
     output = Path(args.output).resolve()

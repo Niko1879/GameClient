@@ -1,17 +1,11 @@
-"""Scheduled quiet capture: export only the quiet observations preparation can use.
+"""Scheduled quiet capture: export no quiet observations.
 
 With `-trainingQuietCapture scheduled` the engine writes every sample's metadata,
 but a quiet cadence sample carries its observation only when this controller
 names its frame; command samples and each player's first sample always carry
-one. Preparation keeps the quiet frames event_schedule.is_snapshot draws from the
-recording, the player and the frame, so the answer to "which quiet frames will need
-one?" is the player's next snapshot frame, known in advance:
-
-  episode running  -> the next snapshot frame at or after this one that is quiet
-  episode finished -> none (never asked again)
-
-An answer stays valid until its frame has passed; the engine also asks again after a
-command row, but never before the latest answer's frame. Quiet frames come from the
+one. Preparation makes rows only from commands (there are no no-op rows since the
+26 Nov feature review), so the answer to "which quiet frames will need one?" is
+always none. The controller still checks every row against the replay. Quiet frames come from the
 original replay's command stream (audit_replay_commands.binary_commands, which every
 export is reconciled against); each arriving row is checked against it. The controller
 follows the export file as it is written (the engine flushes earlier rows before it
@@ -31,7 +25,6 @@ import time
 from audit_replay_commands import binary_commands, message_names
 from binary_replay import stream_records
 from engine_runtime import disable_power_throttling
-from event_schedule import is_snapshot
 from replay_actions import ReplayActionAdapter
 from replay_events import outside_production_scope
 
@@ -46,17 +39,6 @@ def command_frames(replay):
         if kind in names and names[kind] not in IGNORED:
             frames.setdefault(player, set()).add(frame)
     return frames
-
-
-def next_snapshot(config, replay_sha256, player, frame, rate, cadence, quiet):
-    """The first quiet snapshot frame at or after `frame`, in the engine's own frames.
-
-    Snapshots are drawn in canonical 60 Hz frames, as preparation sees them."""
-    scale = 60//rate
-    frame = -(-frame//cadence)*cadence
-    while not (quiet(frame) and is_snapshot(config, replay_sha256, player, frame*scale)):
-        frame += cadence
-    return frame
 
 
 class GrowingFile:
@@ -196,7 +178,7 @@ class CaptureController:
         return frame % self.cadence == 0 and frame not in self.commands.get(player, ())
 
     def directive(self, player, frame, timeout=600):
-        """Quiet frames from `frame` on whose observations decisions() will select (one, or none once the episode ended)."""
+        """Quiet frames from `frame` on whose observations decisions() will select: none (no no-op rows)."""
         # The engine flushed every earlier row before asking: consume them all.
         size = self.file.path.stat().st_size if self.file.path.exists() else 0
         deadline = time.monotonic()+timeout
@@ -215,10 +197,7 @@ class CaptureController:
             raise RuntimeError('Scheduled capture reader failed') from self.error
         if not self.quiet(player, frame) or self.last_frame.get(player, frame) >= frame:
             raise ValueError(f'Unexpected capture request for player {player} at frame {frame}')
-        if player in self.ended:
-            return []
-        return [next_snapshot(self.config, self.replay_sha256, player, frame, self.header['ticks_per_second'],
-                              self.cadence, lambda f: self.quiet(player, f))]
+        return []
 
     def close(self):
         self.finished.set()

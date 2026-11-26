@@ -1,4 +1,4 @@
-"""The model's enemy side input and its hidden decision clocks, in NumPy and PyTorch."""
+"""The model's enemy side input, rank progress and the hidden receipt age, in NumPy and PyTorch."""
 import copy
 import os
 import unittest
@@ -9,7 +9,7 @@ from enemy_side import NATIVE, _natives, enemy_of
 from event_policy import EventActor
 from event_store import feature_identity
 from generals_identity import PLAYER_FACTIONS
-from generals_policy import HIDDEN_SCALARS, NeuralPolicy, scalar_input_slices, visible_scalars
+from generals_policy import SCALAR_FEATURES, NeuralPolicy, scalar_input_slices
 from harvest_china_replays import TEMPLATES
 from nn_numpy import no_grad
 from test_fixtures import fixture
@@ -21,31 +21,31 @@ class EnemyAndClockTests(unittest.TestCase):
     def setUp(self):
         self.config, self.obs, self.terrain = fixture()
         self.policy = NeuralPolicy(self.config, 5)
-        self.encoded = self.policy.encoder.encode(self.obs, self.terrain, 300, previous_frame=240)
+        self.encoded = self.policy.encoder.encode(self.obs, self.terrain, 300)
         self.target = self.policy.target(self.encoded, [{'kind': 'stop', 'units': [10]}])
 
     def logp(self, encoded):
         with no_grad():
             return float(self.policy.decide(encoded, None, teacher=self.target)[4].data)
 
-    def test_clocks_stay_stored_but_never_reach_the_model(self):
-        self.assertGreater(self.encoded['scalars'][9], 0)
-        for index in HIDDEN_SCALARS:
-            scalars = self.encoded['scalars'].copy()
-            scalars[index] += 3
-            self.assertEqual(self.logp({**self.encoded, 'scalars': scalars}), self.logp(self.encoded))
+    def test_rank_progress_is_stored_clipped_and_read(self):
+        self.assertEqual(len(self.encoded['scalars']), SCALAR_FEATURES)
+        self.assertAlmostEqual(self.encoded['scalars'][5], .25)
+        for given, stored in ((-1, 0.), (.999, .999), (7, 1.)):
+            obs = copy.deepcopy(self.obs)
+            obs['player']['rank_progress'] = given
+            self.assertAlmostEqual(self.policy.encoder.encode(obs, self.terrain, 300)['scalars'][5], stored)
         scalars = self.encoded['scalars'].copy()
-        scalars[0] += 3
+        scalars[5] = .9
         self.assertNotEqual(self.logp({**self.encoded, 'scalars': scalars}), self.logp(self.encoded))
+
+    def test_the_receipt_age_never_reaches_the_model(self):
         from unit_tasks import COMMANDS
         COMMAND_AGE = 1+len(COMMANDS)
         commands = self.encoded['task_commands'].copy()
         self.assertGreater(commands[0, COMMAND_AGE], 0, 'The fixture receipt has an age')
         commands[:, COMMAND_AGE] += 3
         self.assertEqual(self.logp({**self.encoded, 'task_commands': commands}), self.logp(self.encoded))
-        batch = visible_scalars(np.stack([self.encoded['scalars']]*2))
-        self.assertFalse(batch[:, HIDDEN_SCALARS].any())
-        self.assertTrue(self.encoded['scalars'][9], 'The stored row must stay unchanged')
 
     def test_enemy_side_changes_decisions_and_defaults_to_unknown(self):
         identity = self.policy.encoder.identity
@@ -69,7 +69,6 @@ class EnemyAndClockTests(unittest.TestCase):
         rows = scalar_input_slices(self.policy.config)
         gradient = learner.model.weights['scalar_in_w'].grad.abs().sum(dim=1).cpu().numpy()
         self.assertGreater(gradient[rows['enemy_identity']].sum(), 0)
-        self.assertFalse(gradient[rows['scalars']][list(HIDDEN_SCALARS)].any())
         self.assertGreater(gradient[rows['scalars']][0], 0)
 
     def test_actor_passes_the_lobby_side(self):

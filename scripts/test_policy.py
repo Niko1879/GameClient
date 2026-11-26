@@ -275,23 +275,9 @@ class AgreementTests(unittest.TestCase):
             {'remaining_quantity': 2, 'progress': 0, 'unit_type': 'ChinaVehicleDozer'}]
         if placement_mode == 'full_mask':
             obs['build_placements'] = [grid(np.ones((16, 16), bool), angle=angle, frame=6) for angle in range(16)]
-        # Armed units, armour and an upgraded unit's bonuses (re-export fix 4) reach both implementations.
-        from generals_policy import DAMAGE_TYPES, TemplateTable
-        obs['own_entities'][0].update(weapons=[0, 1, -1], armor=0, weapon_bonus=[1.25, 1.33, 1.5])
-        obs['own_entities'][1].update(weapons=[-1, -1, -1], armor=1, weapon_bonus=[1, 1, 1])
-        obs['known_nonowned_entities'][0].update(weapons=[1, -1, -1], armor=1)
-        table = TemplateTable(60)
-        table.add({'weapons': [
-            {'id': 0, 'range': 150.0, 'min_range': 0.0, 'damage': 40.0, 'radius': 5.0, 'min_delay_frames': 30,
-             'max_delay_frames': 50, 'clip_size': 3, 'clip_reload_frames': 120, 'anti_mask': 5, 'damage_type': 2},
-            {'id': 1, 'range': 300.0, 'min_range': 50.0, 'damage': 100.0, 'radius': 30.0, 'min_delay_frames': 90,
-             'max_delay_frames': 90, 'clip_size': 0, 'clip_reload_frames': 0, 'anti_mask': 2, 'damage_type': 7}],
-            'armors': [{'id': 0, 'damage_multipliers': list(np.linspace(0, 2, DAMAGE_TYPES))},
-                       {'id': 1, 'damage_multipliers': [.25]*DAMAGE_TYPES}]})
         rows = examples(policy, obs, terrain)
         for i, row in enumerate(rows):
             row['encoded']['ratings'] = rating_inputs(1500+100*i, None if i % 2 else 900)
-            row['encoded'].update(table.arrays())
         model = TorchPolicyV3(policy, dtype=torch.float64)
         encoded = [row['encoded'] for row in rows]
         # The rating input is off by default: the learner then feeds every row as unrated.

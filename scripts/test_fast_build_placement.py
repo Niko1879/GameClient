@@ -49,7 +49,7 @@ class FastPlacementTests(unittest.TestCase):
         rejected=raw_row(30,obs,ui=True)
         rejected['rejected_build_requests']=1
         counts=Counter()
-        events=list(decisions([raw_row(0,obs,stop),rejected,raw_row(60,obs,stop)],config,counts,lambda frame: True))
+        events=list(decisions([raw_row(0,obs,stop),rejected,raw_row(60,obs,stop)],config,counts))
         self.assertEqual([e['source']['frame'] for e in events],[0,60])
         self.assertEqual(counts['rejected_build_requests'],1)
 

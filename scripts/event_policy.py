@@ -10,7 +10,7 @@ import numpy as np
 
 from event_schedule import canonical_frame, native_deadline
 from generals_identity import vanilla_china_production
-from generals_policy import (ARCHITECTURE, OBSERVATION_VERSION, PLAY_APM, PLAY_RATING, UNRATED, TemplateTable, apm_inputs, initial_home,
+from generals_policy import (ARCHITECTURE, OBSERVATION_VERSION, PLAY_APM, PLAY_RATING, UNRATED, apm_inputs, initial_home,
                              opener_inputs, rating_inputs)
 from nn_numpy import no_grad
 from replay_sequences import normalize_demonstration
@@ -168,8 +168,8 @@ class EventActor:
         self.reset()
 
     def reset(self):
-        # The last committed row's frame, the last look's frame and the next look's.
-        self.previous_frame = self.last_look = None
+        # The last look's frame and the next look's.
+        self.last_look = None
         self.next_decision_frame = 0
         self.home_position = None
         self.rate = 60
@@ -178,8 +178,6 @@ class EventActor:
         self.last = {}
         # The policy's core LSTM state at this player's last committed row (None: game start).
         self.memory = None
-        # The game's weapon/armour stats (generals_policy.TemplateTable), built from every observation.
-        self.templates = None
 
     def configure_clock(self, rate):
         canonical_frame(0, rate)
@@ -219,10 +217,6 @@ class EventActor:
         return native_deadline(self.next_decision_frame, self.rate)
 
     def act(self, observation, terrain, frame):
-        # Before any skip: a template's stats arrive once, in the observation where it first appears.
-        if self.templates is None:
-            self.templates = TemplateTable(self.rate)
-        self.templates.add(observation.get('template_stats'))
         frame = canonical_frame(frame, self.rate)
         # Science purchases are scripted and checked on every observation, not on the model's schedule.
         bought = self.science(observation)
@@ -243,7 +237,7 @@ class EventActor:
         self.last_look = frame
         self.next_decision_frame = frame + (max(self.look_ticks, MIN_ORDER_TICKS) if actions else self.look_ticks)
         if actions or self.rng.random() < expected:
-            self.memory, self.previous_frame = memory, frame
+            self.memory = memory
             self.counters['memory_commits'] += 1
         self._decided(encoded, trace, frame, actions, value, logp, entropy)
         if self.decision_log is not None:
@@ -255,8 +249,8 @@ class EventActor:
             'observation': observation}, self.rate)['observation']
         if self.home_position is None:
             self.home_position = initial_home(observation)
-        encoded = self.policy.encoder.encode(observation, terrain, frame, previous_frame=self.previous_frame,
-            home_position=self.home_position, source_ticks_per_second=self.rate)
+        encoded = self.policy.encoder.encode(observation, terrain, frame, home_position=self.home_position,
+            source_ticks_per_second=self.rate)
         encoded['event_rate'] = self.rate
         encoded['enemy_identity'] = self.enemy_identity
         # Only a model trained with the rating input is conditioned: config rating_input (default off), or a
@@ -266,7 +260,6 @@ class EventActor:
         encoded['ratings'] = self.ratings if rated else UNRATED
         encoded['apm'] = self.apm
         encoded['opener'] = opener_inputs(self.policy.config, self.opener, frame/60)
-        encoded.update(self.templates.arrays())
         if self.policy.config['placement_mode'] == 'full_mask':
             if not hasattr(self, 'placement_query'):
                 raise ValueError('Placement-aware event actor needs a placement-capable environment')

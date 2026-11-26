@@ -52,22 +52,46 @@ class EventTests(unittest.TestCase):
                 raw_row(30, self.obs, [{'kind': 'move', 'units': [10], 'position': [200, 300, 0]}]),
                 raw_row(36, self.obs, ui=True), raw_row(60, self.obs, [{'kind': 'stop', 'units': [10]}])]
         counts = Counter()
-        chosen = list(decisions(rows, self.config, counts, lambda frame: True))
-        self.assertEqual([r['source']['frame'] for r in chosen], [0, 30, 60])
-        self.assertEqual(chosen[2]['previous_frame'], 30)
+        chosen = list(decisions(rows, self.config, counts))
+        # No no-op rows (26 Nov): only the two commands.
+        self.assertEqual([r['source']['frame'] for r in chosen], [30, 60])
         self.assertEqual(counts['ui_only_messages'], 2)
+
+    def test_orders_on_one_tick_become_one_row_each_in_source_order(self):
+        move = {'kind': 'move', 'units': [10], 'position': [200, 300, 0]}
+        stop = {'kind': 'stop', 'units': [10]}
+        rows = [raw_row(30, self.obs, [move, stop]), raw_row(60, self.obs, [stop])]
+        counts = Counter()
+        chosen = list(decisions(rows, self.config, counts))
+        self.assertEqual([(r['source']['frame'], r['actions'][0]['kind']) for r in chosen], [(30, 'move'), (30, 'stop'), (60, 'stop')])
+        self.assertEqual(counts['split_ticks'], 1)
+        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
+        encoded = list(encoded_events(self.policy, game, Counter()))
+        self.assertEqual([r['target']['kind'] for r in encoded], ['move', 'stop', 'stop'])
+        np.testing.assert_array_equal(encoded[0]['encoded']['numeric'], encoded[1]['encoded']['numeric'])
+
+    def test_a_click_off_the_map_is_clamped_to_the_edge(self):
+        encoded = self.policy.encoder.encode(self.obs, self.terrain, 30)
+        bins = self.config['position_bins']
+        far = encoded['low'] + encoded['span']*np.array([1.5, -.2])
+        target = self.policy.target(encoded, [{'kind': 'move', 'units': [10], 'position': [*far, 0]}])
+        x, y = target['x'], target['y']
+        if encoded['rotated']:
+            x, y = bins-1-x, bins-1-y
+        self.assertEqual((x, y), (bins-1, 0))
 
     def test_unsupported_events_are_neither_commands_nor_no_ops(self):
         stop = [{'kind': 'stop', 'units': [10]}]
         rows = [raw_row(0, self.obs, stop), raw_row(42, self.obs, unsupported=True), raw_row(84, self.obs, stop)]
         counts = Counter()
-        chosen = list(decisions(rows, self.config, counts, lambda frame: True))
+        chosen = list(decisions(rows, self.config, counts))
         self.assertEqual([r['source']['frame'] for r in chosen], [0, 84])
         self.assertEqual(counts['excluded:unsupported'], 1)
 
     def test_future_command_time_changes_neither_inputs_nor_target(self):
         def convert(frame):
-            rows = [raw_row(0, self.obs), raw_row(frame, self.obs, [{'kind': 'stop', 'units': [10]}])]
+            # The first order's row must not depend on when the next order comes.
+            rows = [raw_row(0, self.obs, [{'kind': 'stop', 'units': [10]}]), raw_row(frame, self.obs, [{'kind': 'stop', 'units': [10]}])]
             game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
             return list(encoded_events(self.policy, game, Counter()))
         a, b = convert(30), convert(70)
@@ -84,7 +108,7 @@ class EventTests(unittest.TestCase):
         chosen = list(encoded_events(self.policy, game, counts))
         self.assertEqual([row['frame'] for row in chosen], [0, 40])
         self.assertEqual(counts['structural_exclusions'], 1)
-        expected = self.policy.encoder.encode(self.obs, self.terrain, 40, previous_frame=0)
+        expected = self.policy.encoder.encode(self.obs, self.terrain, 40)
         np.testing.assert_array_equal(chosen[1]['encoded']['scalars'], expected['scalars'])
 
     def test_clock_rounding_multi_actor_deadlines_and_no_early_inference(self):
@@ -112,10 +136,10 @@ class EventTests(unittest.TestCase):
         counts = Counter()
         game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
         chosen = list(encoded_events(self.policy, game, counts))
-        self.assertEqual([r['frame'] for r in chosen], [0, 1, 2, 3, 6])
+        self.assertEqual([r['frame'] for r in chosen], [1, 2, 3])
         self.assertEqual(counts['commands'], 3)
-        expected = self.policy.encoder.encode(self.obs, self.terrain, 3, previous_frame=2)
-        np.testing.assert_array_equal(chosen[-2]['encoded']['scalars'], expected['scalars'])
+        expected = self.policy.encoder.encode(self.obs, self.terrain, 3)
+        np.testing.assert_array_equal(chosen[-1]['encoded']['scalars'], expected['scalars'])
 
     def test_actor_conditions_on_a_rated_opponent_by_default(self):
         from generals_policy import PLAY_RATING, rating_inputs
@@ -246,43 +270,6 @@ class EventTests(unittest.TestCase):
             _write_json(root/'dataset.json', document)
             self.assertEqual(list(EventDataset(root/'dataset.json').chunks('train')), [])
 
-    def test_weapon_and_armour_stats_reach_every_row_from_any_observation(self):
-        """Stats arrive once (re-export fix 4), here in an observation no training row uses;
-        the episode table must still carry them to every stored row."""
-        from generals_policy import DAMAGE_TYPES, arms_inputs
-        armed = copy.deepcopy(self.obs)
-        armed['own_entities'][0].update(weapons=[0, -1, -1], armor=0, weapon_bonus=[1.25, 1.33, 1.5])
-        weapon = {'id': 0, 'name': 'TestGun', 'range': 150.0, 'min_range': 0.0, 'damage': 40.0, 'radius': 5.0,
-                  'min_delay_frames': 30, 'max_delay_frames': 50, 'clip_size': 3, 'clip_reload_frames': 120,
-                  'anti_mask': 5, 'damage_type': 2}
-        delivered = copy.deepcopy(armed)
-        delivered['template_stats'] = {'weapons': [weapon], 'armors': [{'id': 0, 'damage_multipliers': [.5]*DAMAGE_TYPES}]}
-        rows = [raw_row(0, armed), raw_row(15, delivered)]
-        rows += [raw_row(f, armed, [{'kind': 'stop', 'units': [10]}]) for f in range(30, 331, 30)]
-        game = {'rows': rows, 'map': self.terrain, 'source_ticks_per_second': 60, 'player': 2, 'replay_sha256': RECORDING}
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            result = write_shard(root/'shards/a.zip', [game], self.policy, {'match_key': 'test:1', 'path': 'absent'})
-            _write_json(root/'dataset.json', {'kind': 'generals_event_dataset', 'schema': 1, 'config': self.config,
-                'entries': [{**result, 'path': 'shards/a.zip', 'match_key': 'test:1', 'split': 'train'}]})
-            dataset = EventDataset(root/'dataset.json')
-            stored = [row for reference in dataset.chunks('train') for row in dataset.read(reference)]
-        frames = [row['frame'] for row in stored]
-        self.assertNotIn(15, frames)  # the delivering observation is not a training row
-        self.assertGreater(len(stored), 5)
-        for row in stored:
-            encoded = row['encoded']
-            np.testing.assert_allclose(encoded['weapon_stats'][0], [150, 0, 40, 5, 40/60, 3, 2, 5, 2])
-            np.testing.assert_allclose(encoded['armor_stats'][0], [.5]*DAMAGE_TYPES)
-            # Stored rows keep no id map; the armed dozer is the entity carrying weapon id 0.
-            armed_row = int(np.flatnonzero(encoded['weapon_ids'][:, 0] == 0)[0])
-            self.assertEqual(encoded['armor_ids'][armed_row], 0)
-            arms = arms_inputs(encoded)[armed_row]
-            self.assertEqual(arms[0], 1)  # primary weapon present
-            self.assertAlmostEqual(arms[1], np.log1p(150*1.33)/7)  # range x range bonus
-            self.assertAlmostEqual(arms[3], np.log1p(40*1.25)/7)  # damage x damage bonus
-            self.assertAlmostEqual(arms[5], np.log1p((40/60)/1.5)/3)  # mean delay (s) / rate bonus
-
     def test_portable_columns_cursor_and_integrity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -299,7 +286,7 @@ class EventTests(unittest.TestCase):
             with closing(prefetched(data, 'train', seed=3, epoch=0, batch_size=3,
                                    cursor=all_batches[0][1])) as stream:
                 self.assertEqual([[r['frame'] for r in batch] for batch, _ in stream], expected)
-            self.assertEqual(sum(len(batch) for batch, _ in all_batches), 12)
+            self.assertEqual(sum(len(batch) for batch, _ in all_batches), 11)  # Commands only (no no-op rows).
             rows = all_batches[0][0]
             learner = EventLearner(self.policy)
             learner.batch(rows, train=True)
@@ -348,13 +335,16 @@ class EventTests(unittest.TestCase):
                     np.testing.assert_array_equal(a['exp_avg'].cpu().numpy(), b['exp_avg'].cpu().numpy())
 
     def test_model_width_does_not_invalidate_features(self):
-        # Model-only settings (event_store.MODEL_ONLY) keep the key; the network's fixed widths do not.
+        # Only data-shaping entries (event_store.DATA_CONFIG) change the key: widths, the live no-op rate and the
+        # network do not; a test model's 'widths', a target grid or the clock do.
         config = copy.deepcopy(self.config); config['map_hidden'] = 2*config['map_hidden']
-        self.assertEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
+        config['snapshot_rate'] = .25; config['variant_l2'] = .5; config['network'] = 'memoryfree'
+        self.assertEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config, parameters=False)))
         wider = copy.deepcopy(self.config); wider['widths'] = {**wider['widths'], 'core': 2*wider['widths']['core']}
         self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(wider, parameters=False)))
-        config['snapshot_rate'] = .25
-        self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(config)))
+        for key, value in (('angle_bins', 2*self.config['angle_bins']), ('event_observation_ms', 50)):
+            changed = {**copy.deepcopy(self.config), key: value}
+            self.assertNotEqual(feature_identity(self.policy), feature_identity(NeuralPolicy(changed, parameters=False)), key)
 
     def test_low_memory_preflight_prevents_dataset_and_model_allocation(self):
         resources = {'free_disk_bytes': 100*1024**3, 'available_ram_bytes': 3*1024**3}

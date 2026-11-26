@@ -69,7 +69,7 @@ def observation_fixture():
                'height': [0] * 1024, 'cliff': [0] * 1024}
     observation = {'player': {'index': 2, 'faction': 'FactionChina', 'cash': 10000,
                               'power_production': 0, 'power_consumption': 0, 'radar': False,
-                              'rank': 1, 'skill_points': 0, 'science_points': 1, 'dead': False,
+                              'rank': 1, 'skill_points': 0, 'rank_progress': .25, 'science_points': 1, 'dead': False,
                               'sciences': [], 'purchasable_sciences': [], 'upgrades': []},
                    'own_entities': [entity(10, 'ChinaVehicleDozer', True, [100, 100, 0],
                                            task=task('move', moving=True, destination=[300, 400, 0])),

@@ -20,7 +20,7 @@ ARRAY_FIELDS = ('numeric', 'extra_numeric', 'types', 'queue_units', 'queue_upgra
                 'task_numeric', 'task_relations', 'task_relation_valid', 'task_relation_features',
                 'task_commands', 'task_command_templates', 'task_command_template_present',
                 'entity_upgrades', 'entity_commands', 'entity_command_states', 'player_flags', 'purchasable_sciences',
-                'weapon_ids', 'armor_ids', 'weapon_bonus', 'effect_numeric', 'effect_types', 'effect_powers')
+                'effect_numeric', 'effect_types', 'effect_powers')
 MASK_FIELDS = ('owners', 'visible', 'verb', 'actor', 'unit_masks', 'target',
                'template', 'command', 'slot', 'cell', 'offset')
 LIST_FIELDS = ('unit_choices', 'selected')
