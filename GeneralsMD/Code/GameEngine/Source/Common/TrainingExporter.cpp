@@ -1371,12 +1371,20 @@ void directObservation(Player *player, unsigned frame, DirectBuffer &buffer)
 	DirectCursor root = out.writer.object(buffer, 0, FIELDS(rootFields));
 	const int index = static_cast<int>(player->getPlayerIndex());
 	static const char *const playerFields[] = {"index", "faction", "cash", "power_production", "power_consumption", "radar", "rank",
-		"skill_points", "science_points", "dead", "sciences", "purchasable_sciences", "upgrades"};
+		"skill_points", "rank_progress", "science_points", "dead", "sciences", "purchasable_sciences", "upgrades"};
 	DirectCursor state = out.object(root, FIELDS(playerFields));
 	out.put(state, index); out.put(state, player->getPlayerTemplate()->getName().str());
 	out.put(state, player->getMoney()->countMoney()); out.put(state, player->getEnergy()->getProduction());
 	out.put(state, player->getEnergy()->getConsumption()); out.put(state, player->hasRadar() ? true : false);
 	out.put(state, player->getRankLevel()); out.put(state, player->getSkillPoints());
+	// Progress from this rank's skill-point threshold to the next, in [0, 1); 0 at the top rank or the rank cap.
+	{
+		const Int down = player->getSkillPointsLevelDown(), up = player->getSkillPointsLevelUp();
+		float progress = 0.0f;
+		if (up != INT_MAX && up > down)
+			progress = static_cast<float>(player->getSkillPoints()-down)/static_cast<float>(up-down);
+		out.put(state, progress < 0.0f ? 0.0f : progress < 1.0f ? progress : 0.999999f);
+	}
 	out.put(state, player->getSciencePurchasePoints()); out.put(state, player->isPlayerDead() ? true : false);
 	ObservationLookups &lookups = observationLookups;
 	training_commands::playerCommands(player, lookups.player);
