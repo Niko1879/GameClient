@@ -709,13 +709,13 @@ Json mapFeatures()
 	// knowledge, as the supply locations (feature review, 26 Nov 2026).
 	Json tech = Json::array();
 	static const NameKeyType autoDeposit = NAMEKEY("AutoDepositUpdate");
-	for (Object *o = TheGameLogic->getFirstObject(); o; o = o->getNextObject())
-		if (o->isKindOf(KINDOF_TECH_BUILDING)) {
+	for (Object *t = TheGameLogic->getFirstObject(); t; t = t->getNextObject())
+		if (t->isKindOf(KINDOF_TECH_BUILDING)) {
 			Json building = Json::object();
-			building.set("id", U(static_cast<unsigned>(o->getID())));
-			building.set("type", S(o->getTemplate()->getName().str()));
-			building.set("position", position(o->getPosition()));
-			building.set("income", B(o->findUpdateModule(autoDeposit) != nullptr));
+			building.set("id", U(static_cast<unsigned>(t->getID())));
+			building.set("type", S(t->getTemplate()->getName().str()));
+			building.set("position", position(t->getPosition()));
+			building.set("income", B(t->findUpdateModule(autoDeposit) != nullptr));
 			tech.push(building);
 		}
 	result.set("tech_buildings", tech);
