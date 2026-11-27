@@ -281,7 +281,8 @@ def teacher_heads(model, core, bundle, plan, *, loss_only=False, position_metric
 
     actions = inputs['actions']
     logits = model.action_logits(core)
-    paced = config.get('network') == 'paced'
+    from generals_policy import paced_network
+    paced = paced_network(config)
     if paced:
         timing, entropy, decision, wait = paced_decision(model, core, logits, inputs, plan, loss_only)
     else:

@@ -15,7 +15,7 @@ import zipfile
 import numpy as np
 
 from event_store import SCHEMA
-from generals_policy import ARCHITECTURE, OPENER_WINDOW_SECONDS, UNRATED, apm_inputs, opener_inputs, rating_inputs
+from generals_policy import ARCHITECTURE, OPENER_WINDOW_SECONDS, UNRATED, apm_inputs, opener_inputs, paced_network, rating_inputs
 from openers import blanked
 from prepared_io import COMMON_FIELDS, _digest, _json_bytes
 from tensor_replay_store import ARRAY_FIELDS, LIST_FIELDS, MASK_FIELDS, decode_columns
@@ -164,7 +164,7 @@ class EventDataset:
         if not 0 < self.snapshot_rate <= stored:
             raise ValueError('A dataset can only thin its no-op rows')
         self.noop_share = self.snapshot_rate/stored
-        if self.config.get('network') == 'paced':  # Order rows only: no-op is never trained there.
+        if paced_network(self.config):  # Order rows only: no-op is never trained there.
             self.noop_share = 0.
         seen, keys = set(), set()
         for entry in self.document['entries']:
@@ -242,7 +242,7 @@ class EventDataset:
         if len(metadata) != descriptor['rows']:
             raise ValueError('Event column row count mismatch')
         rows = chunk_rows(columns, metadata, self.shared[identity], self.key)
-        if self.config.get('network') == 'paced':
+        if paced_network(self.config):
             delay_targets(rows)
         kept = self.kept_rows(reference)
         if kept is not None:
