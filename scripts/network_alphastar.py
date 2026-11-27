@@ -38,11 +38,11 @@ NETWORK = 'alphastar'
 PACED = 'paced'
 # Memory-free core, location head with the selected-units plane, relevance planes and whole-map attention.
 MOVEMENT = 'movement'
-# AlphaStar's decision path minus the LSTM (user, 27 Nov): paced, a narrow residual core of CORE_BLOCKS pre-norm blocks
-# (width DEEP_CORE, inner x CORE_EXPANSION; the depth of its 3-layer LSTM, no state) and its 16 x 256 action head.
+# Memory-free with a deeper, narrower core (user, 27 Nov): CORE_BLOCKS pre-norm residual blocks of width DEEP_CORE
+# (inner x CORE_EXPANSION) where SCC has its LSTM, about the wide core's size; single-layer heads as memory-free.
 DEEP = 'deep'
 NETWORKS = ('alphastar', 'memoryfree', PACED, MOVEMENT, DEEP)
-CORE_BLOCKS, DEEP_CORE, CORE_EXPANSION = 3, 384, 4
+CORE_BLOCKS, DEEP_CORE, CORE_EXPANSION = 6, 1024, 2
 # Config effects='map': effects painted on the map, units read their cell; no effect tokens.
 EFFECTS_MAP = 'map'
 # Imported (NeuralPolicy.__init__) before any policy with this network exists, so no feature key includes it.
@@ -78,7 +78,7 @@ def add_parameters(w, b, c, W, config, actions):
         # Units read the 1x1 map at their cell into their features and keys; small start.
         w('unit_cell_w', (W['map_out'], d), .1); b('unit_cell_b', d)
         w('unit_cell_key_w', (W['map_out'], W['key']), .1)
-    if config['network'] in (PACED, DEEP):
+    if config['network'] == PACED:
         # log(order rate here / the player's own game mean): an output only, never read by another head, on a
         # detached core (no pace gradient reaches the trunk). Zero start: the player's mean pace everywhere.
         w('pace_hidden_w', (core, PACE_HIDDEN), math.sqrt(2)); b('pace_hidden_b', PACE_HIDDEN)
@@ -89,7 +89,6 @@ def add_parameters(w, b, c, W, config, actions):
             b(f'core_res{block}_norm_g', core, 1.); b(f'core_res{block}_norm_b', core)
             w(f'core_res{block}_a', (core, CORE_EXPANSION*core), math.sqrt(2)); b(f'core_res{block}_a_b', CORE_EXPANSION*core)
             w(f'core_res{block}_b', (CORE_EXPANSION*core, core), .1); b(f'core_res{block}_b_b', core)
-        action_head(w, b, core, actions)
         return
     if config['network'] == PACED:
         return
@@ -161,7 +160,7 @@ class AlphaStarTorchPolicy(TorchPolicyV3):
         return (hidden @ p['pace_w']+p['pace_b'])[..., 0]
 
     def action_logits(self, core):
-        if self.config['network'] not in (NETWORK, DEEP):
+        if self.config['network'] != NETWORK:
             return super().action_logits(core)
         p = self.weights
         x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])

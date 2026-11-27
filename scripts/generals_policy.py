@@ -158,7 +158,7 @@ def widths(config):
 
 def paced_network(config):
     """Networks with no trained no-op and a pace head that sets the live order rate (network_alphastar)."""
-    return config.get('network') in ('paced', 'deep')
+    return config.get('network') == 'paced'
 
 
 def token_groups(config):
@@ -969,7 +969,7 @@ class NeuralPolicy:
             norm(f'core_lstm{layer}_cell', core)
         # Heads (plan Â§1f): every head reads the core output; the selected action is one flat softmax,
         # and each argument head has its own embedding of that action.
-        if config.get('network') not in ('alphastar', 'deep'):  # Those have their own (network_alphastar).
+        if config.get('network') != 'alphastar':  # It has its own (network_alphastar).
             w('action_w', (core, actions), .1); b('action_b', actions)
         for head in ARGUMENT_HEADS:
             w(head+'_action_embedding', (actions, a), 1)
