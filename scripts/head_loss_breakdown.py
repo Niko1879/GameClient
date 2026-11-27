@@ -90,7 +90,8 @@ def evaluate(args):
                         counts = {k: np.asarray(c).reshape(-1) for k, c in output['head_counts'].items()}
                         # The flat action softmax again, for the act-or-wait / which-action split.
                         # network='paced' never scores no-op: orders only, and p(no-op) is what its pace implies.
-                        paced = model.config.get('network') == 'paced'
+                        from generals_policy import paced_network
+                        paced = paced_network(model.config)
                         mask = plan['staged']['decision_mask']
                         if paced:
                             mask = mask & (model.action_kinds != 0)[None]

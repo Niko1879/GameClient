@@ -156,9 +156,14 @@ WIDTHS = {'entity': 256, 'ffn': 1024, 'heads': 2, 'head_width': 32, 'key': 32, '
 def widths(config):
     """The network widths: WIDTHS, overridden only by a test model's config 'widths'."""
     if config.get('network'):  # Temporary comparison networks (network_alphastar.py).
-        from network_alphastar import WIDTHS as variant
-        return {**WIDTHS, **variant, **config.get('widths', {})}
+        from network_alphastar import variant_widths
+        return {**WIDTHS, **variant_widths(config), **config.get('widths', {})}
     return {**WIDTHS, **config.get('widths', {})}
+
+
+def paced_network(config):
+    """Networks with no trained no-op and a pace head that sets the live order rate (network_alphastar)."""
+    return config.get('network') in ('paced', 'deep')
 
 
 def token_groups(config):
@@ -747,7 +752,7 @@ class Encoder:
 class NeuralPolicy:
     def __init__(self, config, seed=1, *, parameters=True):
         """parameters=False builds the encoder, masks and targets only (preparation and identities)."""
-        if config.get('architecture') != ARCHITECTURE or config.get('network') not in (None, 'alphastar', 'memoryfree', 'paced', 'movement'):
+        if config.get('architecture') != ARCHITECTURE or config.get('network') not in (None, 'alphastar', 'memoryfree', 'paced', 'movement', 'deep'):
             raise ValueError('Unsupported policy architecture')
         if config.get('network'):  # Temporary comparison networks: the import keeps 'network' out of feature keys.
             import network_alphastar  # noqa: F401
@@ -886,7 +891,7 @@ class NeuralPolicy:
             norm(f'core_lstm{layer}_cell', core)
         # Heads (plan Â§1f): every head reads the core output; the selected action is one flat softmax,
         # and each argument head has its own embedding of that action.
-        if config.get('network') != 'alphastar':  # It has its own (network_alphastar).
+        if config.get('network') not in ('alphastar', 'deep'):  # Those have their own (network_alphastar).
             w('action_w', (core, actions), .1); b('action_b', actions)
         for head in ARGUMENT_HEADS:
             w(head+'_action_embedding', (actions, a), 1)
@@ -1547,7 +1552,7 @@ class NeuralPolicy:
         return concatenate(parts+([summary] if summary is not None else []))
 
     def _pace(self, trunk):
-        """log(order rate / own mean) for networks with a pace head (network='paced'), else None."""
+        """log(order rate / own mean) for networks with a pace head (paced_network), else None."""
         return None
 
     def _action_logits(self, trunk):
@@ -1684,7 +1689,7 @@ class NeuralPolicy:
                 trace['top'] = self._top_orders(logits, orders)
             if orders.any():
                 stay, act = logits[noop:noop+1], logits[np.flatnonzero(orders)].reshape((1, -1)).logsumexp(1)
-                if pace is not None:  # network='paced': no trained no-op; orders/s = own pace x exp(pace).
+                if pace is not None:  # paced_network: no trained no-op; orders/s = own pace x exp(pace).
                     stay, act = Tensor(np.asarray([math.log(self.snapshot_rate)])), Tensor(np.asarray([pace+math.log(order_rate(encoded))]))
                 if snapshots is not None:
                     act = act-stay+math.log(snapshots)

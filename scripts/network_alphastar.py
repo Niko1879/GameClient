@@ -37,11 +37,20 @@ NETWORK = 'alphastar'
 PACED = 'paced'
 # Memory-free core, location head with the selected-units plane, relevance planes and whole-map attention.
 MOVEMENT = 'movement'
-NETWORKS = ('alphastar', 'memoryfree', PACED, MOVEMENT)
+# AlphaStar's decision path minus the LSTM (user, 27 Nov): paced, a narrow residual core of CORE_BLOCKS pre-norm blocks
+# (width DEEP_CORE, inner x CORE_EXPANSION; the depth of its 3-layer LSTM, no state) and its 16 x 256 action head.
+DEEP = 'deep'
+NETWORKS = ('alphastar', 'memoryfree', PACED, MOVEMENT, DEEP)
+CORE_BLOCKS, DEEP_CORE, CORE_EXPANSION = 3, 384, 4
 # Config effects='map': effects painted on the map, units read their cell; no effect tokens.
 EFFECTS_MAP = 'map'
 # The 70M's core width (its 'hidden'); the heads read it as AlphaGenerals' heads read the LSTM output.
 WIDTHS = {'core': 3840}
+
+
+def variant_widths(config):
+    """Widths a comparison network sets over generals_policy.WIDTHS: the wide core, or the deep network's narrow one."""
+    return {'core': DEEP_CORE} if config.get('network') == DEEP else WIDTHS
 ACTION_BLOCKS, ACTION_WIDTH = 16, 256
 SKIP = 32
 # Pace: the hidden width of its own small network.
@@ -53,7 +62,8 @@ RELEVANCE_HEADS, RELEVANCE_WIDTH, CELL_HEADS = 8, 32, 4
 def add_parameters(w, b, c, W, config, actions):
     """The core (and for 'alphastar' the action head and skips) in place of the LSTM and the linear action layer."""
     core, m = W['core'], config['map_hidden']
-    w('core_hidden_w', (core, core)); b('core_hidden_b', core)
+    if config['network'] != DEEP:
+        w('core_hidden_w', (core, core)); b('core_hidden_b', core)
     if config.get('effects') == EFFECTS_MAP:
         if config['network'] == NETWORK:
             raise ValueError("effects='map' needs TorchPolicyV3's map encoder; 'alphastar' has its own")
@@ -65,11 +75,20 @@ def add_parameters(w, b, c, W, config, actions):
         # Units read the 1x1 map at their cell into their features and keys; small start.
         w('unit_cell_w', (W['map_out'], d), .1); b('unit_cell_b', d)
         w('unit_cell_key_w', (W['map_out'], W['key']), .1)
-    if config['network'] == PACED:
+    if config['network'] in (PACED, DEEP):
         # log(order rate here / the player's own game mean): an output only, never read by another head, on a
         # detached core (no pace gradient reaches the trunk). Zero start: the player's mean pace everywhere.
         w('pace_hidden_w', (core, PACE_HIDDEN), math.sqrt(2)); b('pace_hidden_b', PACE_HIDDEN)
         w('pace_w', (PACE_HIDDEN, 1), 0); b('pace_b', 1)
+    if config['network'] == DEEP:
+        # Pre-norm residual blocks after core_in (FC-ReLU): x + B relu(A norm(x)); B starts small.
+        for block in range(CORE_BLOCKS):
+            b(f'core_res{block}_norm_g', core, 1.); b(f'core_res{block}_norm_b', core)
+            w(f'core_res{block}_a', (core, CORE_EXPANSION*core), math.sqrt(2)); b(f'core_res{block}_a_b', CORE_EXPANSION*core)
+            w(f'core_res{block}_b', (CORE_EXPANSION*core, core), .1); b(f'core_res{block}_b_b', core)
+        action_head(w, b, core, actions)
+        return
+    if config['network'] == PACED:
         return
     if config['network'] == MOVEMENT:
         key, cells = W['key'], config['map_side']**2
@@ -90,18 +109,23 @@ def add_parameters(w, b, c, W, config, actions):
         return
     if config['network'] != NETWORK:
         return
-    w('verb_in_w', (core, ACTION_WIDTH), math.sqrt(2)); b('verb_in_b', ACTION_WIDTH)
-    for block in range(ACTION_BLOCKS):
-        # The branch ends in a linear layer started small, so a block can add or subtract from the stream.
-        w(f'verb_res{block}_a', (ACTION_WIDTH, ACTION_WIDTH), math.sqrt(2)); b(f'verb_res{block}_a_b', ACTION_WIDTH)
-        w(f'verb_res{block}_b', (ACTION_WIDTH, ACTION_WIDTH), .1); b(f'verb_res{block}_b_b', ACTION_WIDTH)
-    w('action_w', (ACTION_WIDTH, actions), .1); b('action_b', actions)
+    action_head(w, b, core, actions)
     # Skips: the map before its residual blocks and after each but the last, one per FiLM block.
     for skip in range(LOCATION_BLOCKS):
         c(f'map_skip{skip}', SKIP, m, 1)
         c(f'location_skip{skip}', m, SKIP, 1)
     if LOCATION_BLOCKS != MAP_RESIDUAL_BLOCKS:
         raise ValueError('One map skip per location block')
+
+
+def action_head(w, b, core, actions):
+    """AlphaStar's action-type head: ACTION_BLOCKS pre-activation residual blocks of ACTION_WIDTH, then the logits."""
+    w('verb_in_w', (core, ACTION_WIDTH), math.sqrt(2)); b('verb_in_b', ACTION_WIDTH)
+    for block in range(ACTION_BLOCKS):
+        # The branch ends in a linear layer started small, so a block can add or subtract from the stream.
+        w(f'verb_res{block}_a', (ACTION_WIDTH, ACTION_WIDTH), math.sqrt(2)); b(f'verb_res{block}_a_b', ACTION_WIDTH)
+        w(f'verb_res{block}_b', (ACTION_WIDTH, ACTION_WIDTH), .1); b(f'verb_res{block}_b_b', ACTION_WIDTH)
+    w('action_w', (ACTION_WIDTH, actions), .1); b('action_b', actions)
 
 
 class AlphaStarTorchPolicy(TorchPolicyV3):
@@ -116,6 +140,13 @@ class AlphaStarTorchPolicy(TorchPolicyV3):
     def core(self, core_input, resets, state):
         p = self.weights
         with torch.autocast(self.device.type, enabled=False):
+            if self.config['network'] == DEEP:
+                # FC-ReLU, then pre-norm residual blocks, then a parameter-free norm for the heads.
+                x = F.relu(core_input.to(self.dtype) @ p['core_in_w']+p['core_in_b'])
+                for block in range(CORE_BLOCKS):
+                    h = F.layer_norm(x, (x.shape[-1],), p[f'core_res{block}_norm_g'], p[f'core_res{block}_norm_b'], eps=1e-5)
+                    x = x+F.relu(h @ p[f'core_res{block}_a']+p[f'core_res{block}_a_b']) @ p[f'core_res{block}_b']+p[f'core_res{block}_b_b']
+                return self.normalize(x), state
             hidden = torch.tanh(core_input.to(self.dtype) @ p['core_in_w']+p['core_in_b'])
             return torch.tanh(hidden @ p['core_hidden_w']+p['core_hidden_b']), state
 
@@ -127,7 +158,7 @@ class AlphaStarTorchPolicy(TorchPolicyV3):
         return (hidden @ p['pace_w']+p['pace_b'])[..., 0]
 
     def action_logits(self, core):
-        if self.config['network'] != NETWORK:
+        if self.config['network'] not in (NETWORK, DEEP):
             return super().action_logits(core)
         p = self.weights
         x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])

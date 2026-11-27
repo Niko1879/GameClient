@@ -50,7 +50,8 @@ class TorchLivePolicy(NeuralPolicy):
         # never drawn: pace switched off for network='paced', a forced constant rate for any other policy.
         if getattr(self, 'constant_pace', False):
             return 0.
-        if self.config.get('network') != 'paced':
+        from generals_policy import paced_network
+        if not paced_network(self.config):
             return None
         return float(self.model.pace(trunk['core'])[0])
 

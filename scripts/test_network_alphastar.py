@@ -185,6 +185,31 @@ class PacedNetworkTests(AlphaStarNetworkTests):
         self.assertIsNotNone(model.weights['pace_b'].grad)
 
 
+class DeepNetworkTests(PacedNetworkTests):
+    """network='deep' (user, 27 Nov): paced, a narrow residual core and AlphaStar's 16 x 256 action head; every paced
+    test applies, with effects on the map as in the pilot."""
+    network = 'deep'
+    extra = {'effects': 'map'}
+    seed = 6
+
+    def test_parameters_replace_the_lstm_and_linear_action_layer(self):
+        from network_alphastar import ACTION_BLOCKS, CORE_BLOCKS, CORE_EXPANSION
+        names, p = set(self.policy.parameters), self.policy.parameters
+        self.assertFalse({name for name in names if name.startswith(('core_lstm', 'core_hidden', 'map_skip', 'location_skip'))})
+        core = self.config['widths']['core']
+        self.assertEqual(p['core_in_w'].data.shape[1], core)
+        for block in range(CORE_BLOCKS):
+            self.assertEqual(p[f'core_res{block}_a'].data.shape, (core, CORE_EXPANSION*core))
+        self.assertTrue({f'verb_res{ACTION_BLOCKS-1}_b', 'verb_in_w', 'pace_w', 'effect_map_w'} <= names)
+        self.assertEqual(p['verb_in_w'].data.shape[0], core)
+
+    def test_the_default_core_is_narrow(self):
+        from generals_policy import widths
+        from network_alphastar import DEEP_CORE
+        self.assertEqual(widths({'network': 'deep'})['core'], DEEP_CORE)
+        self.assertEqual(widths({'network': 'paced'})['core'], 3840)
+
+
 class MovementNetworkTests(AlphaStarNetworkTests):
     """network='movement': the location head sees the selected units and every entity relative to them."""
     network = 'movement'

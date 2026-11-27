@@ -12,7 +12,7 @@ import numpy as np
 
 from generals_policy import (DERIVED_ENTITY_FEATURES, EFFECT_FEATURES, GROUPS, MAP_POOL, SCATTER_SCALE, UNIT_GROUPS,
                              UNKNOWN_APM, UNRATED, NeuralPolicy, coarse_pixels, command_target, count_channels, derived_inputs,
-                             pool_grid, unit_groups)
+                             paced_network, pool_grid, unit_groups)
 from training_legality import cached_legality
 
 # Modelled encoder cost: per microbatch, per padded token, per padded pair. The fixed cost is the CPU launch
@@ -355,7 +355,7 @@ def prepare_update(spec, rows, pair_budget):
         values, numeric = encode_values(spec, encoded)
         teachers = [row['target'] for row in micro]
         plan = teacher_plan(spec, encoded, teachers, numeric.shape[1])
-        if spec.config.get('network') == 'paced':
+        if paced_network(spec.config):
             pace_plan(plan, micro)
         parts.append({'values': values, 'numeric': numeric,
                       'plan': plan,
