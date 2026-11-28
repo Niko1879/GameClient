@@ -330,6 +330,8 @@ class OldCheckpointTests(unittest.TestCase):
                 terrain = {'grid_size': side, 'extent_low': [0, 0, 0], 'extent_high': [1000, 1000, 100],
                            'height': [0]*side*side, 'cliff': [0]*side*side}
                 observation['visibility_grid'] = [2]*side*side
+                # The feature-review engine's 'ability' task: the 70M reads it as 'other' (unit_tasks_old).
+                observation['own_entities'][0]['task']['kind'] = 'ability'
                 actor = actor_class(live)(live, 3)
                 self.assertEqual(type(actor).__name__, 'DelayActor')
                 for frame in (0, 300, 600):

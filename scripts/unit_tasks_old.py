@@ -126,7 +126,10 @@ def encode(config, observation, encoded, *, rotated, types=None):
         task = entity.get('task')
         if not isinstance(task, dict) or not task.get('available', False):
             raise ValueError('Missing owned-unit task snapshot')
-        one_hot = TASK_ONE_HOT.get(task.get('kind', 'unknown'))
+        # The feature-review engines (19225647) report a unit using a special ability as 'ability'; the 70M's engine
+        # reported its AI state, almost always 'other' (hacking, capturing): read it as that (28 Nov).
+        kind = task.get('kind', 'unknown')
+        one_hot = TASK_ONE_HOT.get('other' if kind == 'ability' else kind)
         if one_hot is None:
             raise ValueError('Unknown unit-task category')
         destination = task.get('destination')
