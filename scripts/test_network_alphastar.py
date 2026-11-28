@@ -74,7 +74,13 @@ class AlphaStarNetworkTests(unittest.TestCase):
             # No NumPy equations: it plays through the PyTorch live policy, memory-free.
             with self.assertRaises(ValueError):
                 restored.decide(rows[0]['encoded'])
+            # Play loads weights only (no Adam moments) and keeps one, torch, copy of them.
+            played, optimizer, _ = load_policy(path, optimizer=False)
+            self.assertIsNone(optimizer)
+            for name, parameter in played.parameters.items():
+                np.testing.assert_array_equal(parameter.data, restored.parameters[name].data)
             live = live_policy(restored, device='cpu', dtype=torch.float64)
+            self.assertFalse(live.model.reference.parameters)
             self.assertIs(actor_class(live).__name__, 'EventActor')
             fresh = live.decide(rows[3]['encoded'], None, rng=np.random.default_rng(2))
             carried = live.decide(rows[3]['encoded'], live.decide(rows[0]['encoded'], None, rng=np.random.default_rng(1))[2],

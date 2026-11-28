@@ -16,6 +16,8 @@ class TorchLivePolicy(NeuralPolicy):
             raise RuntimeError('GPU inference requires a PyTorch installation with a working ROCm or CUDA device')
         super().__init__(reference.config, parameters=False)
         self.model = TorchPolicyV3(reference, device=device, dtype=dtype).eval()
+        # Play never reads the reference's NumPy weights again: a weightless one keeps one copy per game (28 Nov).
+        self.model.reference = NeuralPolicy(reference.config, parameters=False)
         # The live actor applies the checkpoint's rating switch when it prepares the row.
         self.model.config = {**self.config, 'rating_input': True}
         self.parameters = self.model.weights

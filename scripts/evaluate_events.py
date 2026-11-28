@@ -47,7 +47,7 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
         os.environ[PROFILE_ENV] = str(profile.resolve())
     # AlphaGenerals or, until its adoption, a memory-free checkpoint through the _old modules.
     from policy_checkpoints import actor_class, live_policy, load_policy
-    policy, _, checkpoint = load_policy(args.checkpoint)
+    policy, _, checkpoint = load_policy(args.checkpoint, optimizer=False)
     policy.rating_input = args.rating_input
     device = getattr(args, 'device', None) or ('cuda' if args.headed else None)
 
@@ -72,7 +72,7 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
         actors[0].configure_ratings(*rating_view(args.rating, args.opponent_rating, args.rating_view))
         configure_timing(actors[0], args.apm, args.look_ms)
         if args.opponent_kind == 'policy':
-            other, _, _ = load_policy(args.opponent or args.checkpoint)
+            other, _, _ = load_policy(args.opponent or args.checkpoint, optimizer=False)
             other.rating_input = args.opponent_rating_input if args.opponent else args.rating_input
             other = live(other)
             other.constant_pace = args.opponent_constant_pace
@@ -87,11 +87,22 @@ def evaluate(args, *, profile_source=None, write_trajectory=True):
             policy_factions = ['FactionChina', 'FactionChina']
             policy_factions[args.learning_side] = args.faction
             policy_factions[1-args.learning_side] = args.opponent_policy_faction
+        # Per-player stats as the game runs (play_head_to_head's side stats), with or without a trajectory file.
+        from game_stats import SideStats
+        stats = {}
+
+        def on_transition(observations, next_observations, next_frame, feedback, actions):
+            for player in next_observations:
+                stats.setdefault(player, SideStats(player)).update(observations, next_observations, next_frame,
+                                                                   feedback, actions)
+        keep = write_trajectory and not args.no_trajectory
         summary = run_episode(env, actors, args.map, seed=args.seed, max_frames=args.max_frames,
-                              ticks=args.ticks, trajectory=output/'episode.jsonl' if write_trajectory else None,
+                              ticks=args.ticks, trajectory=output/'episode.jsonl' if keep else None,
                               opponent_kind=args.opponent_kind,
                               opponent_faction=args.bot_faction, learning_side=args.learning_side,
-                              record_replay=args.record_replay, policy_factions=policy_factions)
+                              record_replay=args.record_replay, policy_factions=policy_factions,
+                              on_transition=on_transition)
+        summary['side_stats'] = {player: s.result() for player, s in stats.items()}
         if args.headed and args.keep_window and not summary['truncated']:
             print('Match finished. Close the game window to return to the launcher.', flush=True)
             env.process.wait()
@@ -131,6 +142,8 @@ def make_parser():
     parser.add_argument('--device', help='Torch inference device (cuda = the ROCm/CUDA GPU, cpu); default: headless '
                         'games use the NumPy policy, headed games cuda')
     parser.add_argument('--keep-window', action='store_true', help='Keep a headed game open after victory or defeat')
+    parser.add_argument('--no-trajectory', action='store_true',
+                        help='Write no episode.jsonl (~0.5 GB per 2 game minutes); summary.json still has the side stats')
     parser.add_argument('--opponent-kind', choices=('policy', 'hard_ai', 'human'), default='hard_ai')
     parser.add_argument('--opponent', help='Opponent checkpoint for policy games; defaults to the same checkpoint')
     parser.add_argument('--bot-faction', default='random', help='random or an engine faction name')

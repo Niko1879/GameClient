@@ -1572,23 +1572,27 @@ class NeuralPolicy:
         os.replace(temporary, path)
 
     @classmethod
-    def load(cls, path, lr=None):
+    def load(cls, path, lr=None, *, optimizer=True):
+        """(policy, optimizer, document); optimizer=False skips the Adam moments (play: None for the optimizer)."""
+        want = optimizer
         with np.load(path, allow_pickle=False) as data:
             document = json.loads(str(data['metadata']))
             policy = cls(document['config'])
-            optimizer = Adam(policy.parameters, lr or document.get('optimizer_lr') or 3e-4)
-            optimizer.step_count = document['optimizer_step']
+            optimizer = Adam(policy.parameters, lr or document.get('optimizer_lr') or 3e-4) if want else None
+            if optimizer:
+                optimizer.step_count = document['optimizer_step']
             for name, p in policy.parameters.items():
                 value = data['p_' + name]
                 if value.shape != p.data.shape or not np.isfinite(value).all():
                     raise ValueError('Invalid checkpoint weights')
                 p.data[:] = value
-                if 'm_' + name in data:
+                if optimizer and 'm_' + name in data:
                     if not np.isfinite(data['m_' + name]).all() or not np.isfinite(data['v_' + name]).all():
                         raise ValueError('Nonfinite optimizer checkpoint state')
                     optimizer.m[name][:] = data['m_' + name]
                     optimizer.v[name][:] = data['v_' + name]
             if policy.weight_hash() != document['weight_hash'] or policy.identity_hash() != document['policy_identity_hash']:
                 raise ValueError('Checkpoint weight/configuration hash mismatch')
-            optimizer.parameter_steps = document['metadata'].get('event_optimizer_steps', {})
+            if optimizer:
+                optimizer.parameter_steps = document['metadata'].get('event_optimizer_steps', {})
         return policy, optimizer, document

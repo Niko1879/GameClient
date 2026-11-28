@@ -193,10 +193,11 @@ def placement_options(policies):
 
 def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, trajectory=None,
                 opponent_kind='policy', opponent_faction='random', learning_side=0, record_replay=False,
-                policy_factions=None):
+                policy_factions=None, on_transition=None):
     """Each policy implements reset(), act(observation, map_features, frame) and feedback().
 
-    Reward is terminal win/loss only; timeout is truncation with zero reward.
+    Reward is terminal win/loss only; timeout is truncation with zero reward. on_transition(observations,
+    next_observations, next_frame, feedback, actions) sees every step, also without a trajectory file.
     """
     from event_schedule import step_ticks
     from generals_policy import OBSERVATION_VERSION
@@ -259,6 +260,9 @@ def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, t
                 break
             for p, policy in zip(env.controlled_players, policies):
                 policy.feedback([f for f in successor['action_feedback'] if f['player'] == p])
+            if on_transition:
+                on_transition(state['observations'], successor['observations'], successor['frame'],
+                              successor['action_feedback'], actions)
             write({'record': 'transition', 'frame': state['frame'], 'next_frame': successor['frame'],
                    'observations': state['observations'], 'actions': actions,
                    'next_observations': successor['observations'], 'rewards': successor['rewards'],
@@ -268,7 +272,7 @@ def run_episode(env, policies, map_path, *, seed=1, max_frames=36000, ticks=6, t
             state = successor
             steps += 1
         summary = {k: state[k] for k in ('frame', 'rewards', 'terminated', 'truncated')}
-        summary.update(steps=steps, setup=setup, execution_settings=placement,
+        summary.update(steps=steps, setup=setup, execution_settings=placement, controlled_players=env.controlled_players,
                        event_scheduling={str(p): dict(policy.counters)
                                          for p, policy in zip(env.controlled_players, policies)})
         if getattr(env, 'headed', False):

@@ -48,49 +48,30 @@ def games(seeds, maps=DEFAULT_MAPS):
 
 
 def side_stats(path, player):
-    """Per-player stats from the trajectory: dozers, Command Center, income, production."""
-    player = str(player)
-    dozers, max_dozers, last_dozer, cc_gone, income, units, seen = set(), 0, None, None, 0, 0, set()
+    """Per-player stats (game_stats.SideStats) from a recorded trajectory (--trajectories)."""
+    from game_stats import SideStats
+    stats = SideStats(player)
     with gzip.open(path, 'rt', encoding='utf-8') as stream:
         for line in stream:
             row = json.loads(line)
-            if row.get('record') != 'transition':
-                continue
-            before, after = row['observations'][player], row['next_observations'][player]
-            sold = any(f['accepted'] and f['action']['kind'] == 'sell'
-                       for f in row['action_feedback'] if str(f['player']) == player)
-            if not sold:
-                income += max(0, after['player']['cash']-before['player']['cash'])
-            ents = after['own_entities']
-            alive = [e['id'] for e in ents if e['type'].endswith('VehicleDozer')]
-            dozers.update(alive)
-            max_dozers = max(max_dozers, len(alive))
-            minute = row['next_frame']/FPS/60
-            if alive:
-                last_dozer = None
-            elif last_dozer is None:
-                last_dozer = minute
-            if cc_gone is None and not any(e['type'].endswith('CommandCenter') for e in ents):
-                cc_gone = minute
-            for e in ents:
-                if e['id'] not in seen:
-                    seen.add(e['id'])
-                    if e.get('producer_id') and not e['type'].endswith(('Mine', 'ListeningOutpost')):
-                        units += 1
-    return dict(dozers_ever=len(dozers), max_dozers=max_dozers, no_dozer_from_min=last_dozer,
-                no_cc_from_min=cc_gone, income_proxy=income, units_produced=units)
+            if row.get('record') == 'transition':
+                stats.update(row['observations'], row['next_observations'], row['next_frame'], row['action_feedback'],
+                             row['actions'])
+    return stats.result()
 
 
 def finish(game, output, label):
+    """The game's result. evaluate_events gathers the side stats as it plays (summary['side_stats']) unless
+    the game kept its trajectory (--trajectories), which they are then read from."""
     summary = json.loads((output/'summary.json').read_text(encoding='utf-8'))
-    controlled = summary.get('controlled_players') or json.loads(
-        gzip.open(output/'episode.jsonl.gz', 'rt').readline())['controlled_players']
+    packed = output/'episode.jsonl.gz'
+    controlled = summary.get('controlled_players') or json.loads(gzip.open(packed, 'rt').readline())['controlled_players']
     a, b = controlled[game['side']], controlled[1-game['side']]
     ra = summary['rewards'][str(a)]
     outcome = 'time limit' if summary['truncated'] else ('A' if ra > 0 else 'B' if ra < 0 else 'draw')
-    packed = output/'episode.jsonl.gz'
+    stats = summary.get('side_stats') or {str(p): side_stats(packed, p) for p in (a, b)}
     return dict(game=game, outcome=outcome, minutes=summary['frame']/FPS/60,
-                a_player=a, b_player=b, a=side_stats(packed, a), b=side_stats(packed, b),
+                a_player=a, b_player=b, a=stats[str(a)], b=stats[str(b)],
                 scheduling=summary.get('event_scheduling'), labels=label)
 
 
@@ -127,6 +108,9 @@ def main():
                         'venv); default: the NumPy policy on the CPU')
     parser.add_argument('--record-replays', action='store_true',
                         help='Keep a viewable games/<name>/episode.rep per game (evaluate_events --record-replay)')
+    parser.add_argument('--trajectories', action='store_true',
+                        help='Keep each game\'s full trajectory (games/<name>/episode.jsonl.gz, ~0.5 GB per 2 game minutes '
+                             'before compression); by default the side stats are gathered during play and none is written')
     args = parser.parse_args()
     disable_power_throttling()
     for key in ('a', 'b'):
@@ -231,6 +215,8 @@ def main():
                     command += ['--opponent-constant-pace']
                 if args.record_replays:
                     command += ['--record-replay']
+                if not args.trajectories:
+                    command += ['--no-trajectory']
                 if args.device:
                     command += ['--device', args.device]
                 if args.a_rating_input:
@@ -258,9 +244,10 @@ def main():
                         todo.append(game)  # retried after the others
                     continue
                 raw = folder/'episode.jsonl'
-                with raw.open('rb') as source, gzip.open(folder/'episode.jsonl.gz', 'wb', compresslevel=6) as target:
-                    shutil.copyfileobj(source, target, 1024*1024)
-                raw.unlink()
+                if args.trajectories:
+                    with raw.open('rb') as source, gzip.open(folder/'episode.jsonl.gz', 'wb', compresslevel=6) as target:
+                        shutil.copyfileobj(source, target, 1024*1024)
+                    raw.unlink()
                 result = finish(game, folder, None)
                 result['wall_seconds'] = time.monotonic()-start
                 results[game['name']] = result

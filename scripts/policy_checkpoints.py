@@ -30,9 +30,10 @@ def policy_modules(path):
     return NeuralPolicy, TorchLivePolicy
 
 
-def load_policy(path):
-    """(policy, optimizer, document) as NeuralPolicy.load returns them, from the checkpoint's own modules."""
-    return policy_modules(path)[0].load(path)
+def load_policy(path, *, optimizer=True):
+    """(policy, optimizer, document) as NeuralPolicy.load returns them, from the checkpoint's own modules;
+    optimizer=False (play) skips the Adam moments."""
+    return policy_modules(path)[0].load(path, optimizer=optimizer)
 
 
 def actor_class(policy):
