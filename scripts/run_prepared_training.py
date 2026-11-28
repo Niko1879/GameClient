@@ -16,7 +16,8 @@ RUN=ROOT/'model-training'
 DATA=ROOT/'training-data'
 CATALOG=ROOT/'replays/catalog/replay-catalog.sqlite3'
 MANIFEST=DATA/'.model-training.json'
-ENGINE=ROOT/'replay-runtime/game/engine-df0f74a981e087f1.exe'
+# The converter's pinned engine: selection takes its shards, and live play and validation run on it (one pin).
+from replay_conversion import ENGINE
 STOP=RUN/'stop.json'
 
 for name in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS'):os.environ[name]='1'
