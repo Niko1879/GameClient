@@ -40,6 +40,9 @@ PHASES = ((0, 5), (5, 10), (10, 15), (15, 20), (20, 30), (30, None))
 ORDER_LENGTH_BANDS = (15, 40, 80)
 MOVEMENT_KINDS = ('move', 'attack_move', 'add_waypoint')
 CLICK_RADII = (3, 10)
+# AdamW's decoupled weight decay on weight matrices and conv kernels (user, 28 Nov: the usual 0.1). At the pilot's
+# cosine from 1e-3 a weight the data stops holding shrinks to ~e^-0.9 over a 47k-match run.
+WEIGHT_DECAY = .1
 
 
 # Validation scores that early stopping, LR decay and best.npz can follow: every
@@ -297,7 +300,12 @@ class EventLearner:
         self.mirror = optimizer or Adam(reference.parameters, 3e-4)
         # foreach, not fused: fused Adam broke bitwise checkpoint continuation on
         # Radeon (3 of 12 runs), for ~0.5 ms of a 150 ms update.
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.mirror.lr, foreach=True)
+        # AdamW (user, 28 Nov): decoupled WEIGHT_DECAY on the reference's weight matrices and conv kernels only
+        # (NeuralPolicy.decayed). Adam's state is unchanged, so checkpoints are too.
+        decayed = getattr(reference, 'decayed', set())
+        groups = [{'params': [p for name, p in self.model.weights.items() if name in decayed], 'weight_decay': WEIGHT_DECAY},
+                  {'params': [p for name, p in self.model.weights.items() if name not in decayed], 'weight_decay': 0.}]
+        self.optimizer = torch.optim.AdamW([group for group in groups if group['params']], lr=self.mirror.lr, foreach=True)
         self.step_count = self.mirror.step_count
         # The core LSTM state each lane carries into its next unroll, per split (plan Â§2).
         self.states = {}

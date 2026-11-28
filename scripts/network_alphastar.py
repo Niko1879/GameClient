@@ -37,11 +37,14 @@ NETWORK = 'alphastar'
 PACED = 'paced'
 # Memory-free core, location head with the selected-units plane, relevance planes and whole-map attention.
 MOVEMENT = 'movement'
-# AlphaStar's decision path minus the LSTM (user, 27 Nov): paced, a narrow residual core of CORE_BLOCKS pre-norm blocks
-# (width DEEP_CORE, inner x CORE_EXPANSION; the depth of its 3-layer LSTM, no state) and its 16 x 256 action head.
+# Paced with a deep, narrower core (user, 27-28 Nov; pilot in notes/results.md): CORE_BLOCKS pre-norm residual blocks
+# of width DEEP_CORE (inner x CORE_EXPANSION) where SCC has its LSTM; single-layer heads as memory-free.
 DEEP = 'deep'
 NETWORKS = ('alphastar', 'memoryfree', PACED, MOVEMENT, DEEP)
-CORE_BLOCKS, DEEP_CORE, CORE_EXPANSION = 3, 384, 4
+CORE_BLOCKS, DEEP_CORE, CORE_EXPANSION = 12, 768, 2
+# Each block's output layer starts at .1 x sqrt(PILOT_BLOCKS/CORE_BLOCKS): the summed residual branches start as large
+# as the 6-block pilot's. No weight decay (28 Nov): train and validation loss agree at this scale, nothing to curb.
+PILOT_BLOCKS = 6
 # Config effects='map': effects painted on the map, units read their cell; no effect tokens.
 EFFECTS_MAP = 'map'
 # The 70M's core width (its 'hidden'); the heads read it as AlphaGenerals' heads read the LSTM output.
@@ -85,8 +88,8 @@ def add_parameters(w, b, c, W, config, actions):
         for block in range(CORE_BLOCKS):
             b(f'core_res{block}_norm_g', core, 1.); b(f'core_res{block}_norm_b', core)
             w(f'core_res{block}_a', (core, CORE_EXPANSION*core), math.sqrt(2)); b(f'core_res{block}_a_b', CORE_EXPANSION*core)
-            w(f'core_res{block}_b', (CORE_EXPANSION*core, core), .1); b(f'core_res{block}_b_b', core)
-        action_head(w, b, core, actions)
+            w(f'core_res{block}_b', (CORE_EXPANSION*core, core), .1*math.sqrt(PILOT_BLOCKS/CORE_BLOCKS))
+            b(f'core_res{block}_b_b', core)
         return
     if config['network'] == PACED:
         return
@@ -158,7 +161,7 @@ class AlphaStarTorchPolicy(TorchPolicyV3):
         return (hidden @ p['pace_w']+p['pace_b'])[..., 0]
 
     def action_logits(self, core):
-        if self.config['network'] not in (NETWORK, DEEP):
+        if self.config['network'] != NETWORK:
             return super().action_logits(core)
         p = self.weights
         x = F.relu(core @ p['verb_in_w']+p['verb_in_b'])

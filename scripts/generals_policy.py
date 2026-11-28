@@ -790,6 +790,9 @@ class NeuralPolicy:
         self.actions = action_vocabulary(config)
         self.action_index = {(int(k), int(o)): i for i, (k, o) in enumerate(self.actions)}
         self._template_positions = {name: i for i, name in enumerate(config['templates'])}
+        # The weight matrices and conv kernels the trainer decays (train_events.WEIGHT_DECAY, AdamW's usual
+        # split): never biases, norms, embeddings, queries or keys learned as vectors.
+        self.decayed = set()
         if not parameters:
             return
         rng = np.random.default_rng(seed)
@@ -799,11 +802,14 @@ class NeuralPolicy:
         inner, key, core, a = W['heads']*W['head_width'], W['key'], W['core'], W['action_embedding']
         def w(name, shape, gain=1, *, generator=None):
             self.parameters[name] = Tensor((generator or rng).normal(0, gain/math.sqrt(shape[0]), shape), requires_grad=True)
+            if not name.endswith('embedding'):
+                self.decayed.add(name)
         def b(name, count, value=0):
             self.parameters[name] = Tensor(np.full(count, value), requires_grad=True)
         def c(name, outputs, inputs, size, gain=math.sqrt(2)):
             self.parameters[name] = Tensor(rng.normal(0, gain/math.sqrt(inputs*size*size), (outputs, inputs, size, size)),
                                            requires_grad=True)
+            self.decayed.add(name)
             b(name+'_b', (outputs, 1, 1))
         def norm(name, size):
             b(name+'_g', size, 1.); b(name+'_b', size)
@@ -891,7 +897,7 @@ class NeuralPolicy:
             norm(f'core_lstm{layer}_cell', core)
         # Heads (plan Â§1f): every head reads the core output; the selected action is one flat softmax,
         # and each argument head has its own embedding of that action.
-        if config.get('network') not in ('alphastar', 'deep'):  # Those have their own (network_alphastar).
+        if config.get('network') != 'alphastar':  # It has its own (network_alphastar).
             w('action_w', (core, actions), .1); b('action_b', actions)
         for head in ARGUMENT_HEADS:
             w(head+'_action_embedding', (actions, a), 1)
@@ -923,6 +929,7 @@ class NeuralPolicy:
             # Transposed kernels are (in, out, K, K); the final logits start small.
             self.parameters[f'location_up{stage}'] = Tensor(rng.normal(
                 0, (.1 if stage == len(stages)-1 else math.sqrt(2))/math.sqrt(channels*16), (channels, outputs, 4, 4)), requires_grad=True)
+            self.decayed.add(f'location_up{stage}')
             b(f'location_up{stage}_b', (outputs, 1, 1))
             channels = outputs
         # Value: untrained in imitation (RL replaces it).

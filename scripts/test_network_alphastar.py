@@ -186,29 +186,39 @@ class PacedNetworkTests(AlphaStarNetworkTests):
 
 
 class DeepNetworkTests(PacedNetworkTests):
-    """network='deep' (user, 27 Nov): paced, a narrow residual core and AlphaStar's 16 x 256 action head; every paced
-    test applies, with effects on the map as in the pilot."""
+    """network='deep' (user, 27-28 Nov): paced with a deep residual core and single-layer heads; every paced test
+    applies, with effects on the map."""
     network = 'deep'
     extra = {'effects': 'map'}
     seed = 6
 
     def test_parameters_replace_the_lstm_and_linear_action_layer(self):
-        from network_alphastar import ACTION_BLOCKS, CORE_BLOCKS, CORE_EXPANSION
+        from network_alphastar import CORE_BLOCKS, CORE_EXPANSION
         names, p = set(self.policy.parameters), self.policy.parameters
-        self.assertFalse({name for name in names if name.startswith(('core_lstm', 'core_hidden', 'map_skip', 'location_skip'))})
+        self.assertFalse({name for name in names if name.startswith(('core_lstm', 'core_hidden', 'verb_', 'map_skip',
+                                                                     'location_skip'))})
         core = self.config['widths']['core']
         self.assertEqual(p['core_in_w'].data.shape[1], core)
         for block in range(CORE_BLOCKS):
             self.assertEqual(p[f'core_res{block}_a'].data.shape, (core, CORE_EXPANSION*core))
-        self.assertTrue({f'verb_res{ACTION_BLOCKS-1}_b', 'verb_in_w', 'pace_w', 'effect_map_w'} <= names)
-        self.assertEqual(p['verb_in_w'].data.shape[0], core)
+        self.assertTrue({'pace_w', 'effect_map_w'} <= names)
+        self.assertEqual(p['action_w'].data.shape[0], core)
+
+    def test_weight_decay_covers_matrices_and_kernels_only(self):
+        from train_events import WEIGHT_DECAY
+        learner = EventLearner(self.policy)
+        rates = {id(p): group['weight_decay'] for group in learner.optimizer.param_groups for p in group['params']}
+        self.assertEqual(len(rates), len(learner.model.weights))
+        decayed = {name for name, p in learner.model.weights.items() if rates[id(p)] == WEIGHT_DECAY}
+        self.assertTrue({'core_in_w', 'core_res0_a', 'core_res0_b', 'action_w', 'location_block0_b', 'location_up0'} <= decayed)
+        self.assertFalse({'core_res0_b_b', 'core_res0_norm_g', 'core_res0_a_b', 'location_block0_b_b', 'family_embedding',
+                          'general_embedding', 'upgrade_embedding', 'unit_end_key'} & decayed)
 
     def test_the_default_core_is_narrow(self):
         from generals_policy import widths
         from network_alphastar import DEEP_CORE
         self.assertEqual(widths({'network': 'deep'})['core'], DEEP_CORE)
         self.assertEqual(widths({'network': 'paced'})['core'], 3840)
-
 
 class MovementNetworkTests(AlphaStarNetworkTests):
     """network='movement': the location head sees the selected units and every entity relative to them."""
